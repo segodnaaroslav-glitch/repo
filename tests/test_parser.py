@@ -60,7 +60,7 @@ class NumberTests(unittest.TestCase):
 
 class PageTests(unittest.TestCase):
     def setUp(self):
-        self.items, self.updated = parser.parse_category_page(BLOCK_PAGE, "godlies")
+        self.items, self.updated, self.orphans = parser.parse_category_page(BLOCK_PAGE, "godlies")
         self.by_name = {item["name"]: item for item in self.items}
 
     def test_finds_all_cards(self):
@@ -150,7 +150,7 @@ class PopupTests(unittest.TestCase):
     )
 
     def test_popup_only_page(self):
-        items, _ = parser.parse_category_page("<html><body>" + self.POPUP + "</body></html>", "godlies")
+        items, _, _ = parser.parse_category_page("<html><body>" + self.POPUP + "</body></html>", "godlies")
         by_name = {item["name"]: item for item in items}
         self.assertEqual(by_name["Mu Blade"]["value"], 950)
         self.assertEqual(by_name["Mu Blade"]["origin"], "Test 2025")
@@ -159,7 +159,7 @@ class PopupTests(unittest.TestCase):
 
     def test_popup_fills_missing_fields(self):
         page = "<html><body>" + self.POPUP + "<div>Mu Blade</div><div>Value - 1,000</div></body></html>"
-        items, _ = parser.parse_category_page(page, "godlies")
+        items, _, _ = parser.parse_category_page(page, "godlies")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["value"], 950)
         self.assertEqual(items[0]["demand"], 6)
@@ -170,3 +170,79 @@ class PopupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Случаи, найденные при проверке кода."""
+
+    def test_cards_inside_links(self):
+        page = "<body>" + "".join(
+            f'<a class="card" href="#"><span>{name}</span><span>Value - {value}</span>'
+            f"<span>Origin - Xmas 2024</span></a>"
+            for name, value in (("Alpha Blade", 10), ("Beta Gun", 500), ("Gamma", 20))
+        ) + "</body>"
+        items, _, orphans = parser.parse_category_page(page, "godlies")
+        self.assertEqual([(i["name"], i["value"], i["origin"]) for i in items],
+                         [("Alpha Blade", 10, "Xmas 2024"), ("Beta Gun", 500, "Xmas 2024"), ("Gamma", 20, "Xmas 2024")])
+        self.assertEqual(orphans, 0)
+
+    def test_inline_tags_without_spaces(self):
+        page = ('<div class="card"><span>Alpha</span><span>Value -</span><span>10</span></div>'
+                '<div class="card"><span>Beta</span><span>Value -</span><span>20</span>'
+                '<span>Stability -</span><span>Stable</span><span>Demand -</span><span>N/A</span>'
+                '<span>Rarity -</span><span>9</span></div>')
+        items, _, _ = parser.parse_category_page(page, "godlies")
+        self.assertEqual([(i["name"], i["value"]) for i in items], [("Alpha", 10), ("Beta", 20)])
+        self.assertEqual((items[1]["stability"], items[1]["demand"], items[1]["rarity"]), ("Stable", None, 9))
+
+    def test_value_written_as_range(self):
+        self.assertEqual(parser.items_from_text("Alpha\nValue - 1320 - 1340\n", "godlies")[0]["value"], 1320)
+        self.assertEqual(parser.items_from_text("Alpha Value - 1,320 - 1,340 Demand - 5\n", "godlies")[0]["value"], 1320)
+
+    def test_decimal_suffix_has_no_float_noise(self):
+        self.assertEqual(parser.parse_number("16.1K"), 16100)
+        self.assertEqual(parser.parse_number("4.1M"), 4100000)
+        self.assertEqual(parser.parse_number("2.01K"), 2010)
+        self.assertEqual(parser.program_value("", "[16.1K - 16.6K]"), 16100)
+
+    def test_empty_field_before_set(self):
+        text = "Alpha Set\nContains - A, B\nValue - 300\nAliases -\nBeta Set\nContains -\nBeta Knife\nBeta Gun\nValue - 500\n"
+        items = parser.items_from_text(text, "sets")
+        self.assertEqual([(i["name"], i["value"], i["aliases"]) for i in items], [("Alpha Set", 300, ""), ("Beta Set", 500, "")])
+
+    def test_empty_origin_before_ui_text(self):
+        items = parser.items_from_text("Alpha\nValue - 1\nOrigin -\nInv. Controls\nBeta\nValue - 2\n", "rares")
+        self.assertEqual([(i["name"], i["origin"]) for i in items], [("Alpha", ""), ("Beta", "")])
+
+    def test_other_range_formats(self):
+        for text in ("1,320 − 1,340", "[1,320 - 1,340]*", "(1,320 - 1,340)", "~1,320 - 1,340", "1,320 ~ 1,340", "1320-1340"):
+            self.assertEqual(parser.program_value("1,330", text), 1320, text)
+        self.assertEqual(parser.program_value("1,330", "x2 T1 Commons"), 1330)
+
+    def test_value_on_next_line_with_prefix(self):
+        self.assertEqual(parser.items_from_text("Alpha\nValue -\n~1,330\n", "rares")[0]["value"], 1330)
+
+    def test_page_without_head_end_tag(self):
+        page = "<html><head><title>MM2 Values</title><meta charset=utf-8><body><div>Alpha</div><div>Value - 10</div>"
+        items, _, _ = parser.parse_category_page(page, "rares")
+        self.assertEqual([(i["name"], i["value"]) for i in items], [("Alpha", 10)])
+
+    def test_last_updated_in_separate_blocks(self):
+        page = "<p>Values Last Updated</p><p>-</p><p>October 5th, 2026</p><p>at 12:49 PM</p>"
+        self.assertEqual(parser.find_last_updated(parser.html_to_text(page)), "October 5th, 2026 at 12:49 PM")
+
+    def test_badge_is_not_a_name(self):
+        items = parser.items_from_text("Alpha Knife\nNEW\nValue - 10\n", "godlies")
+        self.assertEqual(items[0]["name"], "Alpha Knife")
+
+    def test_popup_range_as_list_of_strings(self):
+        page = '<script>var _svPopup = {"Mu": {"value": "1,000", "range": ["950", "1,050"]}};</script>'
+        items, _, _ = parser.parse_category_page(page, "godlies")
+        self.assertEqual(items[0]["value"], 950)
+
+    def test_orphan_values_are_counted(self):
+        _, orphans = parser.parse_cards("Value - 1\nValue - 2\nAlpha\nValue - 3\n")
+        self.assertEqual(orphans, 2)
+
+    def test_bom_removed_from_name(self):
+        self.assertEqual(parser.items_from_text("﻿Alpha\nValue - 1\n", "rares")[0]["name"], "Alpha")

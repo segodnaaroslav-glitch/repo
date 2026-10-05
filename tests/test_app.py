@@ -42,7 +42,7 @@ class StoreTests(unittest.TestCase):
         self.assertIn("ancients item", names)
         self.assertEqual(data["site_last_updated"], "October 5th, 2026 at 12:49 PM")
         self.assertTrue(data["fetched_at"])
-        self.assertEqual(len(data["errors"]), 1)
+        self.assertEqual([error["category"] for error in data["errors"]], ["godlies"])
         ancients = next(item for item in data["items"] if item["category"] == "ancients")
         self.assertEqual(ancients["value"], 100)
         self.assertEqual(store.load(self.path)["items"], data["items"])
@@ -56,7 +56,7 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
     def test_import_text(self):
-        items = store.import_text("Some Knife\nValue - 1,330\nRange - [1,320 - 1,340]\n", "godlies", self.path)
+        items, _ = store.import_text("Some Knife\nValue - 1,330\nRange - [1,320 - 1,340]\n", "godlies", self.path)
         self.assertEqual(items[0]["value"], 1320)
         self.assertEqual(store.load(self.path)["items"][0]["name"], "Some Knife")
         with self.assertRaises(ValueError):
@@ -180,3 +180,123 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoreRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "values.json"
+        self.quiet = lambda line: None
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def site(self, overrides=None):
+        overrides = overrides or {}
+
+        def fetch(url):
+            slug = url.rsplit("/", 1)[-1]
+            if slug in overrides:
+                result = overrides[slug]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            if url == fetcher.HOME_URL:
+                return HOME
+            return fake_page(slug)
+        return fetch
+
+    def test_corrupt_file_is_set_aside_on_update_and_import(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            store.load(self.path)
+        store.import_text("Alpha\nValue - 5\n", "rares", self.path)
+        self.assertEqual(store.load(self.path)["items"][0]["name"], "Alpha")
+        self.assertTrue(list(Path(self.tmp.name).glob("values.broken-*.json")))
+
+    def test_bom_and_bad_items_tolerated(self):
+        self.path.write_text('﻿{"items": [{"name": "A", "category": "rares"}, 5, {"x": 1}]}', encoding="utf-8")
+        self.assertEqual([item["name"] for item in store.load(self.path)["items"]], ["A"])
+
+    def test_one_broken_page_does_not_stop_update(self):
+        data = store.update_from_site(fetch=self.site({"rares": RuntimeError("boom")}), log=self.quiet, path=self.path)
+        self.assertEqual([error["category"] for error in data["errors"]], ["rares"])
+        self.assertIn("godlies", {item["category"] for item in data["items"]})
+
+    def test_no_network_stops_early(self):
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            raise fetcher.NetworkError("нет интернета")
+        with self.assertRaises(store.UpdateError) as caught:
+            store.update_from_site(fetch=fetch, log=self.quiet, path=self.path)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Импорт", str(caught.exception))
+
+    def test_import_during_update_is_kept(self):
+        def fetch(url):
+            if url.endswith("/commons"):  # пока идёт загрузка, пользователь импортирует Pets
+                store.import_text("My Pet\nValue - 7\n", "pets", self.path)
+            return self.site({"pets": fetcher.FetchError("404")})(url)
+        data = store.update_from_site(fetch=fetch, log=self.quiet, path=self.path)
+        self.assertIn("My Pet", {item["name"] for item in data["items"]})
+
+    def test_suspicious_drop_keeps_old_prices(self):
+        old = store.empty_data()
+        store.replace_category(old, "godlies", [parser.make_item(f"G{i}", "godlies", {"value": "1"}) for i in range(20)], "site")
+        store.save(old, self.path)
+        data = store.update_from_site(fetch=self.site(), log=self.quiet, path=self.path)
+        godlies = [item for item in data["items"] if item["category"] == "godlies"]
+        self.assertEqual(len(godlies), 20)
+        self.assertIn("было 20", data["errors"][0]["message"])
+
+    def test_import_clears_category_error_and_saves_date_only(self):
+        store.update_from_site(fetch=self.site({"rares": fetcher.FetchError("404")}), log=self.quiet, path=self.path)
+        store.import_text("Alpha\nValue - 5\n", "rares", self.path)
+        self.assertEqual(store.load(self.path)["errors"], [])
+        items, date = store.import_text("Values Last Updated - October 6th, 2026 at 1:00 PM", "rares", self.path)
+        self.assertEqual((items, date), ([], "October 6th, 2026 at 1:00 PM"))
+        data = store.load(self.path)
+        self.assertEqual(data["site_last_updated"], "October 6th, 2026 at 1:00 PM")
+        self.assertEqual([item["name"] for item in data["items"] if item["category"] == "rares"], ["Alpha"])
+
+
+class ServerRegressionTests(ServerTests):
+    def test_corrupt_file_still_gives_categories(self):
+        self.path.write_text("garbage", encoding="utf-8")
+        status, body = self.request("GET", "/api/data")
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["load_error"])
+        self.assertEqual(len(data["categories"]), len(parser.CATEGORIES))
+
+    def test_category_dates_and_weights_in_payload(self):
+        store.import_text("Alpha\nValue - 5\n", "rares", self.path)
+        data = json.loads(self.request("GET", "/api/data")[1])
+        rares = next(c for c in data["categories"] if c["slug"] == "rares")
+        self.assertEqual(rares["source"], "import")
+        self.assertTrue(rares["updated_at"])
+        self.assertEqual(data["liquidity"]["stability"]["receding"], -15)
+
+    def test_save_error_reported(self):
+        from unittest import mock
+        with mock.patch.object(store, "save", side_effect=PermissionError("занято")):
+            status, body = self.request("POST", "/api/import", {"category": "rares", "text": "Alpha\nValue - 1\n"},
+                                        {"Content-Type": "application/json"})
+        self.assertEqual(status, 500)
+        self.assertIn("занято", json.loads(body)["error"])
+
+    def test_host_without_port_rejected(self):
+        self.assertEqual(self.request("GET", "/api/data", headers={"Host": "localhost"})[0], 403)
+        self.assertEqual(self.request("GET", "/api/data", headers={"Host": f"localhost:{self.port}"})[0], 200)
+
+
+class CliTests(unittest.TestCase):
+    def test_read_text_file_encodings(self):
+        import mm2_values
+        with tempfile.TemporaryDirectory() as tmp:
+            for encoding in ("utf-8", "utf-8-sig", "utf-16", "cp1251"):
+                path = Path(tmp) / f"{encoding}.txt"
+                path.write_bytes("Нож Alpha\nValue - 5\n".encode(encoding))
+                self.assertEqual(mm2_values.read_text_file(path), "Нож Alpha\nValue - 5\n", encoding)

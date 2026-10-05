@@ -24,6 +24,7 @@
   </header>
 
   <div class="status hidden" id="status" role="status" aria-live="polite"></div>
+  <div class="status error hidden" id="errorsBox"></div>
 
   <nav class="tabs" role="tablist">
     <button class="tab active" type="button" role="tab" data-tab="values" aria-selected="true">Цены</button>
@@ -39,9 +40,9 @@
       </aside>
       <div class="content">
         <div class="toolbar">
-          <input id="search" type="search" placeholder="Поиск по названию…" autocomplete="off">
+          <input id="search" type="search" placeholder="Поиск по названию…" autocomplete="off" aria-label="Поиск по названию">
           <label>Сортировка
-            <select id="sort">
+            <select id="sort" autocomplete="off">
               <option value="value-desc">Значение ↓</option>
               <option value="value-asc">Значение ↑</option>
               <option value="name">Название А–Я</option>
@@ -74,20 +75,21 @@
       <div class="content wide">
         <div class="summary" id="liqSummary"></div>
         <div class="toolbar">
-          <input id="liqSearch" type="search" placeholder="Поиск по названию…" autocomplete="off">
+          <input id="liqSearch" type="search" placeholder="Поиск по названию…" autocomplete="off" aria-label="Поиск по названию">
           <label>Категория
-            <select id="liqCategory"></select>
+            <select id="liqCategory" autocomplete="off"></select>
           </label>
         </div>
         <details class="method">
           <summary>Как считается ликвидность</summary>
-          <p>Балл от 0 до 100 по данным сайта. Основа — <b>спрос</b> (Demand × 10).
-            Стабильность добавляет или снимает баллы: «Overpaid For» +15, «Doing Well» +10,
-            «Fluctuating» −8, «Underpaid For» −12, «Receding» −15. Узкий диапазон цены (до 5%) +5,
-            широкий (больше 20%) −5.</p>
-          <p><b>Ликвидные</b> — 60 и выше: продаются быстро и по значению.
-            <b>Средние</b> — 30–59: продать можно, но дольше или с уступкой.
-            <b>Неликвидные</b> — меньше 30: спроса почти нет, по значению продать трудно.</p>
+          <p>Балл от 0 до 100 по данным сайта. Основа — <b>спрос</b>: Demand × 10
+            (спрос не указан — 0). Стабильность добавляет или снимает баллы:
+            <span id="methodStability"></span>. Узкий диапазон цены (до 5%) +5,
+            широкий (больше 20%) −5. Итог ограничен 0–100.</p>
+          <p><b>Ликвидные</b> — <span id="methodLiquid">60</span> и выше: продаются быстро и по значению.
+            <b>Средние</b> — <span id="methodMedium">30–59</span>: продать можно, но дольше или с уступкой.
+            <b>Неликвидные</b> — меньше <span id="methodIlliquid">30</span>: спроса почти нет, по значению продать трудно.
+            Untradables обменять нельзя, поэтому в колонки они не попадают.</p>
         </details>
         <div class="columns" id="liqColumns"></div>
       </div>

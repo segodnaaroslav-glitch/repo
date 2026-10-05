@@ -16,8 +16,8 @@ Windows может предупредить «Windows защитила ваш к
 нажмите «Подробнее» → «Выполнить в любом случае».
 
 **Из исходников:** установите [Python](https://www.python.org/downloads/) 3.8 или новее
-(на Windows отметьте «Add Python to PATH») и запустите `start.bat` или
-`python3 mm2_values.py`.
+(на Windows отметьте «Add Python to PATH»). Windows: запустите `start.bat`
+(или `py mm2_values.py`). Linux/macOS: `python3 mm2_values.py`.
 
 При первом запуске программа сама скачает цены со всех категорий сайта. Потом цены
 обновляются кнопкой **«Обновить цены»**.
@@ -42,14 +42,15 @@ Windows может предупредить «Windows защитила ваш к
 ## Команды
 
 ```
-python mm2_values.py                  открыть программу
-python mm2_values.py update           обновить цены из консоли
-python mm2_values.py find chroma      найти предмет в консоли
-python mm2_values.py import page.txt --category godlies
-python mm2_values.py --port 9000      открыть на другом порту
+MM2Values.exe                         открыть программу
+MM2Values.exe update                  обновить цены из консоли
+MM2Values.exe find chroma             найти предмет в консоли
+MM2Values.exe import page.txt --category godlies
+MM2Values.exe --port 9000             открыть на другом порту
 ```
 
-В exe те же команды: `MM2Values.exe find chroma`, `MM2Values.exe update` и т. д.
+Из исходников те же команды: `py mm2_values.py find chroma` (Windows) или
+`python3 mm2_values.py find chroma` (Linux/macOS).
 
 ## Если сайт не загружается
 
@@ -57,8 +58,11 @@ python mm2_values.py --port 9000      открыть на другом порт�
 сайт через Edge или Chrome в скрытом режиме (Edge есть в любой Windows 10/11). Если и это
 не помогло, перенесите цены через вкладку «Импорт».
 
-Если у категории не нашлось ни одного предмета, её старые цены остаются, а страница
-сохраняется в `data/debug/` для проверки.
+Если категория не загрузилась или результат выглядит подозрительно (предметов не нашлось,
+их стало вдвое меньше, у карточек не определились названия), у неё остаются прежние цены,
+категория помечается значком ⚠, а страница сохраняется в `data/debug/` для проверки.
+Если файл с ценами повреждён, он переименовывается в `values.broken-….json`, и цены
+загружаются заново.
 
 ## Файлы
 

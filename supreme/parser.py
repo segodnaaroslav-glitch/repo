@@ -23,6 +23,7 @@
 import html as html_lib
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 
 # (адрес категории на сайте, название в меню сайта)
@@ -79,6 +80,8 @@ _LABEL_KEYS = {
 # Надписи интерфейса сайта, которые не являются названиями предметов.
 _FREE_TEXT_FIELDS = ("origin", "aliases")
 _UI_JUNK_RE = re.compile(r"\bInv\.?\s*Controls\b", re.I)
+# Значки на карточках (между названием и Value), которые не являются названием.
+_BADGES = {"new", "hot", "trending", "updated", "limited", "sale", "rising", "dropping"}
 _LAST_UPDATED_RE = re.compile(
     r"Values?\s+(?:were\s+)?Last\s+Updated\s*(?:[-–—:]|on)?\s*(.*?)\s*(?://|\||$)", re.I
 )
@@ -93,24 +96,36 @@ def parse_number(text):
         return None
     token = match.group(1).replace(",", "").replace(" ", "")
     suffix = token[-1].lower() if token[-1].isalpha() else ""
-    number = float(token[:-1] if suffix else token) * _SUFFIX[suffix]
-    return int(number) if number == int(number) else number
+    try:
+        number = Decimal(token[:-1] if suffix else token) * _SUFFIX[suffix]
+    except InvalidOperation:
+        return None
+    return int(number) if number == number.to_integral_value() else float(number)
 
 
 def range_low(range_text):
     """Первое число диапазона: "[1,320 - 1,340]" -> 1320. Нет диапазона -> None."""
     if not range_text:
         return None
-    text = str(range_text).strip()
+    text = str(range_text).strip().replace("−", "-")
     match = _RANGE_RE.match(text) or _SINGLE_RANGE_RE.match(text)
-    return parse_number(match.group(1)) if match else None
+    if match:
+        return parse_number(match.group(1))
+    # Другие записи диапазона: "(1,320 - 1,340)", "~1,320 ~ 1,340", "[1,320 - 1,340]*".
+    numbers = re.findall(_NUMBER, text)
+    rest = re.sub(_NUMBER, "", text)
+    if len(numbers) == 2 and re.fullmatch(r"[\s\[\](){}~≈*+\-–—]*(?:to)?[\s\[\](){}~≈*+\-–—]*", rest, re.I):
+        return parse_number(numbers[0])
+    return None
 
 
 def program_value(value_text, range_text):
-    """Значение для программы: первое число диапазона, иначе число из Value."""
-    low = range_low(range_text)
-    if low is not None:
-        return low
+    """Значение для программы: первое число диапазона (из Range или из самого
+    Value, если там записан диапазон), иначе число из Value."""
+    for text in (range_text, value_text):
+        low = range_low(text)
+        if low is not None:
+            return low
     return parse_number(value_text)
 
 
@@ -122,7 +137,7 @@ def name_key(name):
 
 
 def clean_name(name):
-    text = _UI_JUNK_RE.sub(" ", str(name))
+    text = _UI_JUNK_RE.sub(" ", str(name).replace("\ufeff", ""))
     text = re.sub(r"\s+", " ", text).strip(" -–—:|•")
     if text[:3].lower() == "c. ":
         text = "Chroma " + text[3:]
@@ -137,13 +152,13 @@ def _to_int(text):
 # --- HTML -> текст ---------------------------------------------------------
 
 _BLOCK_TAGS = {
-    "address", "article", "aside", "blockquote", "br", "button", "dd", "details", "div",
+    "a", "address", "article", "aside", "blockquote", "br", "button", "dd", "details", "div",
     "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
     "h4", "h5", "h6", "header", "hr", "img", "label", "li", "main", "nav", "ol", "option",
     "p", "section", "select", "summary", "table", "tbody", "td", "tfoot", "th", "thead",
     "tr", "ul",
 }
-_SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "head"}
+_SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "title"}
 
 
 class _TextExtractor(HTMLParser):
@@ -152,21 +167,24 @@ class _TextExtractor(HTMLParser):
         self.parts = []
         self.skip_depth = 0
 
+    # Соседние строчные теги без пробела ("<span>Demand -</span><span>2</span>") не должны
+    # склеивать слова, поэтому вместо них ставится пробел.
+
     def handle_starttag(self, tag, attrs):
         if tag in _SKIP_TAGS:
             self.skip_depth += 1
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n")
+        else:
+            self.parts.append("\n" if tag in _BLOCK_TAGS else " ")
 
     def handle_startendtag(self, tag, attrs):
-        if tag in _BLOCK_TAGS:
-            self.parts.append("\n")
+        if tag not in _SKIP_TAGS:
+            self.parts.append("\n" if tag in _BLOCK_TAGS else " ")
 
     def handle_endtag(self, tag):
         if tag in _SKIP_TAGS:
             self.skip_depth = max(0, self.skip_depth - 1)
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n")
+        else:
+            self.parts.append("\n" if tag in _BLOCK_TAGS else " ")
 
     def handle_data(self, data):
         if not self.skip_depth:
@@ -190,9 +208,9 @@ def _value_fits(key, text):
     if not text:
         return False
     if key == "value":
-        return bool(re.match(r"^(\d|x\s*\d|priceless|n/?a|untrad|none|\?)", text, re.I))
+        return bool(re.match(r"^[\s*~≈+]*(\d|x\s*\d|priceless|n/?a|untrad|none|\?)", text, re.I))
     if key == "range":
-        return bool(re.match(r"^(\[|\d|n/?a|none)", text, re.I))
+        return bool(re.match(r"^[\s*~≈+(]*(\[|\d|n/?a|none)", text, re.I))
     if key in ("demand", "rarity"):
         return bool(re.match(r"^(\d|n/?a)", text, re.I))
     if key == "stability":
@@ -220,6 +238,8 @@ def _split_line(line):
 
 def _is_name_like(text):
     text = clean_name(text)
+    if text.lower() in _BADGES:
+        return False
     return 2 <= len(text) <= 80 and bool(re.search(r"[A-Za-z]", text))
 
 
@@ -244,9 +264,13 @@ def _set_field(card, key, text):
 
 
 def parse_cards(text, known_names=()):
-    """Найти карточки предметов в тексте страницы (или в скопированном тексте)."""
+    """Найти карточки предметов в тексте страницы (или в скопированном тексте).
+
+    Возвращает (карточки, сколько меток Value остались без названия).
+    """
     known_keys = {name_key(name) for name in known_names}
     cards = []
+    orphans = 0
     card = None
     candidates = []
     name_before_contains = None
@@ -269,6 +293,9 @@ def parse_cards(text, known_names=()):
         for key, value in _split_line(line):
             if key is None:
                 commit_tentative()
+                if pending and not clean_name(value):
+                    pending = None  # служебная надпись ("Inv. Controls") — не значение поля
+                    continue
                 if pending and _value_fits(pending, value):
                     if pending in _FREE_TEXT_FIELDS and _is_name_like(value):
                         # Пустое поле перед следующей карточкой выглядит так же, как поле
@@ -284,7 +311,7 @@ def parse_cards(text, known_names=()):
                     candidates.append(clean_name(value))
                 continue
 
-            if key == "value" and tentative:
+            if key in ("value", "contains") and tentative:
                 tentative = None  # это было название следующей карточки
             commit_tentative()
             pending = None
@@ -293,6 +320,8 @@ def parse_cards(text, known_names=()):
                 card = {"name": name} if name else None
                 if card:
                     cards.append(card)
+                else:
+                    orphans += 1
                 candidates = []
                 name_before_contains = None
             elif key == "contains" and name_before_contains is None:
@@ -305,7 +334,7 @@ def parse_cards(text, known_names=()):
             else:
                 pending = key
     commit_tentative()
-    return cards
+    return cards, orphans
 
 
 # --- JSON _svPopup ---------------------------------------------------------
@@ -326,8 +355,8 @@ def _plain(value):
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
-        if len(value) == 2 and all(isinstance(v, (int, float)) for v in value):
-            return f"{value[0]} - {value[1]}"
+        if len(value) == 2 and all(parse_number(_plain(v)) is not None for v in value):
+            return f"{_plain(value[0])} - {_plain(value[1])}"
         return ", ".join(_plain(v) for v in value)
     text = html_lib.unescape(re.sub(r"<[^>]+>", " ", str(value)))
     return re.sub(r"\s+", " ", text).strip()
@@ -397,11 +426,13 @@ def _dedupe(items):
     return result
 
 
-def items_from_text(text, category, known_names=(), popup=None):
+def parse_items(text, category, popup=None):
+    """Текст страницы -> (предметы, сколько меток Value остались без названия)."""
     popup = popup or {}
     popup_by_key = {name_key(name): (name, fields) for name, fields in popup.items()}
     items = []
-    for card in parse_cards(text, known_names or popup.keys()):
+    cards, orphans = parse_cards(text, popup.keys())
+    for card in cards:
         name = card.pop("name")
         known = popup_by_key.get(name_key(name))
         if known:
@@ -409,30 +440,44 @@ def items_from_text(text, category, known_names=(), popup=None):
             for field, value in known[1].items():
                 card.setdefault(field, value)
         items.append(make_item(name, category, card))
-    return _dedupe(items)
+    return _dedupe(items), orphans
+
+
+def items_from_text(text, category, popup=None):
+    return parse_items(text, category, popup)[0]
 
 
 def find_last_updated(text):
     """Дата "Values Last Updated - ..." со страницы сайта (как написано на сайте)."""
-    lines = text.splitlines()
+    lines = [line.strip() for line in text.splitlines()]
     for index, line in enumerate(lines):
         match = _LAST_UPDATED_RE.search(line)
         if not match:
             continue
         found = match.group(1)
-        if not re.search(r"\d", found) and index + 1 < len(lines):
-            found = lines[index + 1].split("//")[0].split("|")[0]
+        following = iter(lines[index + 1:index + 5])
+        if not re.search(r"\d", found):
+            # Метка, тире и дата могут быть отдельными блоками.
+            found = next((l for l in following if not re.fullmatch(r"[-–—:|/\s]*", l)), "")
+            found = found.split("//")[0].split("|")[0]
         found = found.strip(" -–—:.")
+        if re.search(r"\d", found) and ":" not in found:
+            # Время отдельным блоком: "October 5th, 2026" + "at 12:49 PM".
+            nxt = next(following, "")
+            if re.match(r"at\s+\d", nxt, re.I):
+                found = f"{found} {nxt.split('//')[0].strip()}"
         if re.search(r"\d", found):
             return found
     return None
 
 
 def parse_category_page(page_html, category):
-    """HTML страницы категории -> (список предметов, дата обновления на сайте)."""
+    """HTML страницы категории -> (предметы, дата обновления на сайте,
+    сколько меток Value остались без названия)."""
     text = html_to_text(page_html)
     popup = parse_popup(page_html)
-    items = items_from_text(text, category, popup=popup)
+    items, orphans = parse_items(text, category, popup)
     if not items and popup:
         items = _dedupe([make_item(name, category, fields) for name, fields in popup.items()])
-    return items, find_last_updated(text)
+        orphans = 0
+    return items, find_last_updated(text), orphans

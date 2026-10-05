@@ -53,21 +53,33 @@ def cmd_run(args):
         httpd.server_close()
 
 
+def program_command():
+    return "MM2Values.exe" if paths.FROZEN else "python mm2_values.py"
+
+
 def cmd_update(args):
     try:
         store.update_from_site()
     except store.UpdateError as error:
         print(error, file=sys.stderr)
         return 1
+    except OSError as error:
+        print(f"Не удалось сохранить цены: {error}", file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_find(args):
-    data = store.load()
+    try:
+        data = store.load()
+    except (OSError, ValueError) as error:
+        print(f"Файл с ценами повреждён ({store.DATA_FILE}): {error}", file=sys.stderr)
+        print(f"Обновите цены: {program_command()} update", file=sys.stderr)
+        return 1
     query = " ".join(args.query).lower()
     found = [item for item in data["items"] if query in item["name"].lower()]
     if not data["items"]:
-        print("Цен пока нет. Запустите: python mm2_values.py update")
+        print(f"Цен пока нет. Запустите: {program_command()} update")
         return 1
     if not found:
         print("Ничего не найдено.")
@@ -81,23 +93,42 @@ def cmd_find(args):
     return 0
 
 
-def cmd_import(args):
-    with open(args.file, encoding="utf-8") as file:
-        text = file.read()
+def read_text_file(path):
+    """Текст из файла в любой обычной кодировке Windows (UTF-8, UTF-16, cp1251)."""
+    with open(path, "rb") as file:
+        raw = file.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
     try:
-        items = store.import_text(text, args.category)
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251", "replace")
+
+
+def cmd_import(args):
+    try:
+        text = read_text_file(args.file)
+        items, last_updated = store.import_text(text, args.category)
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
+    except OSError as error:
+        print(f"Не удалось прочитать или сохранить файл: {error}", file=sys.stderr)
+        return 1
     print(f"Загружено предметов: {len(items)}")
+    if last_updated:
+        print(f"Дата обновления цен на сайте: {last_updated}")
     return 0
 
 
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(errors="replace")
-        except AttributeError:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:  # вывод в файл или другую программу — UTF-8, чтобы не было "???"
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
             pass
 
     arg_parser = argparse.ArgumentParser(description="Цены MM2 по сайту Supreme Values")

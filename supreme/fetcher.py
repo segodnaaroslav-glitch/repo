@@ -1,6 +1,8 @@
 """Загрузка страниц supremevalues.com."""
 
+import http.client
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +11,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from . import parser
 
 BASE_URL = "https://supremevalues.com/mm2/"
 HOME_URL = "https://supremevalues.com/mm2"
@@ -30,8 +34,27 @@ class BlockedError(FetchError):
     """Сайт вернул защитную страницу вместо данных."""
 
 
+class NetworkError(FetchError):
+    """Нет соединения с сайтом (нет интернета, сайт недоступен)."""
+
+
+_CONTENT_RE = re.compile(r"(Value|Range)\s*[-–—:]|Last\s+Updated", re.I)
+BLOCK_STATUSES = (403, 429, 503)
+
+
 def looks_blocked(page_html):
-    return "_Incapsula_Resource" in page_html or "Request unsuccessful" in page_html
+    """Защитная страница вместо сайта. Ссылка на скрипт защиты бывает и на
+    нормальной странице, поэтому блокировкой считается только страница без данных."""
+    if "_Incapsula_Resource" not in page_html and "Request unsuccessful" not in page_html:
+        return False
+    return not _CONTENT_RE.search(parser.html_to_text(page_html))
+
+
+def _decode(raw, charset):
+    try:
+        return raw.decode(charset or "utf-8", "replace")
+    except LookupError:  # неизвестная кодировка в заголовке
+        return raw.decode("utf-8", "replace")
 
 
 def fetch_plain(url, timeout=30, attempts=3):
@@ -40,13 +63,18 @@ def fetch_plain(url, timeout=30, attempts=3):
         try:
             request = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                charset = response.headers.get_content_charset() or "utf-8"
-                page_html = response.read().decode(charset, "replace")
+                page_html = _decode(response.read(), response.headers.get_content_charset())
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise FetchError(f"страница не найдена (404): {url}") from error
+            try:
+                body = _decode(error.read(), error.headers.get_content_charset() if error.headers else None)
+            except Exception:
+                body = ""
+            if error.code in BLOCK_STATUSES or looks_blocked(body):
+                raise BlockedError(f"сайт показал защитную проверку (HTTP {error.code}): {url}") from error
             last_error = error
-        except (urllib.error.URLError, OSError) as error:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
             last_error = error
         else:
             if looks_blocked(page_html):
@@ -54,7 +82,9 @@ def fetch_plain(url, timeout=30, attempts=3):
             return page_html
         if attempt + 1 < attempts:
             time.sleep(2 * (attempt + 1))
-    raise FetchError(f"не удалось открыть {url}: {last_error}")
+    if isinstance(last_error, urllib.error.HTTPError):
+        raise FetchError(f"сайт ответил ошибкой HTTP {last_error.code}: {url}")
+    raise NetworkError(f"нет соединения с сайтом ({last_error}): {url}")
 
 
 class BrowserFetcher:

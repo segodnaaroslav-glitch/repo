@@ -63,7 +63,7 @@ class UpdateJob:
             }
 
 
-def build_payload(data):
+def build_payload(data, load_error=None):
     items = []
     for item in data.get("items", []):
         item = dict(item)
@@ -72,15 +72,31 @@ def build_payload(data):
     counts = {}
     for item in items:
         counts[item["category"]] = counts.get(item["category"], 0) + 1
+    category_info = data.get("categories") or {}
+    errors = {error.get("category"): error.get("message") for error in data.get("errors", []) if isinstance(error, dict)}
     return {
         "site_last_updated": data.get("site_last_updated"),
         "fetched_at": data.get("fetched_at"),
         "source": data.get("source"),
-        "errors": data.get("errors", []),
+        "load_error": load_error,
+        "errors": [error for error in data.get("errors", []) if isinstance(error, dict)],
         "categories": [
-            {"slug": slug, "title": title, "count": counts.get(slug, 0), "weapon": slug in parser.WEAPON_CATEGORIES}
+            {
+                "slug": slug,
+                "title": title,
+                "count": counts.get(slug, 0),
+                "weapon": slug in parser.WEAPON_CATEGORIES,
+                "updated_at": (category_info.get(slug) or {}).get("updated_at"),
+                "source": (category_info.get(slug) or {}).get("source"),
+                "error": errors.get(slug),
+            }
             for slug, title in parser.CATEGORIES
         ],
+        "liquidity": {
+            "liquid_from": liquidity.LIQUID_FROM,
+            "medium_from": liquidity.MEDIUM_FROM,
+            "stability": {name: bonus for name, (bonus, _) in liquidity.STABILITY.items()},
+        },
         "items": items,
     }
 
@@ -95,16 +111,26 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- проверки --------------------------------------------------------
 
-    def _allowed_hosts(self):
-        port = self.server.server_address[1]
-        return {f"127.0.0.1:{port}", f"localhost:{port}"}
+    def _local_address(self, value):
+        """"127.0.0.1:8765" / "localhost" (порт 80) -> адрес этой программы?"""
+        host, _, port = value.strip().lower().rpartition(":") if ":" in value else (value.strip().lower(), "", "")
+        if not host:
+            host, port = port, ""
+        server_port = self.server.server_address[1]
+        if port and port != str(server_port):
+            return False
+        if not port and server_port != 80:
+            return False
+        return host in ("127.0.0.1", "localhost")
 
     def _host_ok(self):
-        return self.headers.get("Host", "") in self._allowed_hosts()
+        return self._local_address(self.headers.get("Host", ""))
 
     def _origin_ok(self):
         origin = self.headers.get("Origin")
-        return origin is None or origin in {f"http://{host}" for host in self._allowed_hosts()}
+        if origin is None:
+            return True
+        return origin.lower().startswith("http://") and self._local_address(origin[len("http://"):].rstrip("/"))
 
     # --- ответы ----------------------------------------------------------
 
@@ -135,10 +161,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, (WEB_DIR / name).read_bytes(), content_type)
         if path == "/api/data":
             try:
-                data = store.load(self.data_path)
+                data, load_error = store.load(self.data_path), None
             except (OSError, ValueError) as error:
-                return self._error(500, f"Файл с ценами повреждён: {error}")
-            return self._json(200, build_payload(data))
+                # Показать пустую программу с ошибкой: обновление или импорт заменят файл.
+                data = store.empty_data()
+                load_error = f"Файл с ценами повреждён ({error}). Нажмите «Обновить цены» или загрузите цены через «Импорт»."
+            return self._json(200, build_payload(data, load_error))
         if path == "/api/status":
             return self._json(200, self.job.status())
         return self._error(404, "Не найдено")
@@ -166,17 +194,17 @@ class Handler(BaseHTTPRequestHandler):
             started = self.job.start()
             return self._json(202, {"started": started, **self.job.status()})
         if path == "/api/import":
-            if self.job.running:
-                return self._error(409, "Сейчас идёт обновление с сайта, попробуйте после него")
             text = body.get("text")
             category = body.get("category")
             if not isinstance(text, str) or not isinstance(category, str):
                 return self._error(400, "Нужны поля text и category")
             try:
-                items = store.import_text(text, category, self.data_path)
+                items, last_updated = store.import_text(text, category, self.data_path)
             except ValueError as error:
                 return self._error(400, str(error))
-            return self._json(200, {"imported": len(items), "category": category})
+            except OSError as error:
+                return self._error(500, f"Не удалось сохранить цены: {error}")
+            return self._json(200, {"imported": len(items), "category": category, "site_last_updated": last_updated})
         return self._error(404, "Не найдено")
 
 

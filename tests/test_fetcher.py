@@ -84,3 +84,45 @@ class PathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusBlockTests(unittest.TestCase):
+    def serve(self, status, body):
+        class Handler(Quiet):
+            def do_GET(self):
+                payload = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_address[1]}/"
+
+    def test_block_statuses_raise_blocked_at_once(self):
+        for status in (403, 429, 503):
+            url = self.serve(status, "<html>Access denied</html>")
+            with mock.patch.object(fetcher.time, "sleep") as sleep:
+                with self.assertRaises(fetcher.BlockedError):
+                    fetcher.fetch_plain(url)
+            sleep.assert_not_called()
+
+    def test_page_with_protection_script_but_content_is_not_blocked(self):
+        page = '<script src="/_Incapsula_Resource?x"></script><div>Alpha</div><div>Value - 10</div>'
+        self.assertFalse(fetcher.looks_blocked(page))
+        self.assertEqual(fetcher.fetch_plain(self.serve(200, page)), page)
+
+    def test_server_error_is_not_network_error(self):
+        url = self.serve(500, "oops")
+        with mock.patch.object(fetcher.time, "sleep"):
+            with self.assertRaises(fetcher.FetchError) as caught:
+                fetcher.fetch_plain(url)
+        self.assertNotIsInstance(caught.exception, fetcher.NetworkError)
+
+    def test_connection_refused_is_network_error(self):
+        with mock.patch.object(fetcher.time, "sleep"):
+            with self.assertRaises(fetcher.NetworkError):
+                fetcher.fetch_plain("http://127.0.0.1:9/", timeout=2)

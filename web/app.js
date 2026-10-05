@@ -109,13 +109,47 @@ function renderHeader() {
   $("fetchedAt").textContent = formatDate(state.data.fetched_at);
 }
 
+function renderErrors() {
+  const box = $("errorsBox");
+  const lines = [];
+  if (state.data.load_error) lines.push(state.data.load_error);
+  for (const error of state.data.errors || []) {
+    lines.push(`${error.title}: ${error.message}`);
+  }
+  box.replaceChildren();
+  if (!lines.length) {
+    box.classList.add("hidden");
+    return;
+  }
+  const head = state.data.load_error && lines.length === 1
+    ? "Внимание"
+    : "Эти категории не обновились при последней загрузке (у них остались прежние цены):";
+  box.append(el("strong", "", head));
+  const list = el("ul");
+  list.append(...lines.map((line) => el("li", "", line)));
+  box.append(list);
+  box.classList.remove("hidden");
+}
+
 // --- вкладка «Цены» ---------------------------------------------------------
 
-function categoryButton(slug, title, count) {
+function categoryButton(slug, title, count, info) {
   const li = el("li");
   const button = el("button", slug === state.category ? "active" : "");
   button.type = "button";
-  button.append(el("span", "", title), el("span", "count", count));
+  button.dataset.slug = slug;
+  button.setAttribute("aria-pressed", String(slug === state.category));
+  const label = el("span", "", title);
+  if (info && info.error) label.append(el("span", "warn", " ⚠"));
+  button.append(label, el("span", "count", count));
+  if (info) {
+    const parts = [];
+    parts.push(info.updated_at
+      ? `Обновлено: ${formatDate(info.updated_at)} (${info.source === "import" ? "импорт" : "с сайта"})`
+      : "Ещё не загружалось");
+    if (info.error) parts.push(`Последнее обновление не удалось: ${info.error}`);
+    button.title = parts.join("\n");
+  }
   button.addEventListener("click", () => {
     state.category = slug;
     storageSet("mm2.category", slug);
@@ -127,12 +161,17 @@ function categoryButton(slug, title, count) {
 
 function renderCategories() {
   const list = $("categoryList");
+  const focused = list.contains(document.activeElement) ? document.activeElement.dataset.slug : null;
   list.replaceChildren(
     categoryButton("weapons", "Всё оружие", itemsIn("weapons").length),
     categoryButton("all", "Все предметы", state.data.items.length),
     el("li", "divider"),
-    ...state.data.categories.map((c) => categoryButton(c.slug, c.title, c.count)),
+    ...state.data.categories.map((c) => categoryButton(c.slug, c.title, c.count, c)),
   );
+  if (focused) {
+    const again = list.querySelector(`button[data-slug="${CSS.escape(focused)}"]`);
+    if (again) again.focus();
+  }
 }
 
 function valueCell(item) {
@@ -193,6 +232,18 @@ function renderValues() {
 }
 
 // --- вкладка «Ликвидность» --------------------------------------------------
+
+function renderMethod() {
+  const info = state.data.liquidity;
+  if (!info) return;
+  const weights = Object.entries(info.stability)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, bonus]) => `${name.replace(/\b\w/g, (c) => c.toUpperCase())} ${bonus > 0 ? "+" : bonus < 0 ? "−" : "±"}${Math.abs(bonus)}`);
+  $("methodStability").textContent = weights.join(", ");
+  $("methodLiquid").textContent = info.liquid_from;
+  $("methodMedium").textContent = `${info.medium_from}–${info.liquid_from - 1}`;
+  $("methodIlliquid").textContent = info.medium_from;
+}
 
 function renderLiqCategorySelect() {
   const select = $("liqCategory");
@@ -278,7 +329,10 @@ async function submitImport(event) {
       category: $("importCategory").value,
       text: $("importText").value,
     });
-    result.textContent = `Загружено предметов: ${response.imported} (${categoryTitle(response.category)}).`;
+    const parts = [];
+    if (response.imported) parts.push(`Загружено предметов: ${response.imported} (${categoryTitle(response.category)}).`);
+    if (response.site_last_updated) parts.push(`Дата обновления цен на сайте: ${response.site_last_updated}.`);
+    result.textContent = parts.join(" ");
     $("importText").value = "";
     await loadData();
   } catch (error) {
@@ -315,7 +369,8 @@ async function followUpdate() {
     if (status.error) {
       showStatus(`Не удалось обновить цены:\n${status.error}`, true);
     } else if (status.finished_at) {
-      showStatus(status.log.slice(-1).join("") || "Цены обновлены.");
+      const summary = status.log.filter((line) => line.startsWith("Готово") || line.startsWith("Не обновлено"));
+      showStatus(summary.join("\n") || "Цены обновлены.", summary.some((line) => line.startsWith("Не обновлено")));
     }
     await loadData();
   } catch (error) {
@@ -340,6 +395,8 @@ async function startUpdate() {
 
 function renderAll() {
   renderHeader();
+  renderErrors();
+  renderMethod();
   renderValues();
   renderLiqCategorySelect();
   renderLiquidity();
@@ -357,9 +414,6 @@ async function loadData() {
   if (!known.has(state.category)) state.category = "weapons";
   if (!known.has(state.liqCategory)) state.liqCategory = "weapons";
   renderAll();
-  if (state.data.errors && state.data.errors.length) {
-    $("valuesHint").textContent += ` Не загрузились: ${state.data.errors.length} кат. (подробности — после «Обновить цены»).`;
-  }
 }
 
 function switchTab(name) {
@@ -382,6 +436,10 @@ function init() {
   const savedTab = storageGet("mm2.tab");
   if (savedTab && document.getElementById(`tab-${savedTab}`)) switchTab(savedTab);
 
+  // После «Назад» или F5 браузер может восстановить выбранные пункты — берём их из полей.
+  if (SORTS[$("sort").value]) state.sort = $("sort").value;
+  state.search = $("search").value;
+  state.liqSearch = $("liqSearch").value;
   $("search").addEventListener("input", (event) => { state.search = event.target.value; renderValues(); });
   $("sort").addEventListener("change", (event) => { state.sort = event.target.value; renderValues(); });
   $("liqSearch").addEventListener("input", (event) => { state.liqSearch = event.target.value; renderLiquidity(); });

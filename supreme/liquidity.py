@@ -19,7 +19,7 @@ LIQUID_FROM = 60
 MEDIUM_FROM = 30
 DEMAND_SCALE = 10
 
-_STABILITY = {
+STABILITY = {
     "overpaid for": (15, "за него платят больше значения"),
     "doing well": (10, "цена растёт"),
     "improving": (8, "цена растёт"),
@@ -62,8 +62,8 @@ def assess(item):
         reasons.append(f"спрос {demand}/{DEMAND_SCALE} — {word}")
 
     stability = (item.get("stability") or "").strip().lower()
-    if stability in _STABILITY:
-        bonus, text = _STABILITY[stability]
+    if stability in STABILITY:
+        bonus, text = STABILITY[stability]
         score += bonus
         reasons.append(f"{item['stability']}: {text}")
 
