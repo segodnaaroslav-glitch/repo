@@ -111,23 +111,23 @@ function renderHeader() {
 
 function renderErrors() {
   const box = $("errorsBox");
-  const lines = [];
-  if (state.data.load_error) lines.push(state.data.load_error);
-  for (const error of state.data.errors || []) {
-    lines.push(`${error.title}: ${error.message}`);
-  }
   box.replaceChildren();
-  if (!lines.length) {
+  if (!state.data.load_error && !(state.data.errors || []).length) {
     box.classList.add("hidden");
     return;
   }
-  const head = state.data.load_error && lines.length === 1
-    ? "Внимание"
-    : "Эти категории не обновились при последней загрузке (у них остались прежние цены):";
-  box.append(el("strong", "", head));
-  const list = el("ul");
-  list.append(...lines.map((line) => el("li", "", line)));
-  box.append(list);
+  if (state.data.load_error) box.append(el("p", "", state.data.load_error));
+  const failed = state.data.errors || [];
+  if (failed.length) {
+    box.append(el("strong", "", "Эти категории не обновились при последней загрузке:"));
+    const list = el("ul");
+    list.append(...failed.map((error) => {
+      const info = state.data.categories.find((c) => c.slug === error.category);
+      const kept = info && info.count ? "остались прежние цены" : "цен пока нет";
+      return el("li", "", `${error.title}: ${error.message} (${kept})`);
+    }));
+    box.append(list);
+  }
   box.classList.remove("hidden");
 }
 
@@ -330,10 +330,17 @@ async function submitImport(event) {
       text: $("importText").value,
     });
     const parts = [];
-    if (response.imported) parts.push(`Загружено предметов: ${response.imported} (${categoryTitle(response.category)}).`);
-    if (response.site_last_updated) parts.push(`Дата обновления цен на сайте: ${response.site_last_updated}.`);
+    if (response.imported) {
+      parts.push(`Загружено предметов: ${response.imported} (${categoryTitle(response.category)}).`);
+    } else {
+      parts.push("Предметы в тексте не найдены — цены не изменены.");
+    }
+    if (response.site_last_updated) parts.push(`Дата обновления цен на сайте сохранена: ${response.site_last_updated}.`);
     result.textContent = parts.join(" ");
-    $("importText").value = "";
+    if (response.imported) {
+      $("importText").value = "";
+      showStatus("");
+    }
     await loadData();
   } catch (error) {
     result.textContent = `Ошибка: ${error.message}`;
@@ -369,8 +376,8 @@ async function followUpdate() {
     if (status.error) {
       showStatus(`Не удалось обновить цены:\n${status.error}`, true);
     } else if (status.finished_at) {
-      const summary = status.log.filter((line) => line.startsWith("Готово") || line.startsWith("Не обновлено"));
-      showStatus(summary.join("\n") || "Цены обновлены.", summary.some((line) => line.startsWith("Не обновлено")));
+      // Категории с ошибками показывает отдельный список, он обновляется вместе с данными.
+      showStatus(status.log.filter((line) => line.startsWith("Готово")).join("\n") || "Цены обновлены.");
     }
     await loadData();
   } catch (error) {

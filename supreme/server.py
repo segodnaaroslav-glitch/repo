@@ -1,6 +1,7 @@
 """Локальный веб-сервер программы: http://127.0.0.1:<порт>/"""
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -14,6 +15,12 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 MAX_BODY = 5 * 1024 * 1024
+
+
+class _ExclusiveServer(ThreadingHTTPServer):
+    # На Windows SO_REUSEADDR позволяет занять уже занятый порт — вторая копия
+    # программы «запустилась бы» на том же порту. Здесь занятый порт — ошибка.
+    allow_reuse_address = False
 
 
 class UpdateJob:
@@ -161,12 +168,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, (WEB_DIR / name).read_bytes(), content_type)
         if path == "/api/data":
             try:
-                data, load_error = store.load(self.data_path), None
-            except (OSError, ValueError) as error:
+                payload = build_payload(store.load(self.data_path))
+            except PermissionError as error:
+                payload = build_payload(store.empty_data(), f"Файл с ценами сейчас занят ({error}). Обновите страницу.")
+            except Exception as error:
                 # Показать пустую программу с ошибкой: обновление или импорт заменят файл.
-                data = store.empty_data()
-                load_error = f"Файл с ценами повреждён ({error}). Нажмите «Обновить цены» или загрузите цены через «Импорт»."
-            return self._json(200, build_payload(data, load_error))
+                payload = build_payload(
+                    store.empty_data(),
+                    f"Файл с ценами повреждён ({error}). Нажмите «Обновить цены» или загрузите цены через «Импорт».",
+                )
+            return self._json(200, payload)
         if path == "/api/status":
             return self._json(200, self.job.status())
         return self._error(404, "Не найдено")
@@ -204,6 +215,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(error))
             except OSError as error:
                 return self._error(500, f"Не удалось сохранить цены: {error}")
+            except Exception as error:  # ответить понятной ошибкой, а не обрывом соединения
+                return self._error(500, f"Ошибка импорта: {error}")
             return self._json(200, {"imported": len(items), "category": category, "site_last_updated": last_updated})
         return self._error(404, "Не найдено")
 
@@ -212,10 +225,11 @@ def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=
     """Создать сервер; если порт занят — взять следующий свободный."""
     job = UpdateJob(update or (lambda log: store.update_from_site(log=log, path=data_path)))
     handler = type("BoundHandler", (Handler,), {"job": job, "data_path": data_path})
+    server_class = _ExclusiveServer if os.name == "nt" else ThreadingHTTPServer
     last_error = None
     for offset in range(tries):
         try:
-            server = ThreadingHTTPServer((host, port + offset if port else 0), handler)
+            server = server_class((host, port + offset if port else 0), handler)
         except OSError as error:
             last_error = error
             if not port:

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -21,9 +22,8 @@ def app_dir():
 def _writable(folder):
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        probe = folder / ".write-test"
-        probe.write_bytes(b"")
-        probe.unlink()
+        with tempfile.TemporaryFile(dir=str(folder)):
+            pass
     except OSError:
         return False
     return True

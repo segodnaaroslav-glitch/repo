@@ -18,15 +18,21 @@ import webbrowser
 from supreme import parser, paths, server, store
 
 
-def running_instance(port):
-    """Адрес уже запущенной программы на этом порту (повторный двойной щелчок по exe)."""
-    url = f"http://127.0.0.1:{port}/"
-    try:
-        with urllib.request.urlopen(url + "api/status", timeout=2) as response:
-            status = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError):
-        return None
-    return url if isinstance(status, dict) and "running" in status else None
+def running_instance(port, tries=20):
+    """Адрес уже запущенной программы (повторный двойной щелчок по exe).
+
+    Проверяются те же порты, которые программа занимает, если основной занят.
+    """
+    for candidate in range(port, port + tries):
+        url = f"http://127.0.0.1:{candidate}/"
+        try:
+            with urllib.request.urlopen(url + "api/status", timeout=0.5) as response:
+                status = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            continue
+        if isinstance(status, dict) and "running" in status and "finished_at" in status:
+            return url
+    return None
 
 
 def cmd_run(args):
@@ -77,7 +83,7 @@ def cmd_find(args):
         print(f"Обновите цены: {program_command()} update", file=sys.stderr)
         return 1
     query = " ".join(args.query).lower()
-    found = [item for item in data["items"] if query in item["name"].lower()]
+    found = [item for item in data["items"] if query in item["name"].lower()]  # типы проверены в store.load
     if not data["items"]:
         print(f"Цен пока нет. Запустите: {program_command()} update")
         return 1
@@ -99,6 +105,8 @@ def read_text_file(path):
         raw = file.read()
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "replace")
     try:
         return raw.decode("utf-8-sig")
     except UnicodeDecodeError:

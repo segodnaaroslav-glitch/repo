@@ -300,3 +300,87 @@ class CliTests(unittest.TestCase):
                 path = Path(tmp) / f"{encoding}.txt"
                 path.write_bytes("Нож Alpha\nValue - 5\n".encode(encoding))
                 self.assertEqual(mm2_values.read_text_file(path), "Нож Alpha\nValue - 5\n", encoding)
+
+
+class SecondReviewStoreTests(StoreRegressionTests):
+    def test_file_from_previous_version(self):
+        self.path.write_text(json.dumps({
+            "items": [{"name": "Old", "category": "rares", "value": "12", "demand": True}],
+            "errors": ["Godlies: предметы не найдены", "Unknown: x", 5],
+            "categories": {"rares": "bad", "commons": {"updated_at": "2026-01-01T00:00:00+00:00"}},
+        }), encoding="utf-8")
+        data = store.load(self.path)
+        self.assertEqual((data["items"][0]["value"], data["items"][0]["demand"], data["items"][0]["value_text"]), (None, None, ""))
+        self.assertEqual(data["errors"], [{"category": "godlies", "title": "Godlies", "message": "предметы не найдены"}])
+        self.assertEqual(list(data["categories"]), ["commons"])
+        store.import_text("Alpha\nValue - 5\n", "godlies", self.path)
+        self.assertEqual(store.load(self.path)["errors"], [])
+
+    def test_read_error_never_overwrites_prices(self):
+        from unittest import mock
+        store.import_text("Alpha\nValue - 5\n", "rares", self.path)
+        before = self.path.read_bytes()
+        with mock.patch.object(store, "load", side_effect=PermissionError("занято")), \
+                mock.patch.object(store.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                store.import_text("Beta\nValue - 6\n", "commons", self.path)
+            with self.assertRaises(PermissionError):
+                store.update_from_site(fetch=self.site(), log=self.quiet, path=self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_shrunk_category_accepted_second_time_or_after_import(self):
+        old = store.empty_data()
+        store.replace_category(old, "godlies", [parser.make_item(f"G{i}", "godlies", {"value": "1"}) for i in range(20)], "site")
+        store.save(old, self.path)
+        first = store.update_from_site(fetch=self.site(), log=self.quiet, path=self.path)
+        self.assertEqual(len([i for i in first["items"] if i["category"] == "godlies"]), 20)
+        second = store.update_from_site(fetch=self.site(), log=self.quiet, path=self.path)
+        self.assertEqual([i["name"] for i in second["items"] if i["category"] == "godlies"], ["godlies item"])
+
+        imported = store.empty_data()
+        store.replace_category(imported, "godlies", [parser.make_item(f"G{i}", "godlies", {"value": "1"}) for i in range(20)], "import")
+        store.save(imported, self.path)
+        third = store.update_from_site(fetch=self.site(), log=self.quiet, path=self.path)
+        self.assertEqual(len([i for i in third["items"] if i["category"] == "godlies"]), 1)
+
+    def test_import_into_downloaded_category_during_update_wins(self):
+        def fetch(url):
+            if url.endswith("/commons"):
+                store.import_text("Values Last Updated - Oct 7th, 2026 at 1:00 PM\nMy Godly\nValue - 7\n", "godlies", self.path)
+            return self.site({"godlies": fetcher.FetchError("404")})(url)
+        data = store.update_from_site(fetch=fetch, log=self.quiet, path=self.path)
+        self.assertEqual([i["name"] for i in data["items"] if i["category"] == "godlies"], ["My Godly"])
+        self.assertNotIn("godlies", [e["category"] for e in data["errors"]])
+        self.assertEqual(data["site_last_updated"], "Oct 7th, 2026 at 1:00 PM")
+
+    def test_debug_page_saved_next_to_data_file(self):
+        store.update_from_site(fetch=self.site({"rares": "<html>empty</html>"}), log=self.quiet, path=self.path)
+        self.assertTrue((self.path.parent / "debug" / "rares.html").exists())
+
+    def test_import_with_many_unnamed_cards_rejected(self):
+        with self.assertRaises(ValueError):
+            store.import_text("Value - 1\nValue - 2\nValue - 3\nAlpha\nValue - 4\n", "rares", self.path)
+
+    def test_popup_page_with_protection_marker_not_blocked(self):
+        page = '<script src="/_Incapsula_Resource"></script><script>var _svPopup = {"Mu": {"value": "5"}};</script>'
+        self.assertFalse(fetcher.looks_blocked(page))
+
+
+class SecondReviewCliTests(unittest.TestCase):
+    def test_bom_with_bad_byte(self):
+        import mm2_values
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.txt"
+            path.write_bytes(b"\xef\xbb\xbfAlpha \xff\nValue - 5\n")
+            self.assertTrue(mm2_values.read_text_file(path).startswith("Alpha "))
+
+    def test_running_instance_found_on_fallback_port(self):
+        import mm2_values
+        httpd = server.make_server(port=0, data_path=Path(tempfile.mkdtemp()) / "v.json", update=lambda log: None)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            port = httpd.server_address[1]
+            self.assertEqual(mm2_values.running_instance(port - 3, tries=5), f"http://127.0.0.1:{port}/")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()

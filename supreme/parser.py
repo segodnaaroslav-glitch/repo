@@ -59,6 +59,9 @@ _NUMBER = r"\d[\d,]*(?:\.\d+)?\s*[KkMmBb]?"
 _NUMBER_RE = re.compile(rf"^({_NUMBER})$")
 _RANGE_RE = re.compile(rf"^\[?\s*({_NUMBER})\s*(?:[-–—]|to)\s*({_NUMBER})\s*\]?$", re.I)
 _SINGLE_RANGE_RE = re.compile(rf"^\[?\s*({_NUMBER})\s*\]?$")
+_LOOSE_RANGE_RE = re.compile(
+    rf"[\s\[({{~≈*+]*({_NUMBER})\s*[~≈*+]?\s*(?:[-–—~]|to)\s*[~≈*+]?\s*({_NUMBER})[\s\])}}~≈*+]*", re.I
+)
 _SUFFIX = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
 
 _LABEL_RE = re.compile(
@@ -112,11 +115,8 @@ def range_low(range_text):
     if match:
         return parse_number(match.group(1))
     # Другие записи диапазона: "(1,320 - 1,340)", "~1,320 ~ 1,340", "[1,320 - 1,340]*".
-    numbers = re.findall(_NUMBER, text)
-    rest = re.sub(_NUMBER, "", text)
-    if len(numbers) == 2 and re.fullmatch(r"[\s\[\](){}~≈*+\-–—]*(?:to)?[\s\[\](){}~≈*+\-–—]*", rest, re.I):
-        return parse_number(numbers[0])
-    return None
+    match = _LOOSE_RANGE_RE.fullmatch(text)
+    return parse_number(match.group(1)) if match else None
 
 
 def program_value(value_text, range_text):
@@ -152,13 +152,19 @@ def _to_int(text):
 # --- HTML -> текст ---------------------------------------------------------
 
 _BLOCK_TAGS = {
-    "a", "address", "article", "aside", "blockquote", "br", "button", "dd", "details", "div",
+    "address", "article", "aside", "blockquote", "br", "button", "dd", "details", "div",
     "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
     "h4", "h5", "h6", "header", "hr", "img", "label", "li", "main", "nav", "ol", "option",
     "p", "section", "select", "summary", "table", "tbody", "td", "tfoot", "th", "thead",
     "tr", "ul",
 }
 _SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "title"}
+# Границы разделов страницы: текст после них не может быть полем предыдущей карточки.
+_SECTION_TAGS = {"footer", "nav", "aside"}
+SECTION_BREAK = "\x00"
+_INLINE = "\x1f"  # граница строчного тега; решается в html_to_text
+_ANCHOR = "\x02"  # место начала ссылки <a>; решается при её закрытии
+_BADGE_CLASS_RE = re.compile(r"(?<![\w-])badge(?![\w-])", re.I)
 
 
 class _TextExtractor(HTMLParser):
@@ -166,28 +172,61 @@ class _TextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.skip_depth = 0
+        self.anchors = []  # индексы открытых <a> в self.parts
+        self.badge = None  # [тег, глубина] значка ("NEW", "HOT"), его текст пропускается
 
-    # Соседние строчные теги без пробела ("<span>Demand -</span><span>2</span>") не должны
-    # склеивать слова, поэтому вместо них ставится пробел.
+    def _boundary(self, tag):
+        if tag in _SECTION_TAGS:
+            self.parts.append(f"\n{SECTION_BREAK}\n")
+        else:
+            self.parts.append("\n" if tag in _BLOCK_TAGS else _INLINE)
 
     def handle_starttag(self, tag, attrs):
+        if self.badge:
+            if tag == self.badge[0]:
+                self.badge[1] += 1
+            return
         if tag in _SKIP_TAGS:
             self.skip_depth += 1
-        else:
-            self.parts.append("\n" if tag in _BLOCK_TAGS else " ")
+            return
+        if tag not in _BLOCK_TAGS and _BADGE_CLASS_RE.search(dict(attrs).get("class") or ""):
+            self.badge = [tag, 1]
+            return
+        if tag == "a":
+            self.anchors.append(len(self.parts))
+            self.parts.append(_ANCHOR)
+            return
+        self._boundary(tag)
 
     def handle_startendtag(self, tag, attrs):
-        if tag not in _SKIP_TAGS:
-            self.parts.append("\n" if tag in _BLOCK_TAGS else " ")
+        if not self.badge and tag not in _SKIP_TAGS:
+            self._boundary(tag)
 
     def handle_endtag(self, tag):
+        if self.badge:
+            if tag == self.badge[0]:
+                self.badge[1] -= 1
+                if not self.badge[1]:
+                    self.badge = None
+            return
         if tag in _SKIP_TAGS:
             self.skip_depth = max(0, self.skip_depth - 1)
-        else:
-            self.parts.append("\n" if tag in _BLOCK_TAGS else " ")
+            return
+        if tag == "a":
+            if not self.anchors:
+                return
+            start = self.anchors.pop()
+            # Ссылка с целой карточкой внутри — отдельный блок; ссылка внутри строки
+            # ("<a>Value</a> - 10", "Chroma <a>Luger</a>") — часть строки.
+            inner = "".join(self.parts[start + 1:])
+            separator = "\n" if "\n" in inner or _LABEL_RE.search(inner.replace(_INLINE, " ")) else _INLINE
+            self.parts[start] = separator
+            self.parts.append(separator)
+            return
+        self._boundary(tag)
 
     def handle_data(self, data):
-        if not self.skip_depth:
+        if not self.skip_depth and not self.badge:
             self.parts.append(data)
 
 
@@ -196,7 +235,13 @@ def html_to_text(page_html):
     extractor = _TextExtractor()
     extractor.feed(page_html)
     extractor.close()
-    lines = (re.sub(r"[ \t\r\f\v\xa0]+", " ", line).strip() for line in "".join(extractor.parts).split("\n"))
+    text = "".join(extractor.parts).replace(_ANCHOR, _INLINE)
+    # Соседние строчные теги без пробела браузер показывает слитно ("Traveler<b>'s</b>",
+    # "1<span>,</span>320"). Пробел нужен только перед меткой поля или новым словом
+    # с заглавной буквы ("<span>Alpha</span><span>Value -</span>", "10</span><span>Beta").
+    text = re.sub(_INLINE + r"+(?=\s*(?:" + _LABEL_RE.pattern + r"|[A-ZА-ЯЁ]))", " ", text)
+    text = text.replace(_INLINE, "")
+    lines = (re.sub(r"[ \t\r\f\v\xa0]+", " ", line).strip() for line in text.split("\n"))
     return "\n".join(line for line in lines if line)
 
 
@@ -238,7 +283,7 @@ def _split_line(line):
 
 def _is_name_like(text):
     text = clean_name(text)
-    if text.lower() in _BADGES:
+    if text.lower().rstrip("!") in _BADGES:
         return False
     return 2 <= len(text) <= 80 and bool(re.search(r"[A-Za-z]", text))
 
@@ -263,6 +308,25 @@ def _set_field(card, key, text):
     card[key] = text
 
 
+_SPLIT_NUMERIC_RE = re.compile(
+    rf"^([\[(]?\s*[~≈*+]*{_NUMBER}(?:\s*(?:[-–—]|to)\s*[~≈*+]*{_NUMBER})?\s*[\])]?\*?)\s+(\S.*)$", re.I
+)
+_SPLIT_STABILITY_RE = re.compile(r"^(" + "|".join(STABILITIES) + r")\s+(\S.*)$", re.I)
+
+
+def _split_trailing_name(key, value):
+    """"10 Beta" перед следующим "Value -" на той же строке -> ("10", "Beta")."""
+    if key in ("value", "range", "demand", "rarity", "change"):
+        match = _SPLIT_NUMERIC_RE.match(value)
+    elif key == "stability":
+        match = _SPLIT_STABILITY_RE.match(value)
+    else:
+        return value, None
+    if match and _is_name_like(match.group(2)):
+        return match.group(1), clean_name(match.group(2))
+    return value, None
+
+
 def parse_cards(text, known_names=()):
     """Найти карточки предметов в тексте страницы (или в скопированном тексте).
 
@@ -274,6 +338,7 @@ def parse_cards(text, known_names=()):
     card = None
     candidates = []
     name_before_contains = None
+    contains_first = None  # на странице наборов "Contains" идёт до "Value"?
     pending = None    # метка, значение которой ожидается на следующей строке
     tentative = None  # (метка, текст): значение поля или название следующей карточки
 
@@ -287,10 +352,17 @@ def parse_cards(text, known_names=()):
             tentative = None
 
     for raw_line in text.splitlines():
+        if raw_line.strip(" ") == SECTION_BREAK:
+            # Начался другой раздел страницы (подвал, меню): дальше не поля карточки.
+            commit_tentative()
+            pending = None
+            candidates = []
+            continue
         line = re.sub(r"\s+", " ", raw_line).strip()
         if not line:
             continue
-        for key, value in _split_line(line):
+        segments = _split_line(line)
+        for index, (key, value) in enumerate(segments):
             if key is None:
                 commit_tentative()
                 if pending and not clean_name(value):
@@ -311,8 +383,18 @@ def parse_cards(text, known_names=()):
                     candidates.append(clean_name(value))
                 continue
 
-            if key in ("value", "contains") and tentative:
+            if key == "contains" and contains_first is None:
+                contains_first = not cards
+            if tentative and key == "value":
                 tentative = None  # это было название следующей карточки
+            elif tentative and key == "contains":
+                if not contains_first:
+                    commit_tentative()  # "Value ... Origin - X ... Contains": поле этой карточки
+                elif len(candidates) > 1:
+                    candidates.pop()  # название было раньше, а это поле — его не знаем куда деть
+                    tentative = None
+                else:
+                    tentative = None  # это было название следующего набора
             commit_tentative()
             pending = None
             if key == "value":
@@ -324,15 +406,21 @@ def parse_cards(text, known_names=()):
                     orphans += 1
                 candidates = []
                 name_before_contains = None
-            elif key == "contains" and name_before_contains is None:
+            elif key == "contains" and contains_first and name_before_contains is None:
                 name_before_contains = _pick_name(candidates, known_keys)
 
             if key == "contains":
                 continue
+            next_name = None
+            if index + 1 < len(segments) and segments[index + 1][0] == "value":
+                # Несколько карточек в одной строке: "Value - 10 Beta Value - 20".
+                value, next_name = _split_trailing_name(key, value)
             if value:
                 _set_field(card, key, value)
             else:
                 pending = key
+            if next_name:
+                candidates.append(next_name)
     commit_tentative()
     return cards, orphans
 

@@ -246,3 +246,52 @@ class ReviewRegressionTests(unittest.TestCase):
 
     def test_bom_removed_from_name(self):
         self.assertEqual(parser.items_from_text("﻿Alpha\nValue - 1\n", "rares")[0]["name"], "Alpha")
+
+
+class SecondReviewRegressionTests(unittest.TestCase):
+    """Случаи, найденные при повторной проверке исправлений."""
+
+    def parse(self, page, category="godlies"):
+        return parser.parse_category_page(page, category)[0]
+
+    def test_links_inside_lines_stay_inline(self):
+        page = ('<div>Chroma <a>Luger</a></div><div><a href="/faq">Value</a> - 1,330</div>'
+                '<div><a>Range</a> - [1,320 - 1,340]</div><div><a>Demand</a> - 7</div>'
+                '<div>Origin - <a>Christmas</a> 2024</div><div>Aliases - <a>AB</a>, <a>Alph</a></div>')
+        item = self.parse(page)[0]
+        self.assertEqual((item["name"], item["value"], item["demand"], item["origin"], item["aliases"]),
+                         ("Chroma Luger", 1320, 7, "Christmas 2024", "AB, Alph"))
+
+    def test_inline_tags_do_not_split_words_or_numbers(self):
+        item = self.parse("<div>Traveler<b>'s</b> Axe</div><div>Value - 1<span>,</span>320</div>")[0]
+        self.assertEqual((item["name"], item["value"]), ("Traveler's Axe", 1320))
+
+    def test_badge_inside_heading(self):
+        page = ('<h3>Alpha Knife <span class="badge">NEW</span></h3><div>Value - 10</div>'
+                '<h3><span>Beta</span><span class="badge new">HOT</span></h3><div>Value - 20</div>')
+        self.assertEqual([i["name"] for i in self.parse(page)], ["Alpha Knife", "Beta"])
+        self.assertEqual(parser.items_from_text("Gamma\nNEW!\nValue - 1\n", "godlies")[0]["name"], "Gamma")
+
+    def test_footer_is_not_origin(self):
+        page = "<div>Alpha</div><div>Value - 1</div><div>Origin -</div><footer>Copyright 2026</footer>"
+        self.assertEqual(self.parse(page)[0]["origin"], "")
+        text_items = parser.items_from_text("Alpha\nValue - 1\nOrigin -\nXmas 2024\n", "godlies")
+        self.assertEqual(text_items[0]["origin"], "Xmas 2024")
+
+    def test_several_cards_on_one_line(self):
+        cards, orphans = parser.parse_cards("Alpha Value - 10 Demand - 3 Beta Value - 20 Stability - Stable Gamma Value - 30\n")
+        self.assertEqual([(c["name"], c["value"]) for c in cards], [("Alpha", "10"), ("Beta", "20"), ("Gamma", "30")])
+        self.assertEqual((cards[0]["demand"], cards[1]["stability"], orphans), ("3", "Stable", 0))
+
+    def test_set_field_orders(self):
+        first = parser.items_from_text("Alpha Set\nAliases -\nAS\nContains - a\nValue - 300\nBeta Set\nContains - b\nValue - 500\n", "sets")
+        self.assertEqual([(i["name"], i["value"]) for i in first], [("Alpha Set", 300), ("Beta Set", 500)])
+        second = parser.items_from_text("Alpha Set\nValue - 300\nOrigin -\nXmas 2024\nContains - a\nBeta Set\nValue - 500\n", "sets")
+        self.assertEqual([(i["name"], i["value"], i["origin"]) for i in second],
+                         [("Alpha Set", 300, "Xmas 2024"), ("Beta Set", 500, "")])
+
+    def test_loose_range_does_not_misread_values(self):
+        for text in ("50 + 20", "5 (10)", "130 (+10)", "x2 T1 Commons"):
+            self.assertIsNone(parser.range_low(text), text)
+        for text in ("~1,320 - ~1,340", "1,320 to 1,340", "≈1,320 - 1,340"):
+            self.assertEqual(parser.range_low(text), 1320, text)

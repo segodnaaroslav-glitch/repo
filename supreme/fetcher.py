@@ -47,6 +47,8 @@ def looks_blocked(page_html):
     нормальной странице, поэтому блокировкой считается только страница без данных."""
     if "_Incapsula_Resource" not in page_html and "Request unsuccessful" not in page_html:
         return False
+    if parser.parse_popup(page_html):
+        return False
     return not _CONTENT_RE.search(parser.html_to_text(page_html))
 
 
