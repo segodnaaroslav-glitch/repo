@@ -1,78 +1,100 @@
-"""Значения оружия MM2 по сайту Supreme Values (https://supremevalues.com/).
-
-Значение каждого оружия — первое число диапазона с сайта:
-"1320 - 1340" -> 1320.
+"""Цены оружия и предметов MM2 по сайту Supreme Values (https://supremevalues.com/mm2).
 
 Запуск:
-    python3 mm2_values.py              # показать всё оружие
-    python3 mm2_values.py chroma       # поиск по названию
-    python3 mm2_values.py --import values.txt   # загрузить значения из текста
+    python mm2_values.py                 открыть программу в браузере
+    python mm2_values.py update          обновить цены с сайта
+    python mm2_values.py find chroma     найти предмет в консоли
+    python mm2_values.py import page.txt --category godlies
+                                         загрузить текст, скопированный со страницы сайта
 """
 
-import json
-import re
+import argparse
 import sys
-from pathlib import Path
+import threading
+import webbrowser
 
-DATA_FILE = Path(__file__).with_name("weapons.json")
-
-# Число может содержать запятые как разделители тысяч: "1,320".
-_NUMBER = r"\d[\d,]*(?:\.\d+)?"
-_RANGE_LINE = re.compile(rf"^(?P<name>.+?)\s*[:\t]?\s*(?P<value>{_NUMBER}(?:\s*-\s*{_NUMBER})?)\s*$")
+from supreme import parser, server, store
 
 
-def parse_value(text):
-    """Вернуть первое число из строки значения: "1320 - 1340" -> 1320."""
-    match = re.search(_NUMBER, text)
-    if not match:
-        raise ValueError(f"В строке нет числа: {text!r}")
-    number = match.group().replace(",", "")
-    return float(number) if "." in number else int(number)
+def cmd_run(args):
+    httpd = server.make_server(port=args.port)
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    if not store.DATA_FILE.exists():
+        httpd.job.start()  # первый запуск: сразу скачать цены
+    print(f"Программа открыта: {url}")
+    print("Чтобы закрыть программу, закройте это окно или нажмите Ctrl+C.")
+    if not args.no_browser:
+        threading.Timer(0.5, webbrowser.open, (url,)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
 
 
-def load_weapons():
-    if not DATA_FILE.exists():
-        return {}
-    return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+def cmd_update(args):
+    try:
+        store.update_from_site()
+    except store.UpdateError as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
 
 
-def save_weapons(weapons):
-    DATA_FILE.write_text(
-        json.dumps(weapons, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-
-
-def import_text(path):
-    """Прочитать строки вида "Название 1320 - 1340" и сохранить первое число."""
-    weapons = load_weapons()
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        match = _RANGE_LINE.match(line)
-        if not match:
-            print(f"Пропущена строка: {line}", file=sys.stderr)
-            continue
-        weapons[match.group("name").strip()] = parse_value(match.group("value"))
-    save_weapons(weapons)
-    return weapons
-
-
-def main(args):
-    if args[:1] == ["--import"]:
-        weapons = import_text(args[1])
-        print(f"Загружено оружия: {len(weapons)}")
-        return
-
-    weapons = load_weapons()
-    query = " ".join(args).lower()
-    found = {name: value for name, value in weapons.items() if query in name.lower()}
+def cmd_find(args):
+    data = store.load()
+    query = " ".join(args.query).lower()
+    found = [item for item in data["items"] if query in item["name"].lower()]
+    if not data["items"]:
+        print("Цен пока нет. Запустите: python mm2_values.py update")
+        return 1
     if not found:
-        print("Ничего не найдено." if weapons else "Список оружия пуст.")
-        return
-    for name, value in sorted(found.items(), key=lambda item: -item[1]):
-        print(f"{name}: {value}")
+        print("Ничего не найдено.")
+        return 1
+    found.sort(key=lambda item: (item["value"] is None, -(item["value"] or 0), item["name"]))
+    for item in found:
+        value = item["value"] if item["value"] is not None else item["value_text"] or "—"
+        title = parser.CATEGORY_TITLES.get(item["category"], item["category"])
+        print(f"{item['name']} [{title}]: {value}")
+    print(f"\nЦены на сайте обновлены: {data.get('site_last_updated') or '—'}")
+    return 0
+
+
+def cmd_import(args):
+    with open(args.file, encoding="utf-8") as file:
+        text = file.read()
+    try:
+        items = store.import_text(text, args.category)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    print(f"Загружено предметов: {len(items)}")
+    return 0
+
+
+def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except AttributeError:
+            pass
+
+    arg_parser = argparse.ArgumentParser(description="Цены MM2 по сайту Supreme Values")
+    arg_parser.add_argument("--port", type=int, default=8765, help="порт программы (по умолчанию 8765)")
+    arg_parser.add_argument("--no-browser", action="store_true", help="не открывать браузер")
+    commands = arg_parser.add_subparsers(dest="command")
+    commands.add_parser("update", help="обновить цены с сайта")
+    find = commands.add_parser("find", help="найти предмет")
+    find.add_argument("query", nargs="+")
+    importer = commands.add_parser("import", help="загрузить скопированный текст страницы")
+    importer.add_argument("file")
+    importer.add_argument("--category", required=True, choices=[slug for slug, _ in parser.CATEGORIES])
+
+    args = arg_parser.parse_args(argv)
+    handlers = {None: cmd_run, "update": cmd_update, "find": cmd_find, "import": cmd_import}
+    return handlers[args.command](args) or 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main())
