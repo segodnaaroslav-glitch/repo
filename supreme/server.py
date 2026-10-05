@@ -3,11 +3,10 @@
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
-from . import liquidity, parser, store
+from . import liquidity, parser, paths, store
 
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+WEB_DIR = paths.resource_dir() / "web"
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),

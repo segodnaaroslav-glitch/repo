@@ -1,6 +1,6 @@
 """Цены оружия и предметов MM2 по сайту Supreme Values (https://supremevalues.com/mm2).
 
-Запуск:
+Запуск (или MM2Values.exe с теми же командами):
     python mm2_values.py                 открыть программу в браузере
     python mm2_values.py update          обновить цены с сайта
     python mm2_values.py find chroma     найти предмет в консоли
@@ -9,19 +9,39 @@
 """
 
 import argparse
+import json
 import sys
 import threading
+import urllib.request
 import webbrowser
 
-from supreme import parser, server, store
+from supreme import parser, paths, server, store
+
+
+def running_instance(port):
+    """Адрес уже запущенной программы на этом порту (повторный двойной щелчок по exe)."""
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        with urllib.request.urlopen(url + "api/status", timeout=2) as response:
+            status = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return url if isinstance(status, dict) and "running" in status else None
 
 
 def cmd_run(args):
+    existing = running_instance(args.port)
+    if existing:
+        print(f"Программа уже запущена: {existing}")
+        if not args.no_browser:
+            webbrowser.open(existing)
+        return
     httpd = server.make_server(port=args.port)
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
-    if not store.DATA_FILE.exists():
+    if not args.no_update and not store.DATA_FILE.exists():
         httpd.job.start()  # первый запуск: сразу скачать цены
     print(f"Программа открыта: {url}")
+    print(f"Цены хранятся в: {store.DATA_FILE}")
     print("Чтобы закрыть программу, закройте это окно или нажмите Ctrl+C.")
     if not args.no_browser:
         threading.Timer(0.5, webbrowser.open, (url,)).start()
@@ -83,6 +103,7 @@ def main(argv=None):
     arg_parser = argparse.ArgumentParser(description="Цены MM2 по сайту Supreme Values")
     arg_parser.add_argument("--port", type=int, default=8765, help="порт программы (по умолчанию 8765)")
     arg_parser.add_argument("--no-browser", action="store_true", help="не открывать браузер")
+    arg_parser.add_argument("--no-update", action="store_true", help="не скачивать цены при первом запуске")
     commands = arg_parser.add_subparsers(dest="command")
     commands.add_parser("update", help="обновить цены с сайта")
     find = commands.add_parser("find", help="найти предмет")
@@ -97,4 +118,13 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except Exception as error:  # в exe окно закрылось бы сразу и ошибку не было бы видно
+        if not paths.FROZEN:
+            raise
+        print(f"Ошибка: {error}", file=sys.stderr)
+        code = 1
+    if code and paths.FROZEN and sys.stdin and sys.stdin.isatty():
+        input("Нажмите Enter, чтобы закрыть окно…")
+    sys.exit(code)

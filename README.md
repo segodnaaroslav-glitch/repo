@@ -6,10 +6,18 @@
 
 ## Запуск
 
-1. Установите [Python](https://www.python.org/downloads/) 3.8 или новее. На Windows при
-   установке отметьте «Add Python to PATH».
-2. Windows: дважды щёлкните `start.bat`.
-   Другие системы: `python3 mm2_values.py`.
+**Windows, без установки чего-либо:** скачайте `MM2Values.exe` со страницы
+[релиза](../../releases/tag/mm2-values-latest) и запустите двойным щелчком. Откроется
+чёрное окно программы и браузер с программой. Чтобы выйти, закройте чёрное окно.
+Цены сохраняются в папку `data` рядом с exe, поэтому храните exe в обычной папке
+(например, «Документы\MM2 Values»).
+
+Windows может предупредить «Windows защитила ваш компьютер», потому что exe не подписан:
+нажмите «Подробнее» → «Выполнить в любом случае».
+
+**Из исходников:** установите [Python](https://www.python.org/downloads/) 3.8 или новее
+(на Windows отметьте «Add Python to PATH») и запустите `start.bat` или
+`python3 mm2_values.py`.
 
 При первом запуске программа сама скачает цены со всех категорий сайта. Потом цены
 обновляются кнопкой **«Обновить цены»**.
@@ -41,15 +49,13 @@ python mm2_values.py import page.txt --category godlies
 python mm2_values.py --port 9000      открыть на другом порту
 ```
 
+В exe те же команды: `MM2Values.exe find chroma`, `MM2Values.exe update` и т. д.
+
 ## Если сайт не загружается
 
-Сайт может показывать защитную проверку вместо страницы. Тогда установите браузер для
-программы, и она будет загружать сайт через него:
-
-```
-pip install playwright
-python -m playwright install chromium
-```
+Сайт иногда показывает защитную проверку вместо страницы. Тогда программа сама открывает
+сайт через Edge или Chrome в скрытом режиме (Edge есть в любой Windows 10/11). Если и это
+не помогло, перенесите цены через вкладку «Импорт».
 
 Если у категории не нашлось ни одного предмета, её старые цены остаются, а страница
 сохраняется в `data/debug/` для проверки.
@@ -58,9 +64,14 @@ python -m playwright install chromium
 
 - `mm2_values.py` — запуск программы и команды консоли.
 - `supreme/parser.py` — разбор страниц сайта.
-- `supreme/fetcher.py` — загрузка страниц.
+- `supreme/fetcher.py` — загрузка страниц (напрямую или через Edge/Chrome).
+- `supreme/paths.py` — пути к файлам программы и к ценам (в том числе внутри exe).
 - `supreme/store.py` — хранение цен в `data/values.json` и обновление.
 - `supreme/liquidity.py` — оценка ликвидности.
 - `supreme/server.py` — локальный сервер программы.
 - `web/` — интерфейс.
 - `tests/` — тесты: `python -m unittest discover -s tests -t .`
+- `MM2Values.spec`, `.github/workflows/build-exe.yml` — сборка exe. Её делает GitHub
+  Actions на Windows при каждом обновлении ветки; готовый exe выкладывается в релиз
+  `mm2-values-latest`. Собрать вручную на Windows: `pip install pyinstaller` и
+  `pyinstaller --noconfirm MM2Values.spec` (exe появится в `dist`).

@@ -6,9 +6,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import fetcher, parser
+from . import fetcher, parser, paths
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = paths.data_dir()
 DATA_FILE = DATA_DIR / "values.json"
 DEBUG_DIR = DATA_DIR / "debug"
 

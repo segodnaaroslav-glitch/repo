@@ -1,8 +1,14 @@
 """Загрузка страниц supremevalues.com."""
 
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 BASE_URL = "https://supremevalues.com/mm2/"
 HOME_URL = "https://supremevalues.com/mm2"
@@ -109,23 +115,113 @@ class BrowserFetcher:
         self._playwright = self._browser = self._context = None
 
 
-class Fetcher:
-    """Сначала обычная загрузка; если сайт блокирует — браузер (если установлен)."""
+def find_system_browser():
+    """Edge или Chrome, установленные на компьютере (Edge есть в любой Windows 10/11)."""
+    candidates = []
+    if os.name == "nt":
+        for variable in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+            base = os.environ.get(variable)
+            if base:
+                candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+                candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+        candidates.append(Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"))
+    for name in ("msedge", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
-    def __init__(self):
-        self.browser = BrowserFetcher() if BrowserFetcher.available() else None
 
-    def __call__(self, url):
+class SystemBrowserFetcher:
+    """Загрузка через Edge/Chrome в скрытом режиме: браузер сам проходит проверку
+    сайта и возвращает готовую страницу. Ничего устанавливать не нужно."""
+
+    def __init__(self, executable):
+        self.executable = executable
+
+    def fetch(self, url, timeout=120):
+        profile = tempfile.mkdtemp(prefix="mm2values-browser-")
+        command = [
+            self.executable,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            f"--user-data-dir={profile}",
+            f"--user-agent={HEADERS['User-Agent']}",
+            "--virtual-time-budget=20000",
+            "--dump-dom",
+            url,
+        ]
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            command.insert(1, "--no-sandbox")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            return fetch_plain(url)
-        except BlockedError:
-            if self.browser is None:
-                raise BlockedError(
-                    "сайт блокирует прямую загрузку. Установите браузер для программы: "
-                    "pip install playwright && python -m playwright install chromium"
-                ) from None
-            return self.browser.fetch(url)
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=timeout, creationflags=flags,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise FetchError(f"браузер не смог открыть {url}: {error}") from error
+        finally:
+            shutil.rmtree(profile, ignore_errors=True)
+        page_html = result.stdout.decode("utf-8", "replace")
+        if result.returncode != 0 or "<" not in page_html:
+            raise FetchError(f"браузер не смог открыть {url} (код {result.returncode})")
+        if looks_blocked(page_html):
+            raise BlockedError(f"сайт показал защитную проверку даже браузеру: {url}")
+        return page_html
 
     def close(self):
-        if self.browser:
-            self.browser.close()
+        pass
+
+
+class Fetcher:
+    """Сначала обычная загрузка. Если сайт показывает защитную проверку —
+    через браузер: Playwright (если установлен), затем Edge/Chrome с компьютера."""
+
+    def __init__(self):
+        self._browsers = None
+        self._prefer_browser = False
+
+    def _browser_list(self):
+        if self._browsers is None:
+            self._browsers = []
+            if BrowserFetcher.available():
+                self._browsers.append(BrowserFetcher())
+            executable = find_system_browser()
+            if executable:
+                self._browsers.append(SystemBrowserFetcher(executable))
+        return self._browsers
+
+    def __call__(self, url):
+        if not self._prefer_browser:
+            try:
+                return fetch_plain(url)
+            except BlockedError:
+                self._prefer_browser = True  # дальше сразу через браузер
+        errors = []
+        for browser in self._browser_list():
+            try:
+                return browser.fetch(url)
+            except FetchError as error:
+                errors.append(str(error))
+            except Exception as error:  # сбой самого браузера — пробуем следующий
+                errors.append(f"{type(error).__name__}: {error}")
+        if not self._browser_list():
+            errors.append("на компьютере не найден Edge или Chrome")
+        raise BlockedError(
+            "сайт показывает защитную проверку вместо страницы ("
+            + "; ".join(errors)
+            + "). Перенесите цены через вкладку «Импорт»."
+        )
+
+    def close(self):
+        for browser in self._browsers or []:
+            browser.close()

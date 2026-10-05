@@ -1,0 +1,68 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main, "claude/supreme-mm2-weapons-program-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Build exe
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller==6.*"
+          pyinstaller --noconfirm MM2Values.spec
+
+      - name: Smoke test exe
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path dist\MM2Values.exe
+          $proc = Start-Process -FilePath $exe -ArgumentList "--no-browser", "--no-update", "--port", "8799" -PassThru
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              try { $data = Invoke-RestMethod http://127.0.0.1:8799/api/data; $ok = $true; break } catch { }
+            }
+            if (-not $ok) { throw "exe did not start" }
+            if ($data.categories.Count -ne 14) { throw "unexpected categories: $($data.categories.Count)" }
+            $page = Invoke-WebRequest http://127.0.0.1:8799/ -UseBasicParsing
+            if ($page.Content -notmatch "MM2 Values") { throw "index.html not served" }
+            $js = Invoke-WebRequest http://127.0.0.1:8799/app.js -UseBasicParsing
+            if ($js.StatusCode -ne 200) { throw "app.js not served" }
+            if (-not (Test-Path dist\data)) { throw "data folder not created next to exe" }
+            & $exe find test
+            Write-Host "Smoke test passed"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MM2Values
+          path: dist/MM2Values.exe
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mm2-values-latest --yes --cleanup-tag || true
+          gh release create mm2-values-latest dist/MM2Values.exe \
+            --target "${{ github.sha }}" \
+            --title "MM2 Values для Windows" \
+            --notes "Скачайте MM2Values.exe и запустите двойным щелчком. Программа откроется в браузере. Сборка из коммита ${{ github.sha }}."
