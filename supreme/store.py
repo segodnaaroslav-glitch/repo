@@ -47,7 +47,10 @@ def load(path=None):
         raise ValueError("неверная структура файла")
     base = empty_data()
     base.update(data)
-    base["items"] = [_clean_item(item) for item in base["items"] if _is_item(item)]
+    base["items"] = [
+        _clean_item(item) for item in base["items"]
+        if _is_item(item) and item["category"] in parser.CATEGORY_TITLES  # Evos/Untradables больше не ведутся
+    ]
     categories = base.get("categories")
     base["categories"] = {
         slug: info for slug, info in (categories.items() if isinstance(categories, dict) else ())
@@ -230,6 +233,9 @@ def update_from_site(fetch=None, log=print, path=None):
                 continue
             network_failures = 0
             site_last_updated = site_last_updated or last_updated
+            # Надписи страницы вроде "Class" или "Your Inventory" выглядят как карточки
+            # без спроса и редкости — у настоящих предметов они есть.
+            items = [item for item in items if not parser.is_placeholder(item)]
             problem = _check_parsed(
                 items, orphans, old_counts.get(slug, 0), old_categories.get(slug, {}), old_errors.get(slug)
             )

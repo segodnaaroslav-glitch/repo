@@ -15,7 +15,7 @@ import threading
 import urllib.request
 import webbrowser
 
-from supreme import markets, parser, paths, server, store
+from supreme import markets, parser, paths, rates, server, store
 
 
 def running_instance(port, tries=20):
@@ -43,7 +43,10 @@ def cmd_run(args):
             webbrowser.open(existing)
         return
     monitor = None if args.no_markets else markets.MarketMonitor()
-    httpd = server.make_server(port=args.port, auto_sync=not (args.no_update or args.no_auto), monitor=monitor)
+    rate = rates.RateWatcher()
+    httpd = server.make_server(
+        port=args.port, auto_sync=not (args.no_update or args.no_auto), monitor=monitor, rate=rate
+    )
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     if not args.no_update and not store.DATA_FILE.exists():
         httpd.job.start()  # первый запуск: сразу скачать цены
@@ -51,6 +54,8 @@ def cmd_run(args):
         httpd.sync.start()  # следить за сайтом и подтягивать новые цены
     if monitor:
         monitor.start()  # опрашивать торговые площадки
+    if not args.no_markets:
+        rate.start()  # курс доллара с Rapira
     print(f"Программа открыта: {url}")
     print(f"Цены хранятся в: {store.DATA_FILE}")
     print("Чтобы закрыть программу, закройте это окно или нажмите Ctrl+C.")

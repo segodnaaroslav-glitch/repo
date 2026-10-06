@@ -25,7 +25,7 @@ from . import fetcher, liquidity, parser, store
 POLL_EVERY = 120                 # секунд между опросами одной площадки
 MAX_BACKOFF = 30 * 60            # при ошибках — реже, но не реже раза в 30 минут
 BLOCKED_PAUSE = 15 * 60          # после ответа «слишком много запросов» / «доступ запрещён»
-HISTORY_HOURS = 24
+HISTORY_HOURS = 48  # анализ продаж — за последние двое суток
 MAX_PAGES = 40
 
 # Площадки по умолчанию. kind: "starpets" — API StarPets; "shop" — интернет-магазин
@@ -34,11 +34,12 @@ MAX_PAGES = 40
 DEFAULT_MARKETS = [
     # StarPets: данные обновляются у них раз в ~4 минуты, а после ~50 запросов подряд
     # API блокирует адрес на 10 минут — поэтому опрос раз в 5 минут.
-    {"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "https://starpets.gg/mm2", "interval": 300},
-    {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": "https://dreampets.gg/mm2/", "interval": 180},
-    {"id": "eldorado", "title": "Eldorado", "kind": "eldorado", "url": "https://www.eldorado.gg/mm2-shop/i/204-2-0",
-     "interval": 180},
+    {"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "https://starpets.gg/mm2", "interval": 300,
+     "fee": 0.20},
+    {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": "https://dreampets.gg/mm2/", "interval": 120,
+     "fee": 0.10},
 ]
+# Eldorado и магазины (kind "eldorado" / "shop") можно добавить своим markets.json.
 
 
 # --- HTTP ---------------------------------------------------------------------
@@ -147,7 +148,7 @@ def _level(score):
     return liquidity.MEDIUM if score >= liquidity.MEDIUM_FROM else liquidity.ILLIQUID
 
 
-def assess_offer(offer, sold_24h):
+def assess_offer(offer, sold):
     """Балл 0–100 и причины по данным одной площадки.
 
     Если площадка не показывает ни продаж, ни количества, ни места по
@@ -169,9 +170,9 @@ def assess_offer(offer, sold_24h):
         # Место в списке «популярные» самой площадки: верх списка — ходовые предметы.
         score = 80 * (1 - offer["popularity"])
         reasons.append(f"место по популярности на площадке: верхние {max(1, round(offer['popularity'] * 100))}%")
-    if sold_24h:
-        score = min(100.0, (score or 0) + min(40, 10 * sold_24h))
-        reasons.append(f"куплено за сутки (по проверкам): {sold_24h}")
+    if sold:
+        score = min(100.0, (score or 0) + min(40, 5 * sold))
+        reasons.append(f"куплено за 2 дня (по проверкам): {sold}")
     if score is None:
         return {"score": None, "level": NO_DATA, "reasons": ["есть в продаже, но площадка не показывает продажи"]}
     score = int(round(score))
@@ -179,18 +180,19 @@ def assess_offer(offer, sold_24h):
 
 
 def combine(item, market_infos):
-    """Общая ликвидность: среднее Supreme Values и площадок, где есть данные."""
+    """Общая ликвидность — среднее по площадкам, где у предмета есть данные."""
     supreme = item.get("liquidity") or liquidity.assess(item)
     if supreme["level"] in (liquidity.SECRET, liquidity.UNTRADABLE):
-        return dict(supreme, sources=1)
+        return dict(supreme, sources=0)
     scored = [info for info in market_infos if info.get("score") is not None]
-    scores = [supreme["score"]] + [info["score"] for info in scored]
-    score = int(round(sum(scores) / len(scores)))
-    reasons = [f"Supreme Values: {supreme['score']}"] + [
+    reasons = [
         f"{info['market_title']}: {info['score'] if info.get('score') is not None else info['reasons'][0]}"
         for info in market_infos
     ]
-    return {"score": score, "level": _level(score), "reasons": reasons, "sources": len(scores)}
+    if not scored:
+        return {"score": None, "level": NO_DATA, "reasons": reasons or ["на площадках не найден"], "sources": 0}
+    score = int(round(sum(info["score"] for info in scored) / len(scored)))
+    return {"score": score, "level": _level(score), "reasons": reasons, "sources": len(scored)}
 
 
 # --- адаптеры площадок --------------------------------------------------------
@@ -338,7 +340,7 @@ class StarPetsAdapter(Adapter):
     TYPES = ("weapon", "pet", "misc")
     PAGE = 72
     HEADERS = {"Origin": "https://starpets.gg", "Referer": "https://starpets.gg/"}
-    INFO_PER_POLL = 4
+    INFO_PER_POLL = 10  # ~15 запросов каталога + 10 продаж за 5 минут — с запасом до блокировки (~50)
     INFO_MAX_AGE = 6 * 60 * 60
     PAUSE = 0.4
 
@@ -441,9 +443,12 @@ class DreamPetsAdapter(Adapter):
     читаются по очереди, понемногу за каждый опрос, начиная с самых дорогих.
     """
 
-    PAGES_PER_POLL = 12
+    PAGES_PER_POLL = 25
     PAUSE = 0.5
     PAGE_TIMEOUT = 15
+    CARD_SHARE = 0.5  # если у половины товаров на странице рынка видны цены — берём их оттуда
+    _CARD_PRICE_RE = re.compile(r"(\d[\d \u00a0]*(?:[.,]\d{1,2})?)\s*₽")
+    _BUTTON_RE = re.compile(r"^(купить|в корзину|продать|подробнее|от|лот\w*|шт\.?)$", re.I)
     _LINK_RE = re.compile(r"""href=["']((?:https?://[^"']*dreampets\.(?:gg|io))?/mm2/product/[^"'#?]+)["']""", re.I)
     _PRICE_RE = re.compile(r"от\s*([\d\s\u00a0.,]+?)\s*₽")
     # "674 лотов", "1 234 лота"; число не склеивается с соседними словами ("ММ2 114 лотов").
@@ -453,12 +458,23 @@ class DreamPetsAdapter(Adapter):
         base = self.config["url"]
         root = re.match(r"https?://[^/]+", base).group(0)
         products = self.cache.setdefault("products", {})  # ссылка -> данные товара
-        links = self._catalog(base, root)
+        market_html = self._market_page(base)
+        cards = self._cards(market_html, root) if market_html else {}
+        links = list(cards) or self._catalog(base, root)
         for link in links:
             products.setdefault(link, {"at": 0})
         if not products:
             raise fetcher.FetchError("на странице рынка не нашлось ни одного товара")
-        due = sorted(products, key=lambda link: (products[link].get("at", 0), -(products[link].get("price") or 0)))
+        priced = {link: card for link, card in cards.items() if card.get("price") is not None}
+        from_cards = len(priced) >= max(1, len(cards) * self.CARD_SHARE)
+        if from_cards:
+            # Цены и лоты видны прямо на странице рынка — весь рынок за один запрос.
+            now = time.time()
+            for link, card in priced.items():
+                products[link].update({k: v for k, v in card.items() if v is not None}, at=now)
+        # Страницы товаров читаются только для тех, чьих цен нет на странице рынка.
+        waiting = [link for link in products if link not in priced] if from_cards else list(products)
+        due = sorted(waiting, key=lambda link: (products[link].get("at", 0), -(products[link].get("price") or 0)))
         read = failed = 0
         last_error = None
         for link in due[:self.PAGES_PER_POLL]:
@@ -476,11 +492,15 @@ class DreamPetsAdapter(Adapter):
                 continue
             products[link].update(self._parse_product(page_html), at=time.time())
             read += 1
-        if failed and not read:
+        if failed and not read and not from_cards:
             raise fetcher.FetchError(f"страницы товаров не открываются: {last_error}")
         self.complete = all(entry.get("at") for entry in products.values())
         known = [p for p in products.values() if p.get("name")]
-        self.note = f"товаров на рынке: {len(products)}, прочитано: {len(known)} (по {self.PAGES_PER_POLL} за опрос)"
+        if from_cards:
+            self.note = f"товаров на рынке: {len(products)}, цены и лоты со страницы рынка: {len(priced)}"
+        else:
+            self.note = (f"товаров на рынке: {len(products)}, прочитано: {len(known)} "
+                         f"(по {self.PAGES_PER_POLL} страниц за опрос)")
         return [
             {
                 "name": entry["name"],
@@ -493,6 +513,52 @@ class DreamPetsAdapter(Adapter):
             }
             for link, entry in products.items() if entry.get("name")
         ]
+
+    def _market_page(self, base):
+        try:
+            return _request(base, headers={"Accept-Language": "ru,en;q=0.8"})
+        except (fetcher.BlockedError, fetcher.NetworkError):
+            raise
+        except fetcher.FetchError:
+            return ""
+
+    def _cards(self, page_html, root):
+        """Товары со страницы рынка: {ссылка: {"name", "price", "lots"}} — текст между
+        соседними ссылками на товары считается карточкой товара."""
+        matches = list(self._LINK_RE.finditer(page_html))
+        cards = {}
+        for index, match in enumerate(matches):
+            link = self._absolute(match.group(1), root)
+            end = matches[index + 1].start() if index + 1 < len(matches) else min(len(page_html), match.end() + 4000)
+            start = page_html.rfind("<", 0, match.start())
+            lines = [line.strip() for line in parser.html_to_text(page_html[max(0, start):end]).splitlines() if line.strip()]
+            text = " ".join(lines)
+            price = self._CARD_PRICE_RE.search(text)
+            lots = self._LOTS_RE.search(text)
+            name = next(
+                (line for line in lines if re.search(r"[A-Za-z]", line) and "₽" not in line
+                 and not self._LOTS_RE.search(line) and not self._BUTTON_RE.match(line)),
+                "",
+            )
+            card = cards.setdefault(link, {"name": None, "price": None, "lots": None})
+            card["name"] = card["name"] or (re.split(r"\s+(?:/|—|-)\s+", name, maxsplit=1)[0].strip()
+                                            or self._name_from_link(link))
+            if price and card["price"] is None:
+                card["price"] = _rub(price.group(1))
+            if lots and card["lots"] is None:
+                card["lots"] = int(re.sub(r"\D", "", lots.group(1)))
+        return cards
+
+    @staticmethod
+    def _name_from_link(link):
+        """/mm2/product/eternal-iii/<uuid> -> "eternal iii" (для сопоставления регистр не важен)."""
+        match = re.search(r"/mm2/product/([a-z0-9-]+)/[0-9a-f-]{8,}", link, re.I)
+        return match.group(1).replace("-", " ") if match else None
+
+    @staticmethod
+    def _absolute(href, root):
+        link = href if href.startswith("http") else root + href
+        return re.sub(r"https?://[^/]+", root, link)  # одно зеркало (.gg), без двойного счёта
 
     def _catalog(self, base, root):
         """Ссылки на товары со страницы рынка (обновляются раз в час)."""
@@ -518,8 +584,7 @@ class DreamPetsAdapter(Adapter):
     def _links(self, page_html, root):
         found = []
         for href in self._LINK_RE.findall(page_html) + re.findall(r"<loc>\s*([^<]*/mm2/product/[^<]+?)\s*</loc>", page_html):
-            link = href if href.startswith("http") else root + href
-            link = re.sub(r"https?://[^/]+", root, link)  # одно зеркало (.gg), без двойного счёта
+            link = self._absolute(href, root)
             if link not in found:
                 found.append(link)
         return found
@@ -539,7 +604,7 @@ class DreamPetsAdapter(Adapter):
         price = next((m for m in (self._PRICE_RE.search(t) for t in texts) if m), None)
         lots = next((m for m in (self._LOTS_RE.search(t) for t in texts) if m), None)
         return {
-            "name": name,
+            "name": name or None,
             "price": _rub(price.group(1)) if price else None,
             "lots": int(re.sub(r"\D", "", lots.group(1))) if lots else None,
         }
@@ -703,7 +768,8 @@ class MarketState:
         self.offers = {}       # id предмета -> последнее предложение
         self.complete = False  # offers — полный снимок площадки (можно считать покупки)
         self.unmatched = 0
-        self.sales = {}        # id предмета -> [[время, количество], ...] за сутки
+        self.sales = {}        # id предмета -> [[время, количество], ...] ушедших лотов за 2 дня
+        self.listed = {}       # id предмета -> [[время, количество], ...] новых лотов за 2 дня
 
     def interval(self, default):
         return self.config.get("interval") or default
@@ -722,10 +788,16 @@ class MarketState:
             "matched": len(self.offers),
         }
 
-    def sold_24h(self, key):
+    @staticmethod
+    def _total(events):
         cutoff = (_now() - timedelta(hours=HISTORY_HOURS)).timestamp()
-        events = [event for event in self.sales.get(key, []) if event[0] >= cutoff]
-        return sum(event[1] for event in events)
+        return sum(event[1] for event in events if event[0] >= cutoff)
+
+    def sold(self, key):
+        return self._total(self.sales.get(key, []))
+
+    def new_lots(self, key):
+        return self._total(self.listed.get(key, []))
 
 
 def _valid_sales(value):
@@ -772,6 +844,7 @@ class MarketMonitor:
             offers = entry.get("offers") if isinstance(entry.get("offers"), dict) else {}
             market.offers = {str(k): v for k, v in offers.items() if isinstance(v, dict)}
             market.sales = _valid_sales(entry.get("sales"))
+            market.listed = _valid_sales(entry.get("listed"))
             market.cache = entry.get("cache") if isinstance(entry.get("cache"), dict) else {}
             market.complete = bool(entry.get("complete")) and bool(market.offers)
             market.unmatched = entry.get("unmatched") if isinstance(entry.get("unmatched"), int) else 0
@@ -791,6 +864,7 @@ class MarketMonitor:
                 market.config["id"]: {
                     "offers": market.offers,
                     "sales": market.sales,
+                    "listed": market.listed,
                     "cache": market.cache,
                     "complete": market.complete,
                     "unmatched": market.unmatched,
@@ -910,18 +984,22 @@ class MarketMonitor:
         cutoff = (now - timedelta(hours=HISTORY_HOURS)).timestamp()
         with self._lock:
             if market.complete and adapter.complete:
-                # Оба снимка полные: исчезнувшие предложения — купленные.
+                # Оба снимка полные: исчезнувшие лоты — купленные, появившиеся — новые.
                 for key, offer in matched.items():
                     old = market.offers.get(key)
                     if old and isinstance(old.get("stock"), int) and isinstance(offer.get("stock"), int):
-                        drop = old["stock"] - offer["stock"]
-                        if drop > 0:
-                            market.sales.setdefault(key, []).append([now.timestamp(), drop])
-            market.sales = {
-                key: kept for key, kept in (
-                    (key, [event for event in events if event[0] >= cutoff]) for key, events in market.sales.items()
-                ) if kept
-            }
+                        change = offer["stock"] - old["stock"]
+                        if change < 0:
+                            market.sales.setdefault(key, []).append([now.timestamp(), -change])
+                        elif change > 0:
+                            market.listed.setdefault(key, []).append([now.timestamp(), change])
+            for events_by_item in ("sales", "listed"):
+                setattr(market, events_by_item, {
+                    key: kept for key, kept in (
+                        (key, [event for event in events if event[0] >= cutoff])
+                        for key, events in getattr(market, events_by_item).items()
+                    ) if kept
+                })
             if adapter.complete:
                 market.offers = matched
             else:
@@ -943,11 +1021,15 @@ class MarketMonitor:
         with self._lock:
             return [market.public(self.interval) for market in self.markets]
 
+    def configs(self):
+        return [market.config for market in self.markets]
+
     def annotate(self, items):
         """Добавить предметам данные площадок и общую ликвидность."""
         with self._lock:
             snapshot = [
-                (market.config, dict(market.offers), {k: market.sold_24h(k) for k in market.offers})
+                (market.config, dict(market.offers),
+                 {k: (market.sold(k), market.new_lots(k)) for k in market.offers})
                 for market in self.markets
             ]
         for item in items:
@@ -957,13 +1039,16 @@ class MarketMonitor:
                 offer = offers.get(key)
                 if not isinstance(offer, dict):
                     continue
-                info = assess_offer(offer, sold.get(key, 0))
+                sold_48h, listed_48h = sold.get(key, (0, 0))
+                info = assess_offer(offer, sold_48h)
                 info.update({
                     "price": offer.get("price"),
                     "currency": offer.get("currency") or "USD",
+                    "fee": config.get("fee", 0),
                     "stock": offer.get("stock"),
                     "sales_week": offer.get("sales_week"),
-                    "sold_24h": sold.get(key, 0),
+                    "sold_48h": sold_48h,
+                    "listed_48h": listed_48h,
                     "available": offer.get("available"),
                     "url": offer.get("url"),
                     "market_title": config["title"],
@@ -1003,4 +1088,11 @@ def load_configs(data_path=None):
             config.pop("interval", None)  # неверное значение — обычный интервал
         else:
             config["interval"] = interval
+        try:
+            fee = float(config.get("fee"))
+        except (TypeError, ValueError):
+            fee = None
+        if fee is None or not 0 <= fee < 1:  # нет комиссии или она неверная — как у площадки по умолчанию
+            fee = next((c["fee"] for c in DEFAULT_MARKETS if c["kind"] == config["kind"]), 0)
+        config["fee"] = fee
     return valid or [dict(config) for config in DEFAULT_MARKETS]

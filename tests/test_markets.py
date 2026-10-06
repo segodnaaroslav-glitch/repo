@@ -153,11 +153,11 @@ class MonitorTests(unittest.TestCase):
         items = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(self.path)["items"]])
         ice = next(i for i in items if i["name"] == "Icebreaker")
         info = ice["market"]["fake"]
-        self.assertEqual((info["price"], info["stock"], info["sold_24h"]), (4.5, 5, 3))
-        self.assertEqual(ice["combined"]["sources"], 2)
+        self.assertEqual((info["price"], info["stock"], info["sold_48h"]), (4.5, 5, 3))
+        self.assertEqual(ice["combined"]["sources"], 1)  # общая — только по площадкам
         fang = next(i for i in items if i["name"] == "Fang")
         self.assertEqual(fang["market"], {})
-        self.assertEqual(fang["combined"]["sources"], 1)
+        self.assertEqual(fang["combined"]["sources"], 0)  # нет на площадках — нет общей оценки
 
     def test_state_survives_restart(self):
         monitor = self.monitor()
@@ -210,6 +210,19 @@ class ConfigTests(unittest.TestCase):
             ]), encoding="utf-8")
             configs = markets.load_configs(data_path)
             self.assertEqual([(c["id"], c["title"]) for c in configs], [("myshop", "myshop")])
+            self.assertEqual(configs[0]["fee"], 0)
+
+    def test_fee_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = Path(tmp) / "values.json"
+            (Path(tmp) / "markets.json").write_text(json.dumps([
+                {"id": "sp", "kind": "starpets", "url": "https://starpets.gg/mm2"},
+                {"id": "dp", "kind": "dreampets", "url": "https://dreampets.gg/mm2/", "fee": "abc"},
+                {"id": "dp2", "kind": "dreampets", "url": "https://dreampets.gg/mm2/", "fee": 1.5},
+                {"id": "dp3", "kind": "dreampets", "url": "https://dreampets.gg/mm2/", "fee": "0.15"},
+            ]), encoding="utf-8")
+            fees = {c["id"]: c["fee"] for c in markets.load_configs(data_path)}
+            self.assertEqual(fees, {"sp": 0.20, "dp": 0.10, "dp2": 0.10, "dp3": 0.15})
 
 
 
@@ -416,7 +429,7 @@ class ReviewV3Tests(unittest.TestCase):
     def snapshot(self, monitor):
         items = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(self.path)["items"]])
         return {i["name"]: (i["market"].get("eldorado") or {}).get("stock") for i in items}, \
-            {i["name"]: (i["market"].get("eldorado") or {}).get("sold_24h") for i in items}
+            {i["name"]: (i["market"].get("eldorado") or {}).get("sold_48h") for i in items}
 
     def test_restart_and_long_pause_do_not_invent_purchases(self):
         pages = {1: [self.row("a", "Fang", 5)], 2: [self.row("b", "Seer", 3)], 3: [self.row("c", "Harvester", 2)]}
@@ -460,8 +473,10 @@ class ReviewV3Tests(unittest.TestCase):
         infos = [dict(markets.assess_offer({"price": 5, "available": True}, 0), market_title="StarPets"),
                  dict(markets.assess_offer({"available": False}, 0), market_title="DreamPets")]
         combined = markets.combine(item, infos)
-        self.assertEqual((combined["score"], combined["sources"]), (item["liquidity"]["score"], 1))
+        self.assertEqual((combined["score"], combined["level"], combined["sources"]), (None, "none", 0))
         self.assertIn("StarPets: есть в продаже, но площадка не показывает продажи", combined["reasons"])
+        scored = infos + [dict(markets.assess_offer({"stock": 7, "available": True}, 0), market_title="X")]
+        self.assertEqual(markets.combine(item, scored)["sources"], 1)  # «нет данных» не тянет вниз
 
     def test_waits_for_prices_before_matching(self):
         empty = Path(self.tmp.name) / "empty.json"
@@ -530,3 +545,31 @@ class DreamPetsReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DreamPetsMarketCardsTests(unittest.TestCase):
+    def test_prices_and_lots_from_market_page(self):
+        market = (
+            '<div class="product-card"><a href="/mm2/product/eternal-iii/43948eb3-1e25-4564">'
+            '<img src="/i.png"><p class="card-text-l">Eternal III / Вечный 3</p><span>от 23,71 ₽</span>'
+            '<span>114 лотов</span></a></div>'
+            '<div class="product-card"><a href="https://dreampets.io/mm2/product/harvester/2c0af45a-9134-4c09">'
+            '<p>Harvester</p><b>328.98 ₽</b><i>1 234 лота</i><button>Купить</button></a></div>'
+            '<div class="product-card"><a href="/mm2/product/candy/35e0ab9c-0ef1-46b5"><p>Candy</p></a></div>'
+        )
+        httpd, base = serve({"/mm2/": market})
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with unittest.mock.patch.object(markets, "_pause"), \
+                unittest.mock.patch.object(markets, "_request", wraps=markets._request) as request:
+            adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": base + "/mm2/"})
+            offers = {o["name"]: o for o in adapter.fetch()}
+        self.assertEqual((offers["Eternal III"]["price"], offers["Eternal III"]["stock"]), (23.71, 114))
+        self.assertEqual((offers["Harvester"]["price"], offers["Harvester"]["stock"]), (328.98, 1234))
+        self.assertIn("со страницы рынка: 2", adapter.note)
+        self.assertNotIn("Candy", offers)  # без цены и без страницы товара (404) — пока нет данных
+        self.assertTrue(any("/product/candy/" in str(call) for call in request.call_args_list))
+
+    def test_name_from_link(self):
+        self.assertEqual(markets.DreamPetsAdapter._name_from_link("https://dreampets.gg/mm2/product/eternal-iii/43948eb3-1e25"),
+                         "eternal iii")

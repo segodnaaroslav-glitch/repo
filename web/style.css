@@ -428,3 +428,111 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
   .cards { grid-template-columns: 1fr; }
   .art { width: 76px; height: 76px; }
 }
+
+/* --- курс, цены площадок ------------------------------------------------------ */
+
+.rate {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  min-width: 150px;
+}
+.rate strong { font-size: 15px; font-variant-numeric: tabular-nums; }
+.price b { font-variant-numeric: tabular-nums; }
+.price.payout b { color: var(--good); }
+.card-prices { display: grid; gap: 2px; font-size: 12px; padding: 6px 0 2px; border-top: 1px dashed var(--line); }
+.mp { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; }
+.mp-name { min-width: 72px; font-weight: 700; }
+.mp.starpets .mp-name, th.sp { color: #f5b942; }
+.mp.dreampets .mp-name, th.dp { color: #6fd3ff; }
+
+/* --- окно предмета ------------------------------------------------------------ */
+
+.drawer { width: min(480px, 100vw); }
+.hero { display: flex; gap: 14px; align-items: center; }
+.hero .art.large { margin: 0; flex: none; }
+.hero-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.hero-info .big-value { margin: 0; font-size: 30px; color: var(--accent-2); }
+.hero-info .star { align-self: flex-start; padding: 2px 0; font-size: 14px; }
+.tiles { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.tile {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--panel-2);
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+.tile.starpets { border-left: 4px solid #f5b942; }
+.tile.dreampets { border-left: 4px solid #6fd3ff; }
+.tile-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.tile.starpets .tile-name { color: #f5b942; }
+.tile.dreampets .tile-name { color: #6fd3ff; }
+.tile-price { font-size: 20px; }
+.tile-payout { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; font-size: 13px; }
+.mstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 6px; }
+.mstat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+.mstat-label { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mstat-value { font-size: 16px; font-variant-numeric: tabular-nums; }
+.tile-liq { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13px; }
+.tile-liq .chip { white-space: nowrap; }
+.total-liq { margin-top: 10px; padding: 10px 14px; border: 1px dashed var(--line); border-radius: 12px; }
+
+/* --- вкладка «Площадки» и калькулятор ---------------------------------------- */
+
+.markets-table td, .markets-table th { white-space: nowrap; }
+.item-cell { display: flex; align-items: center; gap: 8px; min-width: 200px; }
+.art.tiny { width: 34px; height: 34px; border-radius: 8px; }
+.art.tiny .mono { font-size: 12px; }
+.calc-input { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 320px); gap: 12px; margin: 10px 0; }
+.calc-input textarea { width: 100%; resize: vertical; min-height: 140px; }
+.drop {
+  border: 2px dashed var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+  background: var(--panel-2);
+}
+.drop.over, .drop:hover, .drop:focus-visible { border-color: var(--accent); outline: none; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 6px; }
+.thumb { position: relative; width: 74px; height: 54px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; }
+.thumb button { position: absolute; top: 2px; right: 2px; padding: 0 5px; font-size: 11px; background: rgba(0, 0, 0, 0.6); color: #fff; }
+.totals { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; align-items: stretch; }
+.total {
+  flex: 1;
+  min-width: 220px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.total.starpets { border-left: 4px solid #f5b942; }
+.total.dreampets { border-left: 4px solid #6fd3ff; }
+.total-sum { font-size: 24px; }
+.totals .hint { flex-basis: 100%; margin: 0; }
+input.qty { width: 72px; text-align: right; }
+
+@media (max-width: 760px) {
+  .calc-input { grid-template-columns: 1fr; }
+  .rate { min-width: 0; }
+}

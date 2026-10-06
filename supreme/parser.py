@@ -31,7 +31,6 @@ from html.parser import HTMLParser
 CATEGORIES = [
     ("sets", "Sets"),
     ("uniques", "Uniques"),
-    ("evos", "Evos"),
     ("ancients", "Ancients"),
     ("vintages", "Vintages"),
     ("chromas", "Chromas"),
@@ -42,11 +41,10 @@ CATEGORIES = [
     ("commons", "Commons"),
     ("pets", "Pets"),
     ("misc", "Misc. Items"),
-    ("untradables", "Untradables"),
 ]
 CATEGORY_TITLES = dict(CATEGORIES)
 WEAPON_CATEGORIES = (
-    "uniques", "evos", "ancients", "vintages", "chromas",
+    "uniques", "ancients", "vintages", "chromas",
     "godlies", "legendaries", "rares", "uncommons", "commons",
 )
 
@@ -660,3 +658,8 @@ def parse_category_page(page_html, category, base_url=None):
             if item["image"]:
                 item["image"] = urljoin(base_url, item["image"])
     return items, find_last_updated(text), orphans
+
+
+def is_placeholder(item):
+    """Не предмет, а надпись со страницы: нет ни спроса, ни редкости."""
+    return item.get("demand") is None and item.get("rarity") is None

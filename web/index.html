@@ -31,6 +31,12 @@
       <div class="sync-row small" id="syncResult"></div>
     </div>
 
+    <div class="rate" id="rateBox" title="Курс доллара для пересчёта цен">
+      <span class="muted small">Курс</span>
+      <strong id="rateValue">—</strong>
+      <span class="muted small" id="rateSource">Rapira, USDT/RUB</span>
+    </div>
+
     <div class="actions">
       <button class="ghost" id="checkBtn" type="button" title="Проверить, не обновил ли сайт цены">Проверить сайт</button>
       <button class="primary" id="updateBtn" type="button">Обновить цены</button>
@@ -41,8 +47,10 @@
 
   <nav class="tabs" role="tablist">
     <button class="tab active" type="button" role="tab" data-tab="values" aria-selected="true">Цены</button>
+    <button class="tab" type="button" role="tab" data-tab="markets" aria-selected="false">Площадки</button>
     <button class="tab" type="button" role="tab" data-tab="liquidity" aria-selected="false">Ликвидность</button>
-    <button class="tab" type="button" role="tab" data-tab="import" aria-selected="false">Импорт</button>
+    <button class="tab" type="button" role="tab" data-tab="calc" aria-selected="false">Калькулятор продажи</button>
+    <button class="tab" type="button" role="tab" data-tab="import" aria-selected="false">Импорт цен</button>
   </nav>
 
   <main>
@@ -68,6 +76,8 @@
               <option value="demand:desc">Спрос ↓</option>
               <option value="rarity:desc">Редкость ↓</option>
               <option value="liquidity:desc">Ликвидность ↓</option>
+              <option value="starpets:desc">Цена StarPets ↓</option>
+              <option value="dreampets:desc">Цена DreamPets ↓</option>
             </select>
           </label>
           <label class="check"><input type="checkbox" id="onlyFav"> Только избранное</label>
@@ -100,6 +110,50 @@
       </div>
     </section>
 
+    <section class="panel hidden" id="tab-markets" role="tabpanel">
+      <div class="content">
+        <div class="toolbar">
+          <div class="search">
+            <input id="mkSearch" type="search" placeholder="Поиск по названию…" autocomplete="off" aria-label="Поиск по названию">
+          </div>
+          <label>Категория
+            <select id="mkCategory" autocomplete="off"></select>
+          </label>
+          <label>Сортировка
+            <select id="mkSort" autocomplete="off">
+              <option value="dreampets:desc">Цена DreamPets ↓</option>
+              <option value="starpets:desc">Цена StarPets ↓</option>
+              <option value="lots:desc">Лотов на DreamPets ↓</option>
+              <option value="sold:desc">Куплено за 2 дня ↓</option>
+              <option value="sales:desc">Продаж StarPets за неделю ↓</option>
+              <option value="name:asc">Название А–Я</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="mkOnlyListed" checked> Только те, что продаются</label>
+        </div>
+        <p class="hint" id="mkHint"></p>
+        <div class="table-wrap">
+          <table class="markets-table">
+            <thead>
+              <tr>
+                <th>Предмет</th>
+                <th class="num">Supreme</th>
+                <th class="num sp">StarPets, цена</th>
+                <th class="num sp">Вы получите (−20%)</th>
+                <th class="num sp">Продаж/нед.</th>
+                <th class="num dp">DreamPets, цена</th>
+                <th class="num dp">Вы получите (−10%)</th>
+                <th class="num dp">Лотов</th>
+                <th class="num dp">Куплено за 2 дня</th>
+                <th class="num dp">Новых лотов за 2 дня</th>
+              </tr>
+            </thead>
+            <tbody id="mkBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <section class="panel hidden" id="tab-liquidity" role="tabpanel">
       <div class="content">
         <div class="markets-bar">
@@ -120,18 +174,57 @@
         </div>
         <details class="method">
           <summary>Как считается ликвидность</summary>
-          <p><b>Supreme Values</b> — балл 0–100 по данным сайта: спрос (Demand × 10, не указан — 0),
-            стабильность (<span id="methodStability"></span>), узкий диапазон цены (до 5%) +5,
-            широкий (больше 20%) −5.</p>
-          <p><b>Площадки</b> — балл 0–100 по продажам за неделю (если площадка их показывает),
-            числу предложений и тому, сколько предложений исчезло между проверками
-            (их купили). Чем больше продаж и предложений, тем легче продать предмет.</p>
-          <p><b>Общая</b> — среднее Supreme Values и всех площадок, где есть данные по предмету.</p>
+          <p><b>StarPets</b> и <b>DreamPets</b> — балл 0–100 по данным площадки: продажи за неделю
+            (StarPets показывает их сам), число лотов в продаже и сколько лотов купили за последние
+            2 дня (программа сравнивает каждую проверку с предыдущей). Если площадка не показывает
+            ни продаж, ни лотов, у StarPets учитывается место предмета в их списке популярных.</p>
+          <p><b>Общая</b> — среднее StarPets и DreamPets, где у предмета есть данные.</p>
           <p><b>Ликвидные</b> — <span id="methodLiquid">60</span> и выше, <b>средние</b> —
             <span id="methodMedium">30–59</span>, <b>неликвидные</b> — меньше
-            <span id="methodIlliquid">30</span>. Секретные предметы и Untradables в колонки не попадают.</p>
+            <span id="methodIlliquid">30</span>. Секретные предметы в колонки не попадают.</p>
         </details>
         <div class="columns" id="liqColumns"></div>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="tab-calc" role="tabpanel">
+      <div class="content">
+        <h2>Сколько получу за свои предметы</h2>
+        <p class="muted">Вставьте список предметов (по одному в строке, можно с количеством: «Harvester x2»)
+          или добавьте скриншоты инвентаря — кнопкой ниже или Ctrl+V. Программа найдёт предметы и посчитает,
+          сколько вы получите на StarPets (комиссия 20%) и на DreamPets (комиссия 10%).</p>
+        <div class="calc-input">
+          <textarea id="calcText" rows="7" placeholder="Harvester x2&#10;Icebreaker&#10;3 Seer"></textarea>
+          <div class="drop" id="calcDrop" tabindex="0" role="button" aria-label="Добавить скриншоты">
+            <input type="file" id="calcFiles" accept="image/*" multiple hidden>
+            <strong>Скриншоты</strong>
+            <span class="muted small">Нажмите, перетащите сюда или вставьте Ctrl+V</span>
+            <div class="thumbs" id="calcThumbs"></div>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button class="primary" id="calcBtn" type="button">Посчитать</button>
+          <button class="ghost" id="calcClear" type="button">Очистить</button>
+          <span class="hint" id="calcStatus" role="status" aria-live="polite"></span>
+        </div>
+        <div class="totals" id="calcTotals"></div>
+        <div class="table-wrap hidden" id="calcWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Предмет</th>
+                <th class="num">Кол-во</th>
+                <th class="num sp">StarPets, за шт.</th>
+                <th class="num sp">Получите на StarPets</th>
+                <th class="num dp">DreamPets, за шт.</th>
+                <th class="num dp">Получите на DreamPets</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="calcBody"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="calcUnmatched"></p>
       </div>
     </section>
 

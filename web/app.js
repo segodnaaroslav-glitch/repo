@@ -32,6 +32,10 @@ const state = {
   liqSearch: "",
   selected: null,        // ключ предмета в карточке
   view: "cards",         // "cards" или "table"
+  mkCategory: "weapons",
+  mkSearch: "",
+  mkSort: "dreampets:desc",
+  mkOnlyListed: true,
   offline: null,         // текст ошибки, если программа не отвечает
   userUpdate: false,     // обновление запущено кнопкой (о результате сообщить всплывающим окном)
   lastError: null,       // последняя показанная ошибка автообновления
@@ -90,6 +94,52 @@ function fmtPrice(value, currency) {
   const number = Number(value).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (currency === "RUB") return `${number} ₽`;
   return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+const MARKET_ORDER = ["starpets", "dreampets"];
+
+function usdRub() {
+  const rate = (state.status && state.status.rate) || state.data.rate;
+  return rate && rate.usd_rub ? rate.usd_rub : null;
+}
+
+function fmtRub(value) {
+  return `${Number(value).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₽`;
+}
+
+function fmtUsd(value) {
+  return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// Цена в обеих валютах: [в валюте площадки, в другой по курсу Rapira].
+function bothPrices(value, currency) {
+  if (value === null || value === undefined) return null;
+  const rate = usdRub();
+  if (currency === "RUB") return [fmtRub(value), rate ? fmtUsd(value / rate) : null];
+  return [fmtUsd(value), rate ? fmtRub(value * rate) : null];
+}
+
+function priceNode(value, currency, className) {
+  const pair = bothPrices(value, currency);
+  if (!pair) return el("span", "muted", "нет в продаже");
+  const box = el("span", `price ${className || ""}`);
+  box.append(el("b", "", pair[0]));
+  if (pair[1]) box.append(el("span", "muted", ` · ${pair[1]}`));
+  return box;
+}
+
+function marketInfo(item, id) {
+  return item.market && item.market[id] ? item.market[id] : null;
+}
+
+function marketTitle(id) {
+  const market = (state.data.markets || []).find((m) => m.id === id);
+  return market ? market.title : id;
+}
+
+function feeOf(id) {
+  const fees = state.data.fees || {};
+  return typeof fees[id] === "number" ? fees[id] : 0;
 }
 
 function fmtDate(iso) {
@@ -155,7 +205,14 @@ function sortValue(item, key) {
     case "category": return categoryTitle(item.category);
     case "demand": return item.demand;
     case "rarity": return item.rarity;
-    case "liquidity": return (item.combined || item.liquidity || {}).score;
+    case "liquidity": return (item.combined || {}).score;
+    case "starpets":
+    case "dreampets": {
+      const info = marketInfo(item, key);
+      if (!info || info.price === null || info.price === undefined) return null;
+      const rate = usdRub() || 1;
+      return info.currency === "RUB" ? info.price / rate : info.price;
+    }
     default: return item.secret ? null : item.value;  // секретные — в конец
   }
 }
@@ -182,6 +239,21 @@ function findItem(key) {
 function renderHeader() {
   $("siteUpdated").textContent = state.data.site_last_updated || "—";
   $("fetchedAt").textContent = fmtDate(state.data.fetched_at);
+  renderRate();
+}
+
+function renderRate() {
+  const rate = (state.status && state.status.rate) || state.data.rate;
+  const box = $("rateBox");
+  if (!rate) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  $("rateValue").textContent = rate.usd_rub ? `1 $ = ${rate.usd_rub.toLocaleString("ru-RU", { maximumFractionDigits: 2 })} ₽` : "нет курса";
+  $("rateSource").textContent = rate.error && !rate.usd_rub
+    ? `Rapira недоступна: ${rate.error}`
+    : `Rapira, USDT/RUB${rate.updated_at ? ` · ${fmtDate(rate.updated_at)}` : ""}${rate.error ? " · старый курс" : ""}`;
 }
 
 function renderSync() {
@@ -447,9 +519,23 @@ function itemCard(item) {
   stats.append(statLine("Спрос", item.demand), statLine("Редкость", item.rarity));
   info.append(stats);
 
+  const prices = el("div", "card-prices");
+  for (const id of MARKET_ORDER) {
+    if (!(state.data.markets || []).some((m) => m.id === id)) continue;
+    const info = marketInfo(item, id);
+    const row = el("div", `mp ${id}`);
+    row.append(el("span", "mp-name", marketTitle(id)));
+    row.append(info ? priceNode(info.price, info.currency) : el("span", "muted", "нет в продаже"));
+    if (info && id === "dreampets" && info.stock !== null && info.stock !== undefined) {
+      row.append(el("span", "muted", ` · ${info.stock} лот.`));
+    }
+    prices.append(row);
+  }
+  if (prices.childElementCount) info.append(prices);
+
   const foot = el("div", "foot");
   foot.append(el("span", `change ${changeClass(item.change)}`, item.change || ""));
-  foot.append(liquidityChip(item.combined || item.liquidity));
+  foot.append(liquidityChip(item.combined));
   info.append(foot);
   card.append(info);
 
@@ -536,7 +622,7 @@ function renderTable(rows) {
     const stability = el("td");
     stability.append(stabilityChip(item.stability));
     const liq = el("td");
-    liq.append(liquidityChip(item.combined || item.liquidity));
+    liq.append(liquidityChip(item.combined));
     tr.append(
       favCell,
       name,
@@ -583,84 +669,106 @@ function fact(list, title, value) {
   list.append(dd);
 }
 
+function tileStat(box, label, value, hint) {
+  const stat = el("div", "mstat");
+  stat.append(el("span", "mstat-label", label));
+  const node = el("strong", "mstat-value");
+  node.append(value);
+  stat.append(node);
+  if (hint) stat.title = hint;
+  box.append(stat);
+}
+
+function marketTile(item, id) {
+  const info = marketInfo(item, id);
+  const tile = el("section", `tile ${id}`);
+  const head = el("div", "tile-head");
+  head.append(el("strong", "tile-name", marketTitle(id)));
+  if (info && info.url) {
+    const link = el("a", "small", "Открыть ↗");
+    link.href = info.url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    head.append(link);
+  }
+  tile.append(head);
+  if (!info) {
+    tile.append(el("p", "muted small", "Не найден на площадке."));
+    return tile;
+  }
+  const priceRow = el("div", "tile-price");
+  priceRow.append(priceNode(info.price, info.currency));
+  tile.append(priceRow);
+  const fee = typeof info.fee === "number" ? info.fee : feeOf(id);
+  if (info.price !== null && info.price !== undefined) {
+    const payout = el("div", "tile-payout");
+    payout.append(el("span", "muted", `Вы получите (−${Math.round(fee * 100)}%)`));
+    payout.append(priceNode(info.price * (1 - fee), info.currency, "payout"));
+    tile.append(payout);
+  }
+  const stats = el("div", "mstats");
+  if (info.stock !== null && info.stock !== undefined) tileStat(stats, "Лотов", String(info.stock), "Лотов в продаже сейчас");
+  if (info.sales_week !== null && info.sales_week !== undefined) {
+    tileStat(stats, "Продаж/нед.", String(info.sales_week), "Продаж за неделю по данным площадки");
+  }
+  tileStat(stats, "Куплено, 2 дня", String(info.sold_48h || 0), "Сколько лотов исчезло с площадки (купили) за последние 48 часов");
+  tileStat(stats, "Новых, 2 дня", String(info.listed_48h || 0), "Сколько новых лотов выставили за последние 48 часов");
+  tile.append(stats);
+  const liq = el("div", "tile-liq");
+  liq.append(el("span", "muted", "Ликвидность"), liquidityChip(info));
+  tile.append(liq);
+  return tile;
+}
+
 function renderDrawer() {
   const item = state.selected && findItem(state.selected);
   if (!item) {
     $("drawer").classList.add("hidden");
     return;
   }
+  const drawer = $("drawer");
+  drawer.className = `drawer cat-${item.category}`;
   $("drawerTitle").textContent = item.name;
   $("drawerSub").textContent = categoryTitle(item.category);
   const body = $("drawerBody");
   body.replaceChildren();
 
-  const head = el("div");
-  head.append(itemArt(item, "large"));
-  if (item.contains) head.append(el("p", "contains", `Состав: ${item.contains}`));
-  head.append(el("div", "big-value", item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value)));
-  if (item.secret) head.append(el("p", "warn", "Секретный предмет: на сайте стоит условное значение 1,000,000, по нему не торгуют."));
+  const hero = el("div", "hero");
+  hero.append(itemArt(item, "large"));
+  const heroInfo = el("div", "hero-info");
+  heroInfo.append(el("span", "muted small", "Supreme Values"));
+  heroInfo.append(el("div", "big-value", item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value)));
+  if (item.range_text) heroInfo.append(el("div", "muted small", `диапазон ${item.range_text}`));
+  if (item.change) heroInfo.append(el("div", `change ${changeClass(item.change)}`, item.change));
   const fav = starButton(item);
   fav.append(state.favorites.has(itemKey(item)) ? " В избранном" : " В избранное");
-  head.append(fav);
-  body.append(head);
+  heroInfo.append(fav);
+  hero.append(heroInfo);
+  body.append(hero);
+  if (item.secret) body.append(el("p", "warn", "Секретный предмет: на сайте стоит условное значение 1,000,000, по нему не торгуют."));
+  if (item.contains) body.append(el("p", "contains", `Состав: ${item.contains}`));
 
+  const markets = (state.data.markets || []).map((m) => m.id);
+  if (markets.length) {
+    body.append(el("h3", "", "На площадках"));
+    const tiles = el("div", "tiles");
+    for (const id of markets) tiles.append(marketTile(item, id));
+    body.append(tiles);
+    const combined = el("div", "tile-liq total-liq");
+    combined.append(el("span", "", "Общая ликвидность (StarPets + DreamPets)"), liquidityChip(item.combined));
+    body.append(combined);
+  }
+
+  body.append(el("h3", "", "Supreme Values"));
   const facts = el("dl", "facts");
-  fact(facts, "Value на сайте", item.value_text);
-  fact(facts, "Диапазон", item.range_text);
   fact(facts, "Спрос", item.demand === null ? "" : `${item.demand}/10`);
   fact(facts, "Редкость", item.rarity === null ? "" : `${item.rarity}/10`);
   fact(facts, "Стабильность", stabilityChip(item.stability));
-  fact(facts, "Изменение", el("span", changeClass(item.change), item.change || "—"));
+  fact(facts, "Value на сайте", item.value_text);
   fact(facts, "Origin", item.origin);
   fact(facts, "Aliases", item.aliases);
   body.append(facts);
-
-  body.append(el("h3", "", "Ликвидность"));
-  const liq = el("dl", "facts");
-  if (item.combined) fact(liq, "Общая", liquidityChip(item.combined));
-  fact(liq, "Supreme Values", liquidityChip(item.liquidity));
-  body.append(liq);
-  if (item.liquidity && item.liquidity.reasons.length) {
-    const reasons = el("ul", "reasons");
-    reasons.append(...item.liquidity.reasons.map((r) => el("li", "", r)));
-    body.append(reasons);
-  }
-
-  const markets = state.data.markets || [];
-  if (markets.length) {
-    body.append(el("h3", "", "Торговые площадки"));
-    const table = el("table", "mini");
-    const head2 = el("tr");
-    for (const title of ["Площадка", "Цена от", "Лотов", "Продаж/нед.", "Куплено/сутки", "Оценка"]) head2.append(el("th", "", title));
-    table.append(head2);
-    for (const market of markets) {
-      const info = item.market && item.market[market.id];
-      const tr = el("tr");
-      const nameCell = el("td");
-      if (info && info.url) {
-        const link = el("a", "", market.title);
-        link.href = info.url;
-        link.target = "_blank";
-        link.rel = "noopener";
-        nameCell.append(link);
-      } else {
-        nameCell.textContent = market.title;
-      }
-      const scoreCell = el("td");
-      scoreCell.append(info ? liquidityChip(info) : el("span", "muted", "не найден"));
-      tr.append(
-        nameCell,
-        el("td", "", info ? fmtPrice(info.price, info.currency) : "—"),
-        el("td", "", info && info.stock !== null && info.stock !== undefined ? info.stock : "—"),
-        el("td", "", info && info.sales_week !== null && info.sales_week !== undefined ? info.sales_week : "—"),
-        el("td", "", info && info.sold_24h ? info.sold_24h : "—"),
-        scoreCell,
-      );
-      table.append(tr);
-    }
-    body.append(table);
-  }
-  $("drawer").classList.remove("hidden");
+  drawer.classList.remove("hidden");
 }
 
 // --- вкладка «Ликвидность» ----------------------------------------------------
@@ -695,15 +803,14 @@ function renderMarketCards() {
 }
 
 function liqViews() {
-  const views = [{ id: "combined", title: "Общая" }, { id: "supreme", title: "Supreme Values" }];
+  const views = [{ id: "combined", title: "Общая" }];
   for (const market of state.data.markets || []) views.push({ id: market.id, title: market.title });
   return views;
 }
 
 function liquidityFor(item, view) {
-  if (view === "supreme") return item.liquidity;
-  if (view === "combined") return item.combined || item.liquidity;
-  return item.market && item.market[view] ? item.market[view] : null;
+  if (view === "combined") return item.combined || null;
+  return marketInfo(item, view);
 }
 
 function renderLiqViews() {
@@ -722,12 +829,11 @@ function renderLiqViews() {
     return button;
   }));
   const hints = {
-    combined: "Среднее по Supreme Values и всем площадкам, где есть данные по предмету.",
-    supreme: "По данным Supreme Values: спрос, стабильность и диапазон цены.",
+    combined: "Среднее по StarPets и DreamPets — где у предмета есть данные.",
   };
   const market = (state.data.markets || []).find((m) => m.id === state.liqView);
   $("liqViewHint").textContent = hints[state.liqView]
-    || (market ? `По данным ${market.title}: продажи за неделю, число предложений и покупки между проверками.` : "");
+    || (market ? `По данным ${market.title}: продажи за неделю, лоты в продаже и сколько лотов купили за 2 дня.` : "");
 }
 
 function renderLiqCategorySelect() {
@@ -751,7 +857,16 @@ function liqItem(item, info) {
   fill.style.width = `${info.score}%`;
   bar.append(fill);
   const value = item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value);
-  li.append(head, bar, el("div", "liq-meta", `${categoryTitle(item.category)} · значение ${value}`));
+  li.append(head, bar, el("div", "liq-meta", `${categoryTitle(item.category)} · Supreme ${value}`));
+  const prices = el("div", "liq-meta");
+  for (const id of MARKET_ORDER) {
+    const market = marketInfo(item, id);
+    if (market && market.price !== null && market.price !== undefined) {
+      const pair = bothPrices(market.price, market.currency);
+      prices.append(`${marketTitle(id)}: ${pair[0]}${pair[1] ? ` (${pair[1]})` : ""}  `);
+    }
+  }
+  if (prices.textContent) li.append(prices);
   if (info.reasons && info.reasons.length) li.append(el("div", "liq-meta", info.reasons.join("; ")));
   li.addEventListener("click", () => openDrawer(itemKey(item)));
   return li;
@@ -793,13 +908,307 @@ function renderLiquidity() {
 function renderMethod() {
   const info = state.data.liquidity;
   if (!info) return;
-  const weights = Object.entries(info.stability)
-    .sort((a, b) => b[1] - a[1])
-    .map(([name, bonus]) => `${name.replace(/\b\w/g, (c) => c.toUpperCase())} ${bonus > 0 ? "+" : bonus < 0 ? "−" : "±"}${Math.abs(bonus)}`);
-  $("methodStability").textContent = weights.join(", ");
   $("methodLiquid").textContent = info.liquid_from;
   $("methodMedium").textContent = `${info.medium_from}–${info.liquid_from - 1}`;
   $("methodIlliquid").textContent = info.medium_from;
+}
+
+// --- вкладка «Площадки» -------------------------------------------------------
+
+function mkSortValue(item, key) {
+  const dp = marketInfo(item, "dreampets");
+  const sp = marketInfo(item, "starpets");
+  switch (key) {
+    case "starpets": return sortValue(item, "starpets");
+    case "dreampets": return sortValue(item, "dreampets");
+    case "lots": return dp ? dp.stock : null;
+    case "sold": return dp ? (dp.sold_48h || 0) : null;
+    case "sales": return sp ? sp.sales_week : null;
+    default: return item.name.toLowerCase();
+  }
+}
+
+function payoutCell(info, id) {
+  const td = el("td", "num");
+  if (!info || info.price === null || info.price === undefined) {
+    td.append(el("span", "muted", "—"));
+    return td;
+  }
+  const fee = typeof info.fee === "number" ? info.fee : feeOf(id);
+  td.append(priceNode(info.price * (1 - fee), info.currency, "payout"));
+  return td;
+}
+
+function numCell(value) {
+  return el("td", "num", value === null || value === undefined ? "—" : value);
+}
+
+function renderMarketsTab() {
+  const select = $("mkCategory");
+  if (!select.childElementCount || select.dataset.version !== String(state.data.categories.length)) {
+    const options = [["weapons", "Всё оружие"], ["all", "Все предметы"], ["favorites", "★ Избранное"]]
+      .concat(state.data.categories.map((c) => [c.slug, c.title]));
+    select.replaceChildren(...options.map(([value, title]) => {
+      const option = el("option", "", title);
+      option.value = value;
+      return option;
+    }));
+    select.dataset.version = String(state.data.categories.length);
+    select.value = state.mkCategory;
+  }
+  const query = state.mkSearch.trim().toLowerCase();
+  let rows = itemsIn(state.mkCategory).filter((item) => !item.secret && matchesSearch(item, query));
+  if (state.mkOnlyListed) {
+    rows = rows.filter((item) => MARKET_ORDER.some((id) => {
+      const info = marketInfo(item, id);
+      return info && info.price !== null && info.price !== undefined;
+    }));
+  }
+  const [key, dir] = state.mkSort.split(":");
+  rows.sort((a, b) => {
+    const av = mkSortValue(a, key);
+    const bv = mkSortValue(b, key);
+    const aMissing = av === null || av === undefined;
+    const bMissing = bv === null || bv === undefined;
+    if (aMissing !== bMissing) return aMissing ? 1 : -1;
+    let result = aMissing ? 0 : (typeof av === "string" ? av.localeCompare(bv) : av - bv);
+    if (dir === "desc") result = -result;
+    return result || a.name.localeCompare(b.name);
+  });
+
+  const fragment = document.createDocumentFragment();
+  for (const item of rows.slice(0, 600)) {
+    const sp = marketInfo(item, "starpets");
+    const dp = marketInfo(item, "dreampets");
+    const tr = el("tr");
+    const nameCell = el("td", "item-cell");
+    const art = itemArt(item, "tiny");
+    nameCell.append(art, el("span", "", item.name));
+    const supreme = item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value);
+    const spPrice = el("td", "num");
+    spPrice.append(sp ? priceNode(sp.price, sp.currency) : el("span", "muted", "—"));
+    const dpPrice = el("td", "num");
+    dpPrice.append(dp ? priceNode(dp.price, dp.currency) : el("span", "muted", "—"));
+    tr.append(
+      nameCell,
+      el("td", "num muted", supreme),
+      spPrice,
+      payoutCell(sp, "starpets"),
+      numCell(sp ? sp.sales_week : null),
+      dpPrice,
+      payoutCell(dp, "dreampets"),
+      numCell(dp ? dp.stock : null),
+      numCell(dp ? (dp.sold_48h || 0) : null),
+      numCell(dp ? (dp.listed_48h || 0) : null),
+    );
+    tr.addEventListener("click", () => openDrawer(itemKey(item)));
+    fragment.append(tr);
+  }
+  if (!rows.length) {
+    const tr = el("tr");
+    const td = el("td", "empty", state.data.items.length ? "Ничего не найдено." : "Цен пока нет.");
+    td.colSpan = 10;
+    tr.append(td);
+    fragment.append(tr);
+  }
+  $("mkBody").replaceChildren(fragment);
+  const rate = usdRub();
+  $("mkHint").textContent = `Показано: ${Math.min(rows.length, 600)}${rows.length > 600 ? ` из ${rows.length}` : ""}. ` +
+    `Цены пересчитаны ${rate ? `по курсу 1 $ = ${rate.toLocaleString("ru-RU", { maximumFractionDigits: 2 })} ₽ (Rapira)` : "— курс ещё не получен"}. ` +
+    "«Вы получите» — цена минус комиссия площадки: StarPets 20%, DreamPets 10%.";
+}
+
+// --- вкладка «Калькулятор продажи» --------------------------------------------
+
+const calc = { images: [], items: [] };
+
+function addCalcFiles(files) {
+  for (const file of files) {
+    if (!file.type.startsWith("image/")) continue;
+    if (calc.images.length >= 8) {
+      toast("Не больше 8 скриншотов за раз", "error");
+      break;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      calc.images.push({ name: file.name || "скриншот", data: reader.result });
+      renderCalcThumbs();
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+function renderCalcThumbs() {
+  $("calcThumbs").replaceChildren(...calc.images.map((image, index) => {
+    const box = el("div", "thumb");
+    const img = el("img");
+    img.src = image.data;
+    img.alt = image.name;
+    const remove = el("button", "ghost icon", "✕");
+    remove.type = "button";
+    remove.title = "Убрать скриншот";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      calc.images.splice(index, 1);
+      renderCalcThumbs();
+    });
+    box.append(img, remove);
+    return box;
+  }));
+}
+
+async function runCalc() {
+  const button = $("calcBtn");
+  button.disabled = true;
+  $("calcStatus").textContent = calc.images.length ? "Распознаю скриншоты…" : "Считаю…";
+  try {
+    const response = await postJson("/api/calc", {
+      text: $("calcText").value,
+      images: calc.images.map((image) => image.data),
+    });
+    calc.items = response.items.map((item) => ({ ...item }));
+    calc.fees = response.fees || {};
+    const notes = [];
+    if (response.ocr_lines) notes.push(`распознано строк на скриншотах: ${response.ocr_lines}`);
+    if (response.ocr_errors && response.ocr_errors.length) notes.push(response.ocr_errors.join("; "));
+    $("calcStatus").textContent = `Найдено предметов: ${calc.items.length}${notes.length ? ` (${notes.join("; ")})` : ""}`;
+    $("calcUnmatched").textContent = response.unmatched && response.unmatched.length
+      ? `Не узнал: ${response.unmatched.join(", ")}. Проверьте написание или добавьте строкой.` : "";
+    renderCalc();
+  } catch (error) {
+    $("calcStatus").textContent = `Ошибка: ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function calcFee(id) {
+  return calc.fees && typeof calc.fees[id] === "number" ? calc.fees[id] : feeOf(id);
+}
+
+const CALC_CURRENCY = { starpets: "USD", dreampets: "RUB" };
+
+function calcPayout(item, id) {
+  const info = item.prices[id];
+  if (!info || info.price === null || info.price === undefined) return null;
+  return info.price * (1 - calcFee(id)) * item.qty;
+}
+
+function inCurrency(amount, from, to) {
+  if (from === to) return amount;
+  const rate = usdRub();
+  if (!rate) return null;
+  return to === "USD" ? amount / rate : amount * rate;
+}
+
+function fillCalcSums(item, sums) {
+  for (const id of MARKET_ORDER) {
+    const payout = calcPayout(item, id);
+    sums[id].replaceChildren(payout === null ? el("span", "muted", "—")
+      : priceNode(payout, item.prices[id].currency, "payout"));
+  }
+}
+
+function renderCalc() {
+  const body = $("calcBody");
+  body.replaceChildren(...calc.items.map((item, index) => {
+    const tr = el("tr");
+    const nameCell = el("td", "item-cell");
+    nameCell.append(itemArt(item, "tiny"), el("span", "", item.name));
+    if (item.score < 1) nameCell.append(el("span", "badge", `похоже на «${item.seen[0]}»`));
+    const qtyCell = el("td", "num");
+    const qty = el("input");
+    qty.type = "number";
+    qty.min = "1";
+    qty.max = "9999";
+    qty.value = item.qty;
+    qty.className = "qty";
+    qty.setAttribute("aria-label", `Количество: ${item.name}`);
+    const cells = [];
+    const sums = {};
+    for (const id of MARKET_ORDER) {
+      const info = item.prices[id];
+      const unit = el("td", "num");
+      if (info && info.price !== null && info.price !== undefined) {
+        unit.append(priceNode(info.price, info.currency));
+      } else {
+        unit.append(el("span", "muted", "нет в продаже"));
+      }
+      sums[id] = el("td", "num");
+      cells.push(unit, sums[id]);
+    }
+    fillCalcSums(item, sums);
+    // Строки не перерисовываются при вводе: меняются только суммы и итог,
+    // иначе поле ввода пропадало бы из-под курсора.
+    qty.addEventListener("input", () => {
+      const value = parseInt(qty.value, 10);
+      if (!(value >= 1)) return;
+      item.qty = Math.min(9999, value);
+      fillCalcSums(item, sums);
+      renderCalcTotals();
+    });
+    qty.addEventListener("change", () => {
+      item.qty = Math.max(1, Math.min(9999, parseInt(qty.value, 10) || 1));
+      qty.value = item.qty;
+      fillCalcSums(item, sums);
+      renderCalcTotals();
+    });
+    qtyCell.append(qty);
+    const removeCell = el("td");
+    const remove = el("button", "ghost icon", "✕");
+    remove.type = "button";
+    remove.title = "Убрать из расчёта";
+    remove.setAttribute("aria-label", `Убрать: ${item.name}`);
+    remove.addEventListener("click", () => {
+      calc.items.splice(index, 1);
+      renderCalc();
+    });
+    removeCell.append(remove);
+    tr.append(nameCell, qtyCell, ...cells, removeCell);
+    return tr;
+  }));
+  $("calcWrap").classList.toggle("hidden", !calc.items.length);
+  renderCalcTotals();
+}
+
+function renderCalcTotals() {
+  const box = $("calcTotals");
+  box.replaceChildren();
+  if (!calc.items.length) return;
+  const totals = {};
+  const missing = {};
+  let noRate = false;
+  for (const id of MARKET_ORDER) {
+    totals[id] = 0;
+    missing[id] = 0;
+    for (const item of calc.items) {
+      const payout = calcPayout(item, id);
+      if (payout === null) {
+        missing[id] += item.qty;
+        continue;
+      }
+      const converted = inCurrency(payout, item.prices[id].currency, CALC_CURRENCY[id]);
+      if (converted === null) noRate = true;
+      else totals[id] += converted;
+    }
+  }
+  for (const id of MARKET_ORDER) {
+    const card = el("div", `total ${id}`);
+    card.append(el("span", "muted", `${marketTitle(id)} — вы получите (−${Math.round(calcFee(id) * 100)}%)`));
+    const sum = el("div", "total-sum");
+    sum.append(priceNode(totals[id], CALC_CURRENCY[id]));
+    card.append(sum);
+    if (missing[id]) card.append(el("span", "muted small", `не продаётся там: ${missing[id]} шт.`));
+    box.append(card);
+  }
+  if (noRate) box.append(el("p", "hint", "Нет курса доллара — часть цен не пересчитана."));
+  const rate = usdRub();
+  if (rate && (totals.starpets || totals.dreampets)) {
+    const star = totals.starpets * rate;
+    const best = star > totals.dreampets ? "starpets" : "dreampets";
+    const diff = Math.abs(star - totals.dreampets);
+    box.append(el("p", "hint", `Выгоднее продать на ${marketTitle(best)} — больше на ${fmtRub(diff)}.`));
+  }
 }
 
 // --- вкладка «Импорт» ---------------------------------------------------------
@@ -911,6 +1320,7 @@ async function poll() {
       await loadData();
     }
     renderSync();
+    renderRate();
     renderMarketCards();
   } catch (error) {
     state.offline = error.message;
@@ -923,6 +1333,7 @@ async function poll() {
 
 function renderAll() {
   renderHeader();
+  renderMarketsTab();
   renderErrors();
   renderMethod();
   renderValues();
@@ -1017,6 +1428,47 @@ function init() {
     renderValues();
   });
   $("moreBtn").addEventListener("click", showMoreCards);
+  $("mkSearch").addEventListener("input", (event) => { state.mkSearch = event.target.value; renderMarketsTab(); });
+  $("mkCategory").addEventListener("change", (event) => { state.mkCategory = event.target.value; renderMarketsTab(); });
+  $("mkSort").addEventListener("change", (event) => { state.mkSort = event.target.value; renderMarketsTab(); });
+  $("mkOnlyListed").addEventListener("change", (event) => { state.mkOnlyListed = event.target.checked; renderMarketsTab(); });
+  $("calcBtn").addEventListener("click", runCalc);
+  $("calcClear").addEventListener("click", () => {
+    calc.images = [];
+    calc.items = [];
+    $("calcText").value = "";
+    $("calcStatus").textContent = "";
+    $("calcUnmatched").textContent = "";
+    renderCalcThumbs();
+    renderCalc();
+  });
+  const drop = $("calcDrop");
+  drop.addEventListener("click", () => $("calcFiles").click());
+  drop.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      $("calcFiles").click();
+    }
+  });
+  $("calcFiles").addEventListener("change", (event) => {
+    addCalcFiles(event.target.files);
+    event.target.value = "";
+  });
+  drop.addEventListener("dragover", (event) => { event.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", (event) => {
+    event.preventDefault();
+    drop.classList.remove("over");
+    addCalcFiles(event.dataTransfer.files);
+  });
+  document.addEventListener("paste", (event) => {
+    if (!$("tab-calc") || $("tab-calc").classList.contains("hidden")) return;
+    const files = [...(event.clipboardData ? event.clipboardData.files : [])];
+    if (files.length) {
+      event.preventDefault();
+      addCalcFiles(files);
+    }
+  });
   if ("IntersectionObserver" in window) {
     // Карточки подгружаются сами, когда пользователь докручивает до конца списка.
     new IntersectionObserver((entries) => {
