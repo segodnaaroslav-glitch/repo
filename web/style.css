@@ -101,7 +101,7 @@ label.check input { width: 16px; height: 16px; padding: 0; accent-color: var(--a
 
 .sync { flex: 1; min-width: 260px; max-width: 560px; }
 .sync-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--none); flex-shrink: 0; }
+.dot { display: inline-block; vertical-align: middle; width: 9px; height: 9px; border-radius: 50%; background: var(--none); flex-shrink: 0; }
 .dot.ok { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 25%, transparent); }
 .dot.busy { background: var(--mid); animation: pulse 1s infinite; }
 .dot.err { background: var(--bad); }
@@ -228,6 +228,7 @@ td.empty { text-align: center; color: var(--muted); padding: 30px; white-space: 
 
 /* --- ликвидность ---------------------------------------------------------- */
 
+.markets-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .markets { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .market {
   border: 1px solid var(--line);

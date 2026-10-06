@@ -76,8 +76,12 @@ def build_payload(data, load_error=None, monitor=None):
         item = dict(item)
         item["liquidity"] = liquidity.assess(item)
         items.append(item)
+    market_error = None
     if monitor is not None:
-        monitor.annotate(items)
+        try:
+            monitor.annotate(items)
+        except Exception as error:  # данные площадок не должны прятать цены
+            market_error = str(error) or type(error).__name__
     counts = {}
     for item in items:
         counts[item["category"]] = counts.get(item["category"], 0) + 1
@@ -107,6 +111,7 @@ def build_payload(data, load_error=None, monitor=None):
             "stability": {name: bonus for name, (bonus, _) in liquidity.STABILITY.items()},
         },
         "markets": monitor.status_list() if monitor is not None else [],
+        "market_error": market_error,
         "items": items,
     }
 

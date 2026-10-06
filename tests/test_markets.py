@@ -49,8 +49,19 @@ class MatchingTests(unittest.TestCase):
             parser.make_item("Locked", "untradables", {"value": "N/A"}),
         ]
         index = markets.build_index(items)
-        self.assertEqual(index["batwing"]["category"], "ancients")
-        self.assertNotIn("locked", index)
+        self.assertEqual(markets.find_item(index, {"name": "Batwing"})["category"], "ancients")
+        self.assertIsNone(markets.find_item(index, {"name": "Locked"}))
+
+    def test_gun_and_knife_with_same_base_name(self):
+        items = [parser.make_item("Flowerwood", "godlies", {"value": "50"}),
+                 parser.make_item("Flowerwood Gun", "godlies", {"value": "40"})]
+        for order in (items, list(reversed(items))):
+            index = markets.build_index(order)
+            self.assertEqual(markets.find_item(index, {"name": "Flowerwood"})["name"], "Flowerwood")
+            self.assertEqual(markets.find_item(index, {"name": "Flowerwood Gun"})["name"], "Flowerwood Gun")
+            self.assertEqual(markets.find_item(index, {"name": "Flowerwood", "kind": "gun"})["name"], "Flowerwood Gun")
+            self.assertEqual(markets.find_item(index, {"name": "Flowerwood", "kind": "knife"})["name"], "Flowerwood")
+            self.assertIsNone(markets.find_item(index, {"name": "Flowerwood (Godly)", "kind": ""}) and None)
 
 
 class ShopAdapterTests(unittest.TestCase):
@@ -183,7 +194,9 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(markets.assess_offer({"sales_week": 0}, 0)["level"], liquidity.ILLIQUID)
         self.assertEqual(markets.assess_offer({"sales_week": 20}, 0)["level"], liquidity.LIQUID)
         self.assertEqual(markets.assess_offer({"stock": 3}, 0)["level"], liquidity.MEDIUM)
-        self.assertEqual(markets.assess_offer({"stock": 50, "available": False}, 0)["score"], 10)
+        self.assertIsNone(markets.assess_offer({"stock": 50, "available": False}, 0)["score"])
+        self.assertIsNone(markets.assess_offer({"price": 5, "available": True}, 0)["score"])
+        self.assertEqual(markets.assess_offer({"popularity": 0.0, "available": True}, 0)["score"], 80)
 
 
 class ConfigTests(unittest.TestCase):
@@ -198,9 +211,6 @@ class ConfigTests(unittest.TestCase):
             configs = markets.load_configs(data_path)
             self.assertEqual([(c["id"], c["title"]) for c in configs], [("myshop", "myshop")])
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class FakeApi(BaseHTTPRequestHandler):
@@ -267,13 +277,18 @@ class StarPetsTests(unittest.TestCase):
         markets.StarPetsAdapter(self.config, cache).fetch()  # продажи уже свежие — не запрашиваются снова
         self.assertEqual(len([c for c in FakeApi.calls if c[0] == "GET"]), gets_before)
 
-    def test_sales_endpoint_missing_is_switched_off(self):
+    def test_sales_endpoint_missing_is_paused(self):
         FakeApi.info_status = 404
         cache = {}
-        for _ in range(3):
+        markets.StarPetsAdapter(self.config, cache).fetch()
+        gets = len([c for c in FakeApi.calls if c[0] == "GET"])
+        self.assertEqual(gets, 2)  # оба предмета с ценой попробованы и ушли в конец очереди
+        markets.StarPetsAdapter(self.config, cache).fetch()
+        self.assertEqual(len([c for c in FakeApi.calls if c[0] == "GET"]), gets)  # без повторов подряд
+        with unittest.mock.patch.object(markets.StarPetsAdapter, "INFO_MAX_AGE", -1):
             adapter = markets.StarPetsAdapter(self.config, cache)
-            offers = adapter.fetch()
-        self.assertTrue(cache["info_off"])
+            offers = adapter.fetch()  # третья ошибка подряд — пауза на час
+        self.assertGreater(cache["info_off_until"], 0)
         self.assertIn("не отдаёт", adapter.note)
         self.assertTrue(all(o["sales_week"] is None for o in offers))
 
@@ -356,3 +371,162 @@ class EldoradoTests(unittest.TestCase):
         self.assertEqual(set(second), {"Fang", "Chroma Luger"})
         self.assertEqual(second["Chroma Luger"]["sales_week"], 7)
         self.assertEqual(cache["page"], 1)  # круг пройден, следующий опрос — снова с первой страницы
+
+
+class ReviewV3Tests(unittest.TestCase):
+    """Случаи, найденные при проверке площадок."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "values.json"
+        data = store.empty_data()
+        store.replace_category(data, "godlies", [
+            parser.make_item(name, "godlies", {"value": "100", "demand": "8", "stability": "Stable"})
+            for name in ("Fang", "Seer", "Harvester")
+        ], "site")
+        store.save(data, self.path)
+        patcher = unittest.mock.patch.object(markets, "_pause")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def eldorado(self, pages, cache):
+        routes = {
+            f"/?gameId=204&category=CustomItem&offerSortingCriterion=Price&isAscending=true&pageIndex={n}&pageSize=50":
+                {"results": rows, "totalPages": len(pages)}
+            for n, rows in pages.items()
+        }
+        httpd, base = serve(routes)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return {"id": "eldorado", "title": "Eldorado", "kind": "eldorado", "url": "u", "api": base + "/"}
+
+    @staticmethod
+    def row(offer_id, name, quantity):
+        return {"offer": {"id": offer_id, "quantity": quantity, "pricePerUnitInUSD": {"amount": 1.0},
+                          "tradeEnvironmentValues": [{"name": "Item type", "value": "Knife"},
+                                                     {"name": "Item name", "value": name}]},
+                "user": {"id": offer_id}}
+
+    def monitor_for(self, config):
+        class Small(markets.EldoradoAdapter):
+            PAGES_PER_POLL = 1
+        return markets.MarketMonitor(self.path, [config], adapters={"eldorado": Small})
+
+    def snapshot(self, monitor):
+        items = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(self.path)["items"]])
+        return {i["name"]: (i["market"].get("eldorado") or {}).get("stock") for i in items}, \
+            {i["name"]: (i["market"].get("eldorado") or {}).get("sold_24h") for i in items}
+
+    def test_restart_and_long_pause_do_not_invent_purchases(self):
+        pages = {1: [self.row("a", "Fang", 5)], 2: [self.row("b", "Seer", 3)], 3: [self.row("c", "Harvester", 2)]}
+        config = self.eldorado(pages, {})
+        monitor = self.monitor_for(config)
+        for _ in range(6):  # два полных круга
+            monitor.poll(monitor.markets[0])
+        stock, sold = self.snapshot(monitor)
+        self.assertEqual(stock, {"Fang": 5, "Seer": 3, "Harvester": 2})
+        self.assertEqual(set(sold.values()), {0})
+
+        again = self.monitor_for(config)  # перезапуск программы
+        again.poll(again.markets[0])
+        stock, sold = self.snapshot(again)
+        self.assertEqual(stock, {"Fang": 5, "Seer": 3, "Harvester": 2})
+        self.assertEqual(set(sold.values()), {0})
+
+        cache = again.markets[0].cache  # компьютер спал 4 часа
+        cache["last_fetch"] -= 4 * 3600
+        for _ in range(3):
+            again.poll(again.markets[0])
+        stock, sold = self.snapshot(again)
+        self.assertEqual(stock, {"Fang": 5, "Seer": 3, "Harvester": 2})
+        self.assertEqual(set(sold.values()), {0})
+
+    def test_real_purchase_is_counted_after_full_cycles(self):
+        pages = {1: [self.row("a", "Fang", 5)], 2: [self.row("b", "Seer", 3)]}
+        config = self.eldorado(pages, {})
+        monitor = self.monitor_for(config)
+        for _ in range(4):
+            monitor.poll(monitor.markets[0])
+        pages[1][0]["offer"]["quantity"] = 2  # купили 3 штуки
+        for _ in range(2):
+            monitor.poll(monitor.markets[0])
+        _, sold = self.snapshot(monitor)
+        self.assertEqual(sold["Fang"], 3)
+
+    def test_no_data_does_not_lower_combined(self):
+        item = parser.make_item("Fang", "godlies", {"value": "100", "demand": "8", "stability": "Stable"})
+        item["liquidity"] = liquidity.assess(item)
+        infos = [dict(markets.assess_offer({"price": 5, "available": True}, 0), market_title="StarPets"),
+                 dict(markets.assess_offer({"available": False}, 0), market_title="DreamPets")]
+        combined = markets.combine(item, infos)
+        self.assertEqual((combined["score"], combined["sources"]), (item["liquidity"]["score"], 1))
+        self.assertIn("StarPets: есть в продаже, но площадка не показывает продажи", combined["reasons"])
+
+    def test_waits_for_prices_before_matching(self):
+        empty = Path(self.tmp.name) / "empty.json"
+        monitor = markets.MarketMonitor(empty, [{"id": "x", "title": "X", "kind": "shop", "url": "http://127.0.0.1:9"}])
+        monitor.poll(monitor.markets[0])
+        status = monitor.status_list()[0]
+        self.assertEqual((status["status"], status["message"]), ("waiting", "ждёт цены Supreme Values"))
+
+    def test_bad_state_file_and_interval_are_ignored(self):
+        (Path(self.tmp.name) / "markets-state.json").write_text(
+            '{"x": {"offers": {"godlies:Fang": 5, "godlies:Seer": {"price": 1}}, "sales": {"a": [[1, "x"]]},'
+            ' "cache": [1], "last_ok_at": "bad"}}', encoding="utf-8")
+        (Path(self.tmp.name) / "markets.json").write_text(
+            '[{"id": "x", "kind": "shop", "url": "http://e", "interval": "fast"},'
+            ' {"id": "y", "kind": "shop", "url": "http://e", "interval": 5}]', encoding="utf-8")
+        monitor = markets.MarketMonitor(self.path)
+        self.assertEqual([m.config.get("interval") for m in monitor.markets], [None, None])
+        market = monitor.markets[0]
+        self.assertEqual((list(market.offers), market.sales, market.cache, market.last_ok_at),
+                         (["godlies:Seer"], {"a": []}, {}, None))
+        self.assertEqual(monitor.status_list()[0]["interval"], markets.POLL_EVERY)
+
+
+class StarPetsRotationTests(unittest.TestCase):
+    def test_bad_id_is_skipped_and_errors_reset(self):
+        class Api(FakeApi):
+            def do_GET(self):
+                self.calls.append(("GET", self.path, None))
+                product_id = int(self.path.split("/")[-2])
+                if product_id == 756:
+                    self._send(404, {})
+                else:
+                    self._send(200, {"product": {"numberOfSalesPerWeek": 9}})
+        FakeApi.calls = []
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Api)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        config = {"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "u",
+                  "api": f"http://127.0.0.1:{httpd.server_address[1]}"}
+        with unittest.mock.patch.object(markets, "_pause"):
+            cache = {}
+            offers = {o["name"]: o for o in markets.StarPetsAdapter(config, cache).fetch()}
+        self.assertEqual(offers["Luger"]["sales_week"], 9)  # 756 не помешал остальным
+        self.assertNotIn("info_off_until", cache)
+        self.assertEqual(cache["info_errors"], 0)
+        self.assertEqual(offers["Luger"]["popularity"], 0.0)
+
+
+class DreamPetsReviewTests(unittest.TestCase):
+    def test_all_pages_failing_is_an_error(self):
+        httpd, base = serve({"/mm2/": '<a href="/mm2/product/a/1">A</a><a href="/mm2/product/b/2">B</a>'})
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with unittest.mock.patch.object(markets, "_pause"):
+            with self.assertRaises(markets.fetcher.FetchError):
+                markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": base + "/mm2/"}).fetch()
+
+    def test_lots_do_not_join_neighbouring_numbers(self):
+        adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dreampets.gg/mm2/"})
+        page = ('<title>Seer - ММ2</title><meta name="description" content="Seer в ММ2 от 17 ₽, 114 лотов">'
+                '<p>ММ2</p><p>2 лота</p>')
+        self.assertEqual(adapter._parse_product(page)["lots"], 114)
+        self.assertEqual(adapter._parse_product("<title>X</title><p>1 234 лота</p>")["lots"], 1234)
+
+
+if __name__ == "__main__":
+    unittest.main()

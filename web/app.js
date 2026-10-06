@@ -31,6 +31,9 @@ const state = {
   liqCategory: "weapons",
   liqSearch: "",
   selected: null,        // ключ предмета в карточке
+  offline: null,         // текст ошибки, если программа не отвечает
+  userUpdate: false,     // обновление запущено кнопкой (о результате сообщить всплывающим окном)
+  lastError: null,       // последняя показанная ошибка автообновления
 };
 
 const $ = (id) => document.getElementById(id);
@@ -185,6 +188,13 @@ function renderSync() {
   const sync = status && status.sync;
   const dot = $("syncDot");
   dot.className = "dot";
+  if (state.offline) {
+    dot.classList.add("err");
+    $("syncNext").textContent = "Программа не отвечает";
+    $("syncResult").textContent = `Нет связи с программой: ${state.offline}. Запустите её снова.`;
+    $("syncProgress").style.width = "0";
+    return;
+  }
   if (status && status.running) {
     dot.classList.add("busy");
     $("syncNext").textContent = "Идёт загрузка цен с сайта…";
@@ -507,6 +517,7 @@ function renderMarketCards() {
   const markets = state.data.markets || [];
   const box = $("marketCards");
   const live = (state.status && state.status.markets) || markets;
+  $("marketsBtn").classList.toggle("hidden", !live.length);
   box.replaceChildren(...live.map((market) => {
     const card = el("div", "market");
     const head = el("div", "market-head");
@@ -682,9 +693,20 @@ async function submitImport(event) {
 async function startUpdate() {
   try {
     await postJson("/api/update");
+    state.userUpdate = true;
     toast("Загружаю цены с сайта…");
   } catch (error) {
     toast(`Не удалось начать обновление: ${error.message}`, "error");
+  }
+  pollSoon();
+}
+
+async function pollMarkets() {
+  try {
+    await postJson("/api/markets/poll");
+    toast("Опрашиваю площадки…");
+  } catch (error) {
+    toast(error.message, "error");
   }
   pollSoon();
 }
@@ -711,11 +733,18 @@ async function poll() {
   clearTimeout(pollTimer);
   try {
     const status = await api("/api/status");
+    state.offline = null;
     if (status.now) state.clockOffset = new Date(status.now).getTime() - Date.now();
     state.status = status;
     if (wasRunning && !status.running) {
-      if (status.error) toast(`Не удалось обновить цены:\n${status.error}`, "error");
-      else toast((status.log || []).filter((line) => line.startsWith("Готово")).join("\n") || "Цены обновлены.", "ok");
+      // О результате своего обновления — всегда; об автообновлении — только о новой ошибке.
+      if (status.error && (state.userUpdate || status.error !== state.lastError)) {
+        toast(`Не удалось обновить цены:\n${status.error}`, "error");
+      } else if (!status.error) {
+        toast((status.log || []).filter((line) => line.startsWith("Готово")).join("\n") || "Цены обновлены.", "ok");
+      }
+      state.lastError = status.error || null;
+      state.userUpdate = false;
     }
     wasRunning = status.running;
     const version = `${status.data_version}:${status.market_version || 0}`;
@@ -726,8 +755,8 @@ async function poll() {
     renderSync();
     renderMarketCards();
   } catch (error) {
-    $("syncResult").textContent = `Нет связи с программой: ${error.message}`;
-    $("syncDot").className = "dot err";
+    state.offline = error.message;
+    renderSync();
   }
   pollTimer = setTimeout(poll, state.status && state.status.running ? 1500 : 5000);
 }
@@ -823,6 +852,7 @@ function init() {
   $("liqCategory").addEventListener("change", (event) => { state.liqCategory = event.target.value; renderLiquidity(); });
   $("updateBtn").addEventListener("click", startUpdate);
   $("checkBtn").addEventListener("click", checkSite);
+  $("marketsBtn").addEventListener("click", pollMarkets);
   $("importForm").addEventListener("submit", submitImport);
   $("drawerClose").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {

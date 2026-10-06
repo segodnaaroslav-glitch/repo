@@ -99,6 +99,61 @@ class AutoSyncTests(unittest.TestCase):
             sync.stop()
 
 
+class JobWithStatus(FakeJob):
+    def __init__(self):
+        super().__init__()
+        self.error = None
+        self.finished_at = None
+
+    def status(self):
+        return {"running": self.running, "error": self.error, "finished_at": self.finished_at}
+
+
+class AutoSyncReviewTests(AutoSyncTests):
+    def test_failed_categories_are_retried_later(self):
+        self.save(self.site_date, fetched_at="2026-01-01T00:00:00")  # без часового пояса — не падать
+        sync = self.sync()
+        sync.max_age = 10 ** 9
+        data = store.load(self.path)
+        data["errors"] = [{"category": "godlies", "title": "Godlies", "message": "нет связи"}]
+        store.save(data, self.path)
+        sync._tick()
+        self.assertEqual(self.job.started, 1)
+        self.assertIn("не все категории", sync.status()["last_result"])
+
+    def test_failures_back_off(self):
+        self.job = JobWithStatus()
+        sync = self.sync()
+        sync._tick()  # цен нет — первое обновление
+        self.assertEqual(self.job.started, 1)
+        self.job.error, self.job.finished_at = "сайт недоступен", "t1"
+        sync._tick()  # обновление не удалось — пауза, без повтора каждые 5 минут
+        self.assertEqual(self.job.started, 1)
+        self.assertIn("не удалось 1 раз", sync.status()["last_result"])
+        sync.pause_until = autosync._now()  # пауза прошла
+        sync._tick()
+        self.assertEqual(self.job.started, 2)
+        self.job.error, self.job.finished_at = None, "t2"
+        sync._tick()
+        self.assertEqual((sync.failures, sync.pause_until), (0, None))
+
+    def test_locked_file_is_not_corruption(self):
+        from unittest import mock
+        self.save(self.site_date)
+        sync = self.sync()
+        with mock.patch.object(store, "load", side_effect=PermissionError("занят")):
+            sync._tick()
+        self.assertEqual(self.job.started, 0)
+        self.assertIn("занят", sync.status()["last_result"])
+
+    def test_unexpected_error_does_not_kill_the_loop(self):
+        sync = autosync.AutoSync(self.job, self.path, check_site=lambda: 1 / 0, first_after=0)
+        self.save(self.site_date)
+        sync._decide = lambda: (_ for _ in ()).throw(RuntimeError("сбой"))
+        sync._tick()
+        self.assertIn("ошибка проверки: сбой", sync.status()["last_result"])
+
+
 class SecretTests(unittest.TestCase):
     def test_placeholder_million_is_secret(self):
         item = parser.make_item("Batwing", "godlies", {"value": "1,000,000", "demand": "10", "rarity": "10"})

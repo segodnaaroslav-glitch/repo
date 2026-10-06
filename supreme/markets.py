@@ -98,15 +98,38 @@ def market_key(name):
 
 
 def build_index(items):
-    """{ключ названия: предмет} — секретные и Untradables не сопоставляются."""
-    index = {}
+    """Поиск предметов Supreme Values по названию товара на площадке.
+
+    Точное название ищется первым. Упрощённый ключ (без "Gun", "Knife", "(Godly)")
+    используется, только если он однозначен: "Flowerwood" и "Flowerwood Gun" —
+    разные предметы. Секретные и Untradables не сопоставляются.
+    """
+    exact, loose, ambiguous = {}, {}, set()
     for item in items:
         if item.get("secret") or item.get("category") == "untradables":
             continue
-        for key in {parser.name_key(item["name"]), market_key(item["name"])}:
-            if key and key not in index:
-                index[key] = item
-    return index
+        exact.setdefault(parser.name_key(item["name"]), item)
+        key = market_key(item["name"])
+        if not key:
+            continue
+        if key in loose and loose[key] is not item:
+            ambiguous.add(key)
+        else:
+            loose.setdefault(key, item)
+    for key in ambiguous:
+        loose.pop(key, None)
+    return {"exact": exact, "loose": loose}
+
+
+def find_item(index, offer):
+    """Предмет Supreme Values для товара площадки или None."""
+    name = str(offer.get("name") or "")
+    kind = str(offer.get("kind") or "").lower()
+    if kind in ("gun", "knife", "pet"):  # "Flowerwood" с типом Gun — это "Flowerwood Gun"
+        item = index["exact"].get(parser.name_key(f"{name} {kind}"))
+        if item:
+            return item
+    return index["exact"].get(parser.name_key(name)) or index["loose"].get(market_key(name))
 
 
 def item_id(item):
@@ -115,10 +138,25 @@ def item_id(item):
 
 # --- оценка ликвидности на площадке ------------------------------------------
 
+NO_DATA = "none"
+
+
+def _level(score):
+    if score >= liquidity.LIQUID_FROM:
+        return liquidity.LIQUID
+    return liquidity.MEDIUM if score >= liquidity.MEDIUM_FROM else liquidity.ILLIQUID
+
+
 def assess_offer(offer, sold_24h):
-    """Балл 0–100 и причины по данным одной площадки."""
+    """Балл 0–100 и причины по данным одной площадки.
+
+    Если площадка не показывает ни продаж, ни количества, ни места по
+    популярности, балла нет (score=None): «нет данных» — не то же самое, что 0.
+    """
+    if offer.get("available") is False:
+        return {"score": None, "level": NO_DATA, "reasons": ["сейчас нет в продаже"]}
     reasons = []
-    score = 0.0
+    score = None
     if offer.get("sales_week") is not None:
         sales = max(0, offer["sales_week"])
         score = min(100.0, 25 * math.log2(1 + sales))
@@ -126,38 +164,33 @@ def assess_offer(offer, sold_24h):
     elif offer.get("stock") is not None:
         stock = max(0, offer["stock"])
         score = min(100.0, 20 * math.log2(1 + stock))
-        reasons.append(f"предложений: {stock}")
+        reasons.append(f"в продаже: {stock} шт.")
+    elif offer.get("popularity") is not None:
+        # Место в списке «популярные» самой площадки: верх списка — ходовые предметы.
+        score = 80 * (1 - offer["popularity"])
+        reasons.append(f"место по популярности на площадке: верхние {max(1, round(offer['popularity'] * 100))}%")
     if sold_24h:
-        score = min(100.0, score + min(40, 10 * sold_24h))
+        score = min(100.0, (score or 0) + min(40, 10 * sold_24h))
         reasons.append(f"куплено за сутки (по проверкам): {sold_24h}")
-    if offer.get("available") is False:
-        score = min(score, 10)
-        reasons.append("нет в наличии")
+    if score is None:
+        return {"score": None, "level": NO_DATA, "reasons": ["есть в продаже, но площадка не показывает продажи"]}
     score = int(round(score))
-    level = (
-        liquidity.LIQUID if score >= liquidity.LIQUID_FROM
-        else liquidity.MEDIUM if score >= liquidity.MEDIUM_FROM
-        else liquidity.ILLIQUID
-    )
-    return {"score": score, "level": level, "reasons": reasons}
+    return {"score": score, "level": _level(score), "reasons": reasons}
 
 
 def combine(item, market_infos):
-    """Общая ликвидность: среднее Supreme Values и площадок."""
+    """Общая ликвидность: среднее Supreme Values и площадок, где есть данные."""
     supreme = item.get("liquidity") or liquidity.assess(item)
     if supreme["level"] in (liquidity.SECRET, liquidity.UNTRADABLE):
         return dict(supreme, sources=1)
-    scores = [supreme["score"]] + [info["score"] for info in market_infos]
+    scored = [info for info in market_infos if info.get("score") is not None]
+    scores = [supreme["score"]] + [info["score"] for info in scored]
     score = int(round(sum(scores) / len(scores)))
-    level = (
-        liquidity.LIQUID if score >= liquidity.LIQUID_FROM
-        else liquidity.MEDIUM if score >= liquidity.MEDIUM_FROM
-        else liquidity.ILLIQUID
-    )
     reasons = [f"Supreme Values: {supreme['score']}"] + [
-        f"{info['market_title']}: {info['score']}" for info in market_infos
+        f"{info['market_title']}: {info['score'] if info.get('score') is not None else info['reasons'][0]}"
+        for info in market_infos
     ]
-    return {"score": score, "level": level, "reasons": reasons, "sources": len(scores)}
+    return {"score": score, "level": _level(score), "reasons": reasons, "sources": len(scores)}
 
 
 # --- адаптеры площадок --------------------------------------------------------
@@ -165,8 +198,11 @@ def combine(item, market_infos):
 class Adapter:
     def __init__(self, config, cache=None):
         self.config = config
-        self.cache = cache if cache is not None else {}  # живёт между опросами площадки
+        self.cache = cache if cache is not None else {}  # живёт между опросами и перезапусками
         self.note = ""  # пояснение для окна программы
+        # False, пока адаптер не прочитал площадку целиком (читает её частями):
+        # тогда старые данные не выбрасываются, а покупки не считаются.
+        self.complete = True
 
     def fetch(self):
         """Список предложений: {"name", "price", "currency", "stock", "sales_week", "available", "url"}."""
@@ -310,6 +346,8 @@ class StarPetsAdapter(Adapter):
         api = self.config.get("api", self.API).rstrip("/")
         offers = []
         for kind in self.TYPES:
+            group = []
+            count = 0
             for page in range(1, MAX_PAGES + 1):
                 body = {"currency": "usd", "page": page, "amount": self.PAGE,
                         "filter": {"types": [{"type": kind}]}, "sort": {"popularity": "desc"}}
@@ -317,11 +355,16 @@ class StarPetsAdapter(Adapter):
                 rows = data.get("items") if isinstance(data, dict) else None
                 if not isinstance(rows, list):
                     raise fetcher.FetchError("StarPets ответил в незнакомом формате")
-                offers.extend(self._offer(row, kind) for row in rows if isinstance(row, dict))
+                group.extend(self._offer(row, kind) for row in rows if isinstance(row, dict))
                 count = data.get("count") if isinstance(data.get("count"), int) else 0
                 if not rows or page * self.PAGE >= count:
                     break
                 _pause(self.PAUSE)
+            # Список отсортирован по популярности на StarPets: место в нём — тоже сигнал.
+            total = max(len(group), count, 1)
+            for rank, offer in enumerate(group):
+                offer["popularity"] = rank / total
+            offers.extend(group)
         self._add_sales(api, offers)
         return offers
 
@@ -333,8 +376,10 @@ class StarPetsAdapter(Adapter):
         product_id = row.get("id")
         slug = re.sub(r"[^a-z0-9]+", "-", str(row.get("name") or "").lower().replace("'", "")).strip("-")
         url = f"https://starpets.gg/mm2/shop/{kind}/{slug}/{product_id}" if product_id else self.config["url"]
+        subtype = str(row.get("subtype") or "").lower()
         return {
             "name": name,
+            "kind": "pet" if kind == "pet" else subtype,
             "price": price,
             "currency": "USD",
             "stock": None,
@@ -346,29 +391,37 @@ class StarPetsAdapter(Adapter):
 
     def _add_sales(self, api, offers):
         sales = self.cache.setdefault("sales", {})
-        if not self.cache.get("info_off"):
-            now = time.time()
+        now = time.time()
+        if self.cache.get("info_off_until", 0) <= now:
+            # По очереди: сначала ни разу не запрошенные, потом самые старые;
+            # при равенстве — более дорогие.
             due = sorted(
                 (o for o in offers if o["id"] is not None and o["price"] is not None
                  and now - sales.get(str(o["id"]), {}).get("at", 0) > self.INFO_MAX_AGE),
-                key=lambda o: -(o["price"] or 0),
+                key=lambda o: (sales.get(str(o["id"]), {}).get("at", 0), -(o["price"] or 0)),
             )[:self.INFO_PER_POLL]
             for offer in due:
                 _pause(self.PAUSE)
+                key = str(offer["id"])
                 try:
                     data = get_json(f"{api}/api/v2/products/{offer['id']}/info", headers=self.HEADERS)
-                except fetcher.BlockedError:
+                except (fetcher.BlockedError, fetcher.NetworkError):
                     raise
                 except fetcher.FetchError:
+                    old = sales.get(key, {})
+                    sales[key] = {"at": now, "value": old.get("value")}  # в конец очереди
                     self.cache["info_errors"] = self.cache.get("info_errors", 0) + 1
-                    if self.cache["info_errors"] >= 3:
-                        self.cache["info_off"] = True
-                    break
+                    if self.cache["info_errors"] >= 3:  # три ошибки подряд — пауза на час
+                        self.cache["info_off_until"] = now + 3600
+                        self.cache["info_errors"] = 0
+                        break
+                    continue
+                self.cache["info_errors"] = 0
                 product = data.get("product") if isinstance(data, dict) else None
                 value = product.get("numberOfSalesPerWeek") if isinstance(product, dict) else None
-                sales[str(offer["id"])] = {"at": now, "value": value if isinstance(value, int) else None}
-        if self.cache.get("info_off"):
-            self.note = "продажи за неделю StarPets не отдаёт — оценка по наличию"
+                sales[key] = {"at": now, "value": value if isinstance(value, int) else None}
+        if self.cache.get("info_off_until", 0) > now:
+            self.note = "продажи за неделю StarPets сейчас не отдаёт — оценка по популярности, повтор через час"
         else:
             known = sum(1 for entry in sales.values() if entry.get("value") is not None)
             self.note = f"продажи за неделю известны для {known} предметов (обновляются по очереди)"
@@ -388,9 +441,11 @@ class DreamPetsAdapter(Adapter):
 
     PAGES_PER_POLL = 12
     PAUSE = 0.5
+    PAGE_TIMEOUT = 15
     _LINK_RE = re.compile(r"""href=["']((?:https?://[^"']*dreampets\.(?:gg|io))?/mm2/product/[^"'#?]+)["']""", re.I)
     _PRICE_RE = re.compile(r"от\s*([\d\s\u00a0.,]+?)\s*₽")
-    _LOTS_RE = re.compile(r"(\d[\d\s\u00a0]*)\s*лот", re.I)
+    # "674 лотов", "1 234 лота"; число не склеивается с соседними словами ("ММ2 114 лотов").
+    _LOTS_RE = re.compile(r"(?<![\w.,])(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)[ \u00a0]*лот", re.I)
 
     def fetch(self):
         base = self.config["url"]
@@ -402,18 +457,26 @@ class DreamPetsAdapter(Adapter):
         if not products:
             raise fetcher.FetchError("на странице рынка не нашлось ни одного товара")
         due = sorted(products, key=lambda link: (products[link].get("at", 0), -(products[link].get("price") or 0)))
-        read = 0
+        read = failed = 0
+        last_error = None
         for link in due[:self.PAGES_PER_POLL]:
             _pause(self.PAUSE)
             try:
-                page_html = _request(link, headers={"Accept-Language": "ru,en;q=0.8"})
-            except fetcher.BlockedError:
-                raise
-            except fetcher.FetchError:
-                products[link]["at"] = time.time()
+                page_html = _request(link, headers={"Accept-Language": "ru,en;q=0.8"}, timeout=self.PAGE_TIMEOUT)
+            except (fetcher.BlockedError, fetcher.NetworkError):
+                raise  # нет связи или блок — опрос считается неудачным
+            except fetcher.FetchError as error:
+                products[link]["at"] = time.time()  # в конец очереди
+                last_error = error
+                failed += 1
+                if failed >= 2 and not read:
+                    break
                 continue
             products[link].update(self._parse_product(page_html), at=time.time())
             read += 1
+        if failed and not read:
+            raise fetcher.FetchError(f"страницы товаров не открываются: {last_error}")
+        self.complete = all(entry.get("at") for entry in products.values())
         known = [p for p in products.values() if p.get("name")]
         self.note = f"товаров на рынке: {len(products)}, прочитано: {len(known)} (по {self.PAGES_PER_POLL} за опрос)"
         return [
@@ -442,7 +505,7 @@ class DreamPetsAdapter(Adapter):
                     links = self._links(fetcher.SystemBrowserFetcher(browser).fetch(base), root)
             if not links:
                 links = self._links(_request(root + "/sitemap.xml"), root)
-        except fetcher.BlockedError:
+        except (fetcher.BlockedError, fetcher.NetworkError):
             raise
         except fetcher.FetchError:
             links = []
@@ -463,10 +526,16 @@ class DreamPetsAdapter(Adapter):
         title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.S | re.I)
         name = html_unescape(title.group(1)) if title else ""
         name = re.split(r"\s+(?:/|—|-)\s+", name.strip(), maxsplit=1)[0].strip()
-        description = " ".join(re.findall(r"<meta[^>]+content=[\"']([^\"']*)[\"']", page_html, re.I))
-        text = html_unescape(description) + " " + parser.html_to_text(page_html)
-        price = self._PRICE_RE.search(text)
-        lots = self._LOTS_RE.search(text)
+        # Описание страницы ("от 328.98 ₽, 674 лотов"), затем видимый текст — по строкам,
+        # чтобы числа из разных мест не склеивались.
+        texts = [
+            html_unescape(content) for content in re.findall(
+                r"<meta[^>]+(?:name|property)=[\"'](?:description|og:description)[\"'][^>]*content=[\"']([^\"']*)[\"']",
+                page_html, re.I,
+            )
+        ] + parser.html_to_text(page_html).splitlines()
+        price = next((m for m in (self._PRICE_RE.search(t) for t in texts) if m), None)
+        lots = next((m for m in (self._LOTS_RE.search(t) for t in texts) if m), None)
         return {
             "name": name,
             "price": _rub(price.group(1)) if price else None,
@@ -486,40 +555,51 @@ class EldoradoAdapter(Adapter):
     PAGES_PER_POLL = 15
     PAGE_SIZE = 50
     PAUSE = 1.5
-    STALE = 3 * 60 * 60  # предложение, не встреченное за 3 часа, считается ушедшим
+    STALE = 3 * 60 * 60  # перерыв дольше 3 часов — данные считаются устаревшими
 
     def fetch(self):
         api = self.config.get("api", self.API)
         offers = self.cache.setdefault("offers", {})  # id предложения -> данные
         page = self.cache.get("page", 1)
         total_pages = self.cache.get("total_pages")
+        cycle = self.cache.setdefault("cycle", 1)
+        now = time.time()
+        if now - self.cache.get("last_fetch", now) > self.STALE:
+            # Долгий перерыв (сон компьютера, нет сети): данные устарели целиком —
+            # дочитываем круг заново, не считая исчезнувшее покупками.
+            self.cache["refilling"] = True
+        self.cache["last_fetch"] = now
         for _ in range(self.PAGES_PER_POLL):
             query = (f"?gameId=204&category=CustomItem&offerSortingCriterion=Price&isAscending=true"
                      f"&pageIndex={page}&pageSize={self.PAGE_SIZE}")
             data = get_json(api + query)
             if not isinstance(data, dict) or not isinstance(data.get("results"), list):
                 raise fetcher.FetchError("Eldorado ответил в незнакомом формате")
-            now = time.time()
             for row in data["results"]:
                 parsed = self._offer(row) if isinstance(row, dict) else None
                 if parsed:
-                    parsed["seen"] = now
+                    parsed["cycle"] = cycle
                     offers[parsed.pop("id")] = parsed
             total_pages = data.get("totalPages") if isinstance(data.get("totalPages"), int) else total_pages
             page = page + 1 if total_pages and page < total_pages and data["results"] else 1
             if page == 1:
-                break  # круг пройден
+                # Круг пройден: предложения, не встреченные за круг, ушли с рынка.
+                for offer_id in [k for k, v in offers.items() if v.get("cycle", 0) < cycle]:
+                    del offers[offer_id]
+                cycle += 1
+                self.cache["cycles_done"] = self.cache.get("cycles_done", 0) + 1
+                self.cache["refilling"] = False
+                break
             _pause(self.PAUSE)
         self.cache["page"] = page
         self.cache["total_pages"] = total_pages
-        cutoff = time.time() - self.STALE
-        for offer_id in [k for k, v in offers.items() if v["seen"] < cutoff]:
-            del offers[offer_id]
+        self.cache["cycle"] = cycle
+        self.complete = self.cache.get("cycles_done", 0) >= 1 and not self.cache.get("refilling")
         items = {}
         for entry in offers.values():
-            item = items.setdefault(entry["name"], {
-                "name": entry["name"], "price": None, "currency": "USD", "stock": 0, "sales_week": None,
-                "available": True, "url": self.config["url"], "sellers": set(),
+            item = items.setdefault((entry["name"], entry.get("kind", "")), {
+                "name": entry["name"], "kind": entry.get("kind", ""), "price": None, "currency": "USD", "stock": 0,
+                "sales_week": None, "available": True, "url": self.config["url"], "sellers": set(),
             })
             if entry["price"] and (item["price"] is None or entry["price"] < item["price"]):
                 item["price"] = entry["price"]
@@ -562,6 +642,7 @@ class EldoradoAdapter(Adapter):
         return {
             "id": str(offer.get("id")),
             "name": name,
+            "kind": kind.lower(),
             "price": amount,
             "quantity": quantity if isinstance(quantity, int) and quantity > 0 else 1,
             "seller": str(user.get("id") or offer.get("userId") or ""),
@@ -616,16 +697,16 @@ class MarketState:
         self.last_ok_at = None
         self.next_poll_at = _now()
         self.failures = 0
-        self.cache = {}       # данные адаптера между опросами
-        self.offers = {}      # id предмета -> последнее предложение
+        self.cache = {}        # данные адаптера между опросами (сохраняются на диск)
+        self.offers = {}       # id предмета -> последнее предложение
+        self.complete = False  # offers — полный снимок площадки (можно считать покупки)
         self.unmatched = 0
-        self.sales = {}       # id предмета -> [[время, количество], ...] за сутки
+        self.sales = {}        # id предмета -> [[время, количество], ...] за сутки
 
     def interval(self, default):
-        return int(self.config.get("interval") or default)
+        return self.config.get("interval") or default
 
     def public(self, interval):
-        interval = self.interval(interval)
         return {
             "id": self.config["id"],
             "title": self.config["title"],
@@ -634,7 +715,7 @@ class MarketState:
             "message": self.message,
             "last_ok_at": self.last_ok_at.isoformat() if self.last_ok_at else None,
             "next_poll_at": self.next_poll_at.isoformat() if self.next_poll_at else None,
-            "interval": interval,
+            "interval": self.interval(interval),
             "offers": len(self.offers) + self.unmatched,
             "matched": len(self.offers),
         }
@@ -645,7 +726,19 @@ class MarketState:
         return sum(event[1] for event in events)
 
 
+def _valid_sales(value):
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): [list(e) for e in events if isinstance(e, (list, tuple)) and len(e) == 2
+                   and all(isinstance(x, (int, float)) for x in e)]
+        for key, events in value.items() if isinstance(events, list)
+    }
+
+
 class MarketMonitor:
+    WAIT_FOR_PRICES = 30  # пока цен Supreme нет, площадки сопоставлять не с чем
+
     def __init__(self, data_path=None, configs=None, interval=POLL_EVERY, adapters=None):
         self.data_path = data_path
         self.interval = interval
@@ -668,36 +761,47 @@ class MarketMonitor:
             saved = json.loads(self._state_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
+        if not isinstance(saved, dict):
+            return
         for market in self.markets:
-            entry = saved.get(market.config["id"]) if isinstance(saved, dict) else None
+            entry = saved.get(market.config["id"])
             if not isinstance(entry, dict):
                 continue
-            market.offers = entry.get("offers") if isinstance(entry.get("offers"), dict) else {}
-            market.sales = entry.get("sales") if isinstance(entry.get("sales"), dict) else {}
+            offers = entry.get("offers") if isinstance(entry.get("offers"), dict) else {}
+            market.offers = {str(k): v for k, v in offers.items() if isinstance(v, dict)}
+            market.sales = _valid_sales(entry.get("sales"))
+            market.cache = entry.get("cache") if isinstance(entry.get("cache"), dict) else {}
+            market.complete = bool(entry.get("complete")) and bool(market.offers)
             market.unmatched = entry.get("unmatched") if isinstance(entry.get("unmatched"), int) else 0
             try:
                 market.last_ok_at = datetime.fromisoformat(entry["last_ok_at"]) if entry.get("last_ok_at") else None
-            except ValueError:
+                if market.last_ok_at and market.last_ok_at.tzinfo is None:
+                    market.last_ok_at = market.last_ok_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
                 market.last_ok_at = None
             if market.offers:
                 market.status = "ok"
                 market.message = "данные с прошлого запуска, скоро обновятся"
 
     def _save_state(self):
-        data = {
-            market.config["id"]: {
-                "offers": market.offers,
-                "sales": market.sales,
-                "unmatched": market.unmatched,
-                "last_ok_at": market.last_ok_at.isoformat() if market.last_ok_at else None,
+        with self._lock:
+            data = {
+                market.config["id"]: {
+                    "offers": market.offers,
+                    "sales": market.sales,
+                    "cache": market.cache,
+                    "complete": market.complete,
+                    "unmatched": market.unmatched,
+                    "last_ok_at": market.last_ok_at.isoformat() if market.last_ok_at else None,
+                }
+                for market in self.markets
             }
-            for market in self.markets
-        }
+            text = json.dumps(data, ensure_ascii=False, default=list)
         path = self._state_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(text, encoding="utf-8")
             tmp.replace(path)
         except OSError:
             pass
@@ -730,36 +834,59 @@ class MarketMonitor:
                 self._wake.wait(timeout=max(1, min(waits + [30])))
                 self._wake.clear()
                 continue
-            self.poll(due)
+            try:
+                self.poll(due)
+            except Exception as error:  # поток наблюдения не должен останавливаться
+                with self._lock:
+                    due.status = "error"
+                    due.message = f"внутренняя ошибка: {error}"
+                    due.next_poll_at = _now() + timedelta(seconds=due.interval(self.interval))
+                    self.version += 1
 
     def _adapter(self, market):
         factory = self._adapters.get(market.config["kind"])
         return factory(market.config, market.cache) if factory else make_adapter(market.config, market.cache)
 
+    def _fail(self, market, error):
+        with self._lock:
+            market.failures += 1
+            market.status = "error"
+            market.message = str(error) or type(error).__name__
+            backoff = min(MAX_BACKOFF, market.interval(self.interval) * (2 ** min(market.failures - 1, 5)))
+            if isinstance(error, fetcher.BlockedError):
+                backoff = max(backoff, BLOCKED_PAUSE)  # площадка просит не спешить — не настаиваем
+            market.next_poll_at = _now() + timedelta(seconds=backoff)
+            self.version += 1
+
     def poll(self, market):
         """Опросить одну площадку (вызывается из фонового потока или тестов)."""
+        try:
+            items = store.load(self.data_path)["items"]
+        except Exception as error:
+            items, load_error = [], error
+        else:
+            load_error = None
+        if not items:
+            with self._lock:
+                market.status = "waiting"
+                market.message = "ждёт цены Supreme Values" if load_error is None else f"нет цен: {load_error}"
+                market.next_poll_at = _now() + timedelta(seconds=self.WAIT_FOR_PRICES)
+                self.version += 1
+            return
         with self._lock:
             market.status = "busy"
         adapter = self._adapter(market)
         try:
             offers = adapter.fetch()
-            items = store.load(self.data_path)["items"]
         except Exception as error:
-            with self._lock:
-                market.failures += 1
-                market.status = "error"
-                market.message = str(error) or type(error).__name__
-                backoff = min(MAX_BACKOFF, market.interval(self.interval) * (2 ** min(market.failures - 1, 5)))
-                if isinstance(error, fetcher.BlockedError):
-                    backoff = max(backoff, BLOCKED_PAUSE)  # площадка просит не спешить — не настаиваем
-                market.next_poll_at = _now() + timedelta(seconds=backoff)
-                self.version += 1
+            self._fail(market, error)
+            self._save_state()  # кэш адаптера мог пополниться и до ошибки
             return
         index = build_index(items)
         matched = {}
         unmatched = 0
         for offer in offers:
-            item = index.get(market_key(offer.get("name", "")))
+            item = find_item(index, offer)
             if item is None:
                 unmatched += 1
                 continue
@@ -774,22 +901,31 @@ class MarketMonitor:
                     previous["stock"] = (previous.get("stock") or 0) + offer["stock"]
                 if offer.get("sales_week") is not None:
                     previous["sales_week"] = (previous.get("sales_week") or 0) + offer["sales_week"]
+                if offer.get("popularity") is not None:
+                    previous["popularity"] = min(previous.get("popularity", 1), offer["popularity"])
                 previous["available"] = bool(previous.get("available")) or bool(offer.get("available"))
         now = _now()
         cutoff = (now - timedelta(hours=HISTORY_HOURS)).timestamp()
         with self._lock:
-            for key, offer in matched.items():
-                old = market.offers.get(key)
-                if old and isinstance(old.get("stock"), int) and isinstance(offer.get("stock"), int):
-                    drop = old["stock"] - offer["stock"]
-                    if drop > 0:  # предложения исчезли — их купили
-                        market.sales.setdefault(key, []).append([now.timestamp(), drop])
+            if market.complete and adapter.complete:
+                # Оба снимка полные: исчезнувшие предложения — купленные.
+                for key, offer in matched.items():
+                    old = market.offers.get(key)
+                    if old and isinstance(old.get("stock"), int) and isinstance(offer.get("stock"), int):
+                        drop = old["stock"] - offer["stock"]
+                        if drop > 0:
+                            market.sales.setdefault(key, []).append([now.timestamp(), drop])
             market.sales = {
-                key: [event for event in events if event[0] >= cutoff]
-                for key, events in market.sales.items()
+                key: kept for key, kept in (
+                    (key, [event for event in events if event[0] >= cutoff]) for key, events in market.sales.items()
+                ) if kept
             }
-            market.sales = {key: events for key, events in market.sales.items() if events}
-            market.offers = matched
+            if adapter.complete:
+                market.offers = matched
+            else:
+                # Площадка прочитана не целиком: обновляем прочитанное, остальное не трогаем.
+                market.offers = dict(market.offers, **matched)
+            market.complete = adapter.complete
             market.unmatched = unmatched
             market.failures = 0
             market.status = "ok"
@@ -817,7 +953,7 @@ class MarketMonitor:
             infos = {}
             for config, offers, sold in snapshot:
                 offer = offers.get(key)
-                if not offer:
+                if not isinstance(offer, dict):
                     continue
                 info = assess_offer(offer, sold.get(key, 0))
                 info.update({
@@ -836,6 +972,9 @@ class MarketMonitor:
         return items
 
 
+MIN_INTERVAL = 30
+
+
 def load_configs(data_path=None):
     """Список площадок: data/markets.json, если он есть и правильный, иначе встроенный."""
     path = Path(data_path or store.DATA_FILE).with_name("markets.json")
@@ -849,4 +988,12 @@ def load_configs(data_path=None):
     ]
     for config in valid:
         config.setdefault("title", config["id"])
+        try:
+            interval = int(config.get("interval"))
+        except (TypeError, ValueError):
+            interval = None
+        if interval is None or interval < MIN_INTERVAL:
+            config.pop("interval", None)  # неверное значение — обычный интервал
+        else:
+            config["interval"] = interval
     return valid or [dict(config) for config in DEFAULT_MARKETS]
