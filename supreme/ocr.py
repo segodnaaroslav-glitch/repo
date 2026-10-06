@@ -52,14 +52,20 @@ def recognize(image_bytes, suffix=".png"):
     """Строки текста со скриншота. OcrError — если распознать не удалось."""
     if not available():
         raise OcrError("распознавание скриншотов работает в Windows 10/11; вставьте список предметов текстом")
-    workdir = tempfile.mkdtemp(prefix="mm2values-ocr-")
+    try:
+        workdir = tempfile.mkdtemp(prefix="mm2values-ocr-")
+    except OSError as error:
+        raise OcrError(f"не удалось создать временную папку: {error}") from error
     image = os.path.join(workdir, "shot" + (suffix if suffix.startswith(".") else ".png"))
     script = os.path.join(workdir, "ocr.ps1")
     try:
-        with open(image, "wb") as file:
-            file.write(image_bytes)
-        with open(script, "w", encoding="utf-8-sig") as file:
-            file.write(_SCRIPT)
+        try:
+            with open(image, "wb") as file:
+                file.write(image_bytes)
+            with open(script, "w", encoding="utf-8-sig") as file:
+                file.write(_SCRIPT)
+        except OSError as error:
+            raise OcrError(f"не удалось сохранить картинку во временную папку: {error}") from error
         try:
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",

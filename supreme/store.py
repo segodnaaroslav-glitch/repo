@@ -61,10 +61,15 @@ def load(path=None):
     categories = base.get("categories")
     base["categories"] = {
         slug: info for slug, info in (categories.items() if isinstance(categories, dict) else ())
-        if isinstance(info, dict)
+        if isinstance(info, dict) and slug in parser.CATEGORY_TITLES
     }
     errors = base.get("errors") if isinstance(base.get("errors"), list) else []
-    base["errors"] = [e for e in (_clean_error(error) for error in errors) if e]
+    # Ошибки категорий, которые больше не ведутся (Evos, Untradables), не показываются
+    # и не заставляют автообновление перекачивать всё снова.
+    base["errors"] = [
+        e for e in (_clean_error(error) for error in errors)
+        if e and e["category"] in parser.CATEGORY_TITLES
+    ]
     for key in ("site_last_updated", "fetched_at"):
         if not isinstance(base.get(key), str):
             base[key] = None
@@ -305,6 +310,10 @@ def import_text(text, category, path=None):
     if category not in parser.CATEGORY_TITLES:
         raise ValueError(f"Неизвестная категория: {category}")
     items, orphans = parser.parse_items(text, category)
+    if any(not parser.is_placeholder(item) for item in items):
+        # На странице у предметов есть спрос и редкость, а без них — надписи
+        # ("Your Inventory", "Class"), как и при загрузке с сайта.
+        items = [item for item in items if not parser.is_placeholder(item)]
     last_updated = parser.find_last_updated(text)
     if not items and not last_updated:
         raise ValueError("В тексте не найдено ни одного предмета со значением (Value).")

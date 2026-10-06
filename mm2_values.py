@@ -96,7 +96,8 @@ def cmd_find(args):
         print(f"Обновите цены: {program_command()} update", file=sys.stderr)
         return 1
     query = " ".join(args.query).lower()
-    found = [item for item in data["items"] if query in item["name"].lower()]  # типы проверены в store.load
+    items = [item for item in data["items"] if not parser.is_placeholder(item)] or data["items"]
+    found = [item for item in items if query in item["name"].lower()]  # типы проверены в store.load
     if not data["items"]:
         print(f"Цен пока нет. Запустите: {program_command()} update")
         return 1

@@ -132,7 +132,9 @@ class FrozenPathTests(unittest.TestCase):
     def setUp(self):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.exe_dir = Path(tmp.name) / "Загрузки"
+        # resolve(): на Windows временная папка бывает с коротким именем (RUNNER~1),
+        # а программа берёт полный путь к exe.
+        self.exe_dir = Path(tmp.name).resolve() / "Загрузки"
         self.old = self.exe_dir / "data"
         self.local = Path(tmp.name) / "Local"
         self.target = self.local / "MM2Values" / "data"

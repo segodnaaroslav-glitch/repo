@@ -573,3 +573,74 @@ class DreamPetsMarketCardsTests(unittest.TestCase):
     def test_name_from_link(self):
         self.assertEqual(markets.DreamPetsAdapter._name_from_link("https://dreampets.gg/mm2/product/eternal-iii/43948eb3-1e25"),
                          "eternal iii")
+
+
+class MarketsCalcReviewTests(MonitorTests):
+    """Найдено при проверке вкладки «Площадки» и калькулятора."""
+
+    def annotated(self, monitor, name):
+        items = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(self.path)["items"]])
+        return next(i for i in items if i["name"] == name)["market"]["fake"]
+
+    def test_old_snapshot_is_not_counted_as_two_days(self):
+        from datetime import timedelta
+        monitor = self.monitor()
+        self.offers = [{"name": "Icebreaker", "price": 4.0, "stock": 100, "available": True, "url": "u"}]
+        monitor.poll(monitor.markets[0])
+        monitor.markets[0].last_ok_at -= timedelta(days=7)  # программа была закрыта неделю
+        self.offers = [{"name": "Icebreaker", "price": 4.0, "stock": 10, "available": True, "url": "u"}]
+        monitor.poll(monitor.markets[0])
+        self.assertEqual(self.annotated(monitor, "Icebreaker")["sold_48h"], 0)
+        self.offers = [{"name": "Icebreaker", "price": 4.0, "stock": 7, "available": True, "url": "u"}]
+        monitor.poll(monitor.markets[0])  # следующая проверка — свежая: считается
+        self.assertEqual(self.annotated(monitor, "Icebreaker")["sold_48h"], 3)
+
+    def test_market_without_lots_has_no_48h_numbers(self):
+        monitor = self.monitor()
+        self.offers = [{"name": "Icebreaker", "price": 4.0, "stock": None, "sales_week": 40, "available": True, "url": "u"}]
+        monitor.poll(monitor.markets[0])
+        monitor.poll(monitor.markets[0])
+        info = self.annotated(monitor, "Icebreaker")
+        self.assertEqual((info["sold_48h"], info["listed_48h"], info["sales_week"]), (None, None, 40))
+
+
+class DreamPetsReviewV4Tests(unittest.TestCase):
+    def test_card_prices(self):
+        cards = markets.DreamPetsAdapter._cards
+        adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dreampets.gg/mm2/"})
+        page = ('<a href="/mm2/product/a/11111111-1111"><p>Alpha</p><span>от 1,299.50 ₽</span></a>'
+                '<a href="/mm2/product/b/22222222-2222"><p>Beta</p><span>от 12,345 ₽</span></a>'
+                '<a href="/mm2/product/c/33333333-3333"><p>Eternal III / Вечный 3</p><b>23,71 ₽</b></a>'
+                '<a href="/mm2/product/d/44444444-4444"><p>Delta</p><i>114</i><b>23,71 ₽</b></a>'
+                '<a href="/mm2/product/e/55555555-5555"><p>Echo</p><span>от 1 299,50 ₽</span></a>'
+                '<a href="/mm2/product/f/66666666-6666"><p>Foxtrot</p><span>2 499</span><span>₽</span></a>')
+        prices = {c["name"]: c["price"] for c in cards(adapter, page, "https://dreampets.gg").values()}
+        self.assertEqual(prices, {"Alpha": 1299.5, "Beta": 12345.0, "Eternal III": 23.71, "Delta": 23.71,
+                                  "Echo": 1299.5, "Foxtrot": 2499.0})
+        self.assertEqual([markets._rub(t) for t in ("328.98", "34,99", "1.299,50", "1 234")], [328.98, 34.99, 1299.5, 1234.0])
+
+    def test_lots_come_from_product_pages_when_cards_lack_them(self):
+        market = ('<a href="/mm2/product/harvester/2c0af45a-9134"><p>Harvester</p><span>от 328.98 ₽</span></a>'
+                  '<a href="/mm2/product/seer/35e0ab9c-0ef1"><p>Seer</p><span>от 50 ₽</span></a>')
+        product = ('<html><head><title>Harvester / Жнец — купить в ММ2</title></head>'
+                   '<body><p>от 330 ₽</p><p>500 лотов</p></body></html>')
+        httpd, base = serve({"/mm2/": market, "/mm2/product/harvester/2c0af45a-9134": product,
+                             "/mm2/product/seer/35e0ab9c-0ef1": product.replace("Harvester", "Seer").replace("500", "50")})
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with unittest.mock.patch.object(markets, "_pause"):
+            adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": base + "/mm2/"})
+            offers = {o["name"]: o for o in adapter.fetch()}
+        # Цена — со страницы рынка (свежее), лоты — со страницы товара.
+        self.assertEqual((offers["Harvester"]["price"], offers["Harvester"]["stock"]), (328.98, 500))
+        self.assertEqual((offers["Seer"]["price"], offers["Seer"]["stock"]), (50.0, 50))
+
+
+class ListedLotsTests(unittest.TestCase):
+    def test_new_lots_lower_the_score_and_are_explained(self):
+        base = markets.assess_offer({"stock": 20, "available": True}, 0, 0)
+        flooded = markets.assess_offer({"stock": 20, "available": True}, 0, 10)
+        self.assertLess(flooded["score"], base["score"])
+        self.assertIn("новых лотов за 2 дня: 10", flooded["reasons"])
+        balanced = markets.assess_offer({"stock": 20, "available": True}, 10, 10)
+        self.assertGreaterEqual(balanced["score"], base["score"])

@@ -96,6 +96,8 @@
                 <th><button class="sort" data-sort="name" type="button">Название</button></th>
                 <th><button class="sort" data-sort="category" type="button">Категория</button></th>
                 <th class="num"><button class="sort" data-sort="value" type="button">Значение</button></th>
+                <th class="num sp"><button class="sort" data-sort="starpets" type="button">StarPets</button></th>
+                <th class="num dp"><button class="sort" data-sort="dreampets" type="button">DreamPets</button></th>
                 <th>На сайте</th>
                 <th><button class="sort" data-sort="demand" type="button">Спрос</button></th>
                 <th><button class="sort" data-sort="rarity" type="button">Редкость</button></th>
@@ -139,10 +141,10 @@
                 <th>Предмет</th>
                 <th class="num">Supreme</th>
                 <th class="num sp">StarPets, цена</th>
-                <th class="num sp">Вы получите (−20%)</th>
+                <th class="num sp" id="mkSpPayout">Вы получите (−20%)</th>
                 <th class="num sp">Продаж/нед.</th>
                 <th class="num dp">DreamPets, цена</th>
-                <th class="num dp">Вы получите (−10%)</th>
+                <th class="num dp" id="mkDpPayout">Вы получите (−10%)</th>
                 <th class="num dp">Лотов</th>
                 <th class="num dp">Куплено за 2 дня</th>
                 <th class="num dp">Новых лотов за 2 дня</th>
@@ -174,10 +176,13 @@
         </div>
         <details class="method">
           <summary>Как считается ликвидность</summary>
-          <p><b>StarPets</b> и <b>DreamPets</b> — балл 0–100 по данным площадки: продажи за неделю
-            (StarPets показывает их сам), число лотов в продаже и сколько лотов купили за последние
-            2 дня (программа сравнивает каждую проверку с предыдущей). Если площадка не показывает
-            ни продаж, ни лотов, у StarPets учитывается место предмета в их списке популярных.</p>
+          <p><b>StarPets</b> — балл 0–100 по продажам за неделю (их показывает сама площадка),
+            а пока их нет — по месту предмета в списке популярных. Число лотов StarPets не показывает,
+            поэтому покупки за 2 дня у неё не считаются.</p>
+          <p><b>DreamPets</b> — по числу лотов в продаже и по тому, сколько лотов купили за последние
+            2 дня: программа сравнивает каждую проверку с предыдущей (если программа была закрыта
+            или не было сети, пропущенное время не считается). Если новых лотов за 2 дня выставили
+            больше, чем купили, балл ниже — продать будет труднее.</p>
           <p><b>Общая</b> — среднее StarPets и DreamPets, где у предмета есть данные.</p>
           <p><b>Ликвидные</b> — <span id="methodLiquid">60</span> и выше, <b>средние</b> —
             <span id="methodMedium">30–59</span>, <b>неликвидные</b> — меньше
@@ -192,7 +197,8 @@
         <h2>Сколько получу за свои предметы</h2>
         <p class="muted">Вставьте список предметов (по одному в строке, можно с количеством: «Harvester x2»)
           или добавьте скриншоты инвентаря — кнопкой ниже или Ctrl+V. Программа найдёт предметы и посчитает,
-          сколько вы получите на StarPets (комиссия 20%) и на DreamPets (комиссия 10%).</p>
+          сколько вы получите на StarPets (комиссия <span id="calcFeeSp">20%</span>) и на DreamPets
+          (комиссия <span id="calcFeeDp">10%</span>).</p>
         <div class="calc-input">
           <textarea id="calcText" rows="7" placeholder="Harvester x2&#10;Icebreaker&#10;3 Seer"></textarea>
           <div class="drop" id="calcDrop" tabindex="0" role="button" aria-label="Добавить скриншоты">

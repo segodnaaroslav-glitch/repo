@@ -405,3 +405,27 @@ class AutoSyncServerTests(unittest.TestCase):
                            headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
         self.assertEqual(connection.getresponse().status, 202)
         connection.close()
+
+
+class RemovedCategoriesTests(StoreRegressionTests):
+    def test_old_evos_and_untradables_data_is_dropped(self):
+        self.path.write_text(json.dumps({
+            "items": [{"name": "Evo Knife", "category": "evos", "value": "5"},
+                      {"name": "Seer", "category": "godlies", "value": "10"}],
+            "errors": [{"category": "evos", "title": "Evos", "message": "предметы не найдены"},
+                       {"category": "untradables", "title": "Untradables", "message": "x"}],
+            "categories": {"evos": {"updated_at": "2026-01-01T00:00:00+00:00"},
+                           "godlies": {"updated_at": "2026-01-01T00:00:00+00:00"}},
+        }), encoding="utf-8")
+        data = store.load(self.path)
+        self.assertEqual([i["name"] for i in data["items"]], ["Seer"])
+        self.assertEqual(data["errors"], [])  # иначе автообновление перекачивало бы всё каждые 15 минут
+        self.assertEqual(list(data["categories"]), ["godlies"])
+
+
+class ImportPlaceholderTests(StoreRegressionTests):
+    def test_import_skips_cards_without_demand_and_rarity(self):
+        text = "Your Inventory\nValue - 0\nEver Set\nValue - 98,000\nDemand - 7\nRarity - 8\n"
+        items, _ = store.import_text(text, "sets", self.path)
+        self.assertEqual([i["name"] for i in items], ["Ever Set"])
+        self.assertEqual([i["name"] for i in store.load(self.path)["items"]], ["Ever Set"])

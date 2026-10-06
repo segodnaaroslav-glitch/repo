@@ -6,27 +6,71 @@ import re
 
 from . import markets, parser
 
-_QTY_RE = re.compile(
-    r"^(?:(?P<pre>\d{1,4})\s*(?:x|х|×|шт\.?)?\s+|(?:x|х|×)\s*(?P<pre_x>\d{1,4})\s+)?(?P<name>.+?)"
-    r"(?:\s*(?:[-–—:]|x|х|×)\s*(?P<post>\d{1,4})\s*(?:шт\.?)?|\s+(?P<count>\d{1,4})\s*шт\.?)?$",
+_X = r"[xх×]"
+# Количество перед названием: "2 Harvester", "2x Harvester", "x2 Harvester", "2 шт Harvester".
+_PRE_RE = re.compile(rf"^(?:(?P<n>\d{{1,4}})\s*(?:{_X}|шт\.?)?|{_X}\s*(?P<xn>\d{{1,4}}))\s+(?P<name>\S.*)$", re.I)
+# Количество после названия: "Harvester x2", "Harvester (3)", "Seer (x10)", "Harvester [x2]",
+# "Seer (10 шт)", "Harvester - 3", "Harvester: 3", "Harvester 2", "Harvester 2x", "Icebreaker 5 шт".
+# Перед "x" нужен пробел: "Phoenix 2" — это Phoenix, а не "Phoeni" × 2.
+_POST_RE = re.compile(
+    rf"^(?P<name>.*?\S)\s*(?:"
+    rf"[(\[]\s*(?:{_X}\s*)?(?P<br>\d{{1,4}})\s*(?:{_X}|шт\.?)?\s*[)\]]"
+    rf"|(?<=\s){_X}\s*(?P<x>\d{{1,4}})"
+    rf"|[-–—:]\s*(?P<sep>\d{{1,4}})\s*(?:шт\.?)?"
+    rf"|(?<=\s)(?P<bare>\d{{1,4}})\s*(?:{_X}|шт\.?)?"
+    rf")$",
     re.I,
 )
+# Строка только с количеством ("x2" — значок на картинке предмета в инвентаре).
+_QTY_ONLY_RE = re.compile(rf"^(?:{_X}\s*(?P<a>\d{{1,4}})|(?P<b>\d{{1,4}})\s*{_X})$", re.I)
 _NOISE_LINE_RE = re.compile(r"^[\W\d_]*$")
 CUTOFF = 0.82  # насколько похожим должно быть название при опечатках распознавания
 
 
+def _split_qty(line):
+    """"Harvester x2" -> ("Harvester", 2); без количества -> (строка, 1)."""
+    match = _PRE_RE.match(line)
+    if match and re.search(r"[A-Za-zА-Яа-яЁё]", match.group("name")):
+        return match.group("name").strip(), int(match.group("n") or match.group("xn"))
+    match = _POST_RE.match(line)
+    if match and re.search(r"[A-Za-zА-Яа-яЁё]", match.group("name")):
+        qty = next(int(match.group(g)) for g in ("br", "x", "sep", "bare") if match.group(g))
+        return match.group("name").strip(), qty
+    return line, 1
+
+
 def parse_lines(text):
-    """Строки -> [(название, количество)]: "Harvester x2", "2 Harvester", "Harvester - 3"."""
+    """Строки -> [(название, количество)]: "Harvester x2", "2 Harvester", "Harvester - 3".
+
+    Строка, где только количество ("x2"), относится к следующему предмету
+    (на скриншоте значок обычно над названием), а если его нет — к предыдущему.
+    """
+    return [(name, qty) for _, name, qty, _ in _entries(text)]
+
+
+def _entries(text):
+    """[(строка, название, количество, количество, если вся строка — название)]."""
     result = []
+    pending = None
     for raw in str(text or "").splitlines():
         line = re.sub(r"\s+", " ", raw).strip()
-        if not line or _NOISE_LINE_RE.match(line):
+        if not line:
             continue
-        match = _QTY_RE.match(line)
-        name = match.group("name").strip() if match else line
-        qty = int(match.group("pre") or match.group("pre_x") or match.group("post") or match.group("count") or 1) if match else 1
-        result.append((name, max(1, qty)))
-    return result
+        only = _QTY_ONLY_RE.match(line)
+        if only:
+            pending = int(only.group("a") or only.group("b"))
+            continue
+        if _NOISE_LINE_RE.match(line):
+            continue
+        name, qty = _split_qty(line)
+        whole_qty = pending or 1
+        if pending is not None and qty == 1:
+            qty = pending
+        pending = None
+        result.append([line, name, max(1, qty), max(1, whole_qty)])
+    if pending is not None and result and result[-1][2] == 1:
+        result[-1][2] = result[-1][3] = max(1, pending)
+    return [tuple(entry) for entry in result]
 
 
 def build_matcher(items):
@@ -37,17 +81,20 @@ def build_matcher(items):
     for item in usable:
         keys.setdefault(parser.name_key(item["name"]), item)
 
-    def find(name):
+    def find(name, line=None):
+        # Строка целиком — точное название ("Candy 2" — предмет, а не Candy × 2).
+        if line is not None and parser.name_key(line) in keys:
+            return keys[parser.name_key(line)], 1.0, True
         item = markets.find_item(index, {"name": name})
         if item:
-            return item, 1.0
+            return item, 1.0, False
         key = parser.name_key(name)
         if len(key) < 3:
-            return None, 0.0
+            return None, 0.0, False
         close = difflib.get_close_matches(key, list(keys), n=1, cutoff=CUTOFF)
         if close:
-            return keys[close[0]], difflib.SequenceMatcher(None, key, close[0]).ratio()
-        return None, 0.0
+            return keys[close[0]], difflib.SequenceMatcher(None, key, close[0]).ratio(), False
+        return None, 0.0, False
 
     return find
 
@@ -57,14 +104,87 @@ def match_text(text, items):
     find = build_matcher(items)
     found = {}
     unmatched = []
-    for name, qty in parse_lines(text):
-        item, score = find(name)
-        if item is None:
-            unmatched.append(name)
-            continue
+
+    def add(item, qty, score, seen):
         key = markets.item_id(item)
         entry = found.setdefault(key, {"item": item, "qty": 0, "score": score, "seen": []})
         entry["qty"] += qty
         entry["score"] = min(entry["score"], score)
-        entry["seen"].append(name)
+        entry["seen"].append(seen)
+
+    for line, name, qty, whole_qty in _entries(text):
+        item, score, whole = find(name, line)
+        if whole:
+            name, qty = line, whole_qty
+        if item is not None and score < 1 and len(name.split()) != len(item["name"].split()):
+            item = None  # похоже лишь отчасти: в строке, видимо, несколько названий
+        if item is not None:
+            add(item, qty, score, name)
+            continue
+        # Распознавание часто отдаёт целый ряд инвентаря одной строкой:
+        # "Harvester x2 Icebreaker Seer" — ищем названия внутри строки.
+        hits, rest = _scan_line(line, find)
+        if not hits:
+            unmatched.append(name)
+            continue
+        for hit_item, hit_qty, hit_score, seen in hits:
+            add(hit_item, hit_qty if hit_qty > 1 or whole_qty == 1 else whole_qty, hit_score, seen)
+        unmatched.extend(rest)
     return list(found.values()), unmatched
+
+
+_QTY_TOKEN_RE = re.compile(rf"^(?:{_X}\s*(\d{{1,4}})|(\d{{1,4}})\s*{_X}?|[(\[]\s*{_X}?\s*(\d{{1,4}})\s*[)\]])$", re.I)
+MAX_NAME_WORDS = 5
+
+
+def _qty_token(word):
+    match = _QTY_TOKEN_RE.match(word)
+    return int(next(g for g in match.groups() if g)) if match else None
+
+
+def _scan_line(line, find):
+    """Несколько названий в одной строке -> ([(предмет, количество, похожесть, текст)], нераспознанное)."""
+    words = line.split()
+    hits, rest, leftover = [], [], []
+    pending = None
+    index = 0
+    while index < len(words):
+        qty = _qty_token(words[index])
+        if qty is not None:
+            if hits and hits[-1][1] == 1 and pending is None and not leftover:
+                hits[-1] = (hits[-1][0], qty, hits[-1][2], hits[-1][3])  # "Harvester x2"
+            else:
+                pending = qty  # "x2 Harvester"
+            index += 1
+            continue
+        item = None
+        for size in range(min(MAX_NAME_WORDS, len(words) - index), 0, -1):
+            chunk = " ".join(words[index:index + size])
+            has_qty = any(_qty_token(word) is not None for word in words[index:index + size])
+            item, score, whole = find(chunk, chunk)
+            if item is None or (has_qty and not whole):
+                # Число внутри — только если это точное название ("Candy 2"), иначе это количество.
+                item = None
+                continue
+            if score < 1 and len(chunk.split()) != len(item["name"].split()):
+                # Похожее, но другой длины: "Icebreaker Seer" — это не Icebreaker с опечаткой.
+                item = None
+                continue
+            if size > 1 or len(parser.name_key(chunk)) >= 3:
+                break
+            item = None
+        if item is None:
+            leftover.append(words[index])
+            index += 1
+            continue
+        if leftover:
+            rest.append(" ".join(leftover))
+            leftover = []
+        hits.append((item, pending or 1, score, chunk))
+        pending = None
+        index += size
+    if leftover:
+        rest.append(" ".join(leftover))
+    # Обрывки без букв (значки, цифры) не показываются как «не узнал».
+    rest = [r for r in rest if len(re.sub(r"[^A-Za-zА-Яа-яЁё]", "", r)) >= 3]
+    return hits, rest

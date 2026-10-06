@@ -118,3 +118,59 @@ class WindowsOcrTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewV4CalcTests(unittest.TestCase):
+    def test_more_quantity_forms(self):
+        cases = {
+            "Harvester 2": ("Harvester", 2), "Harvester 2x": ("Harvester", 2), "Harvester (3)": ("Harvester", 3),
+            "Seer (x10)": ("Seer", 10), "Harvester [x2]": ("Harvester", 2), "Seer (10 шт)": ("Seer", 10),
+            "Phoenix 2": ("Phoenix", 2), "Fox 2": ("Fox", 2), "Harvester: 3": ("Harvester", 3),
+            "Eternal IV": ("Eternal IV", 1),
+        }
+        for line, expected in cases.items():
+            self.assertEqual(calc.parse_lines(line), [expected], line)
+
+    def test_quantity_on_its_own_line(self):
+        self.assertEqual(calc.parse_lines("x2\nHarvester\nIcebreaker\nx3"), [("Harvester", 2), ("Icebreaker", 3)])
+        found, unmatched = calc.match_text("x2\nHarvester", items())
+        self.assertEqual([(e["item"]["name"], e["qty"]) for e in found], [("Harvester", 2)])
+        self.assertEqual(unmatched, [])
+
+    def test_name_with_number_is_not_a_quantity(self):
+        stock = items() + [parser.make_item("Candy 2", "misc", {"value": "5", "demand": "1", "rarity": "1"})]
+        found, _ = calc.match_text("Candy 2\nIcebreaker 2", stock)
+        self.assertEqual({e["item"]["name"]: e["qty"] for e in found}, {"Candy 2": 1, "Icebreaker": 2})
+
+
+class CalcRobustnessTests(CalcEndpointTests):
+    def test_ocr_crash_keeps_text_result(self):
+        from unittest import mock
+        with mock.patch.object(ocr, "recognize", side_effect=FileNotFoundError("no temp")):
+            status, payload = self.post({"text": "Icebreaker", "images": [base64.b64encode(b"x").decode()]})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["items"][0]["name"], "Icebreaker")
+        self.assertTrue(payload["ocr_errors"])
+
+    def test_ocr_temp_folder_error_is_ocr_error(self):
+        from unittest import mock
+        with mock.patch.object(ocr, "available", return_value=True), \
+                mock.patch.object(ocr.tempfile, "mkdtemp", side_effect=OSError("disk full")):
+            with self.assertRaises(ocr.OcrError):
+                ocr.recognize(b"x")
+
+    def test_too_big_request_gets_readable_answer(self):
+        from unittest import mock
+        with mock.patch.object(server, "MAX_CALC_BODY", 1000):
+            status, payload = self.post({"text": "Icebreaker", "images": ["A" * 5000]})
+        self.assertEqual(status, 413)
+        self.assertIn("Скриншоты", payload["error"])
+
+
+class OcrRowTests(unittest.TestCase):
+    def test_several_names_in_one_line(self):
+        stock = items() + [parser.make_item("Seer", "godlies", {"value": "5", "demand": "1", "rarity": "1"})]
+        found, unmatched = calc.match_text("Harvester x2 Icebreaker Seer\nInventory Flowerwod Gun Trade", stock)
+        self.assertEqual({e["item"]["name"]: e["qty"] for e in found},
+                         {"Harvester": 2, "Icebreaker": 1, "Seer": 1, "Flowerwood Gun": 1})
+        self.assertEqual(unmatched, ["Inventory", "Trade"])

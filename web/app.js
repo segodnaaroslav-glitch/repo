@@ -132,14 +132,25 @@ function marketInfo(item, id) {
   return item.market && item.market[id] ? item.market[id] : null;
 }
 
+const MARKET_DEFAULTS = { starpets: { title: "StarPets", fee: 0.2 }, dreampets: { title: "DreamPets", fee: 0.1 } };
+
 function marketTitle(id) {
   const market = (state.data.markets || []).find((m) => m.id === id);
-  return market ? market.title : id;
+  return market ? market.title : (MARKET_DEFAULTS[id] ? MARKET_DEFAULTS[id].title : id);
 }
 
 function feeOf(id) {
   const fees = state.data.fees || {};
-  return typeof fees[id] === "number" ? fees[id] : 0;
+  if (typeof fees[id] === "number") return fees[id];
+  return MARKET_DEFAULTS[id] ? MARKET_DEFAULTS[id].fee : 0;
+}
+
+function feeText(id) {
+  return `${Math.round(feeOf(id) * 100)}%`;
+}
+
+function marketsOff() {
+  return !(state.data.markets || []).length;
 }
 
 function fmtDate(iso) {
@@ -391,6 +402,8 @@ function toggleFavorite(key) {
   if (state.favorites.has(key)) state.favorites.delete(key); else state.favorites.add(key);
   storageSet("mm2.favorites", JSON.stringify([...state.favorites]));
   renderValues();
+  renderMarketsTab();
+  renderLiquidity();
   if (state.selected === key) renderDrawer();
 }
 
@@ -465,7 +478,19 @@ function syncSortSelect() {
 
 // --- карточки -----------------------------------------------------------------
 
-const failedImages = new Set();  // адреса, которые не загрузились, — не запрашивать снова
+const failedImages = new Map();  // адрес -> когда не загрузился: не запрашивать снова какое-то время
+const IMAGE_RETRY_MS = 10 * 60 * 1000;
+window.addEventListener("online", () => failedImages.clear());
+
+function imageFailed(url) {
+  const at = failedImages.get(url);
+  if (at === undefined) return false;
+  if (Date.now() - at > IMAGE_RETRY_MS) {
+    failedImages.delete(url);
+    return false;
+  }
+  return true;
+}
 
 function monogram(item) {
   const words = item.name.replace(/^Chroma\s+/i, "").split(/\s+/).filter(Boolean);
@@ -475,7 +500,7 @@ function monogram(item) {
 
 function itemArt(item, size) {
   const box = el("div", `art ${size || ""}`);
-  const sources = [item.image, item.image_market].filter((url) => url && !failedImages.has(url));
+  const sources = [item.image, item.image_market].filter((url) => url && !imageFailed(url));
   if (!sources.length) {
     box.append(monogram(item));
     return box;
@@ -487,7 +512,7 @@ function itemArt(item, size) {
   img.referrerPolicy = "no-referrer";
   let next = 0;
   img.addEventListener("error", () => {
-    failedImages.add(sources[next]);
+    failedImages.set(sources[next], Date.now());
     next += 1;
     if (next < sources.length) img.src = sources[next];
     else img.replaceWith(monogram(item));  // картинка не загрузилась — значок с буквами
@@ -637,7 +662,7 @@ function renderTable(rows) {
   if (!state.data.items.length) {
     const tr = el("tr");
     const td = el("td", "empty", "Цен пока нет. Нажмите «Обновить цены» или загрузите их на вкладке «Импорт».");
-    td.colSpan = 10;
+    td.colSpan = 12;
     tr.append(td);
     body.replaceChildren(tr);
     return;
@@ -659,11 +684,18 @@ function renderTable(rows) {
     stability.append(stabilityChip(item.stability));
     const liq = el("td");
     liq.append(liquidityChip(item.combined));
+    const prices = MARKET_ORDER.map((id) => {
+      const info = marketInfo(item, id);
+      const td = el("td", "num price-cell");
+      td.append(info ? priceNode(info.price, info.currency) : el("span", "muted", "—"));
+      return td;
+    });
     tr.append(
       favCell,
       name,
       el("td", "", categoryTitle(item.category)),
       valueCell(item),
+      ...prices,
       el("td", "site-text", item.range_text || item.value_text || "—"),
       demand,
       rarity,
@@ -677,7 +709,7 @@ function renderTable(rows) {
   if (!rows.length) {
     const tr = el("tr");
     const td = el("td", "empty", "Ничего не найдено.");
-    td.colSpan = 10;
+    td.colSpan = 12;
     tr.append(td);
     fragment.append(tr);
   }
@@ -750,8 +782,12 @@ function marketTile(item, id) {
   if (info.sales_week !== null && info.sales_week !== undefined) {
     tileStat(stats, "Продаж/нед.", String(info.sales_week), "Продаж за неделю по данным площадки");
   }
-  tileStat(stats, "Куплено, 2 дня", String(info.sold_48h || 0), "Сколько лотов исчезло с площадки (купили) за последние 48 часов");
-  tileStat(stats, "Новых, 2 дня", String(info.listed_48h || 0), "Сколько новых лотов выставили за последние 48 часов");
+  if (typeof info.sold_48h === "number") {
+    tileStat(stats, "Куплено, 2 дня", String(info.sold_48h), "Сколько лотов исчезло с площадки (купили) за последние 48 часов");
+    tileStat(stats, "Новых, 2 дня", String(info.listed_48h || 0), "Сколько новых лотов выставили за последние 48 часов");
+  } else {
+    tileStat(stats, "Куплено, 2 дня", "нет данных", "Площадка не показывает число лотов, поэтому покупки не посчитать — смотрите продажи за неделю");
+  }
   tile.append(stats);
   const liq = el("div", "tile-liq");
   liq.append(el("span", "muted", "Ликвидность"), liquidityChip(info));
@@ -872,7 +908,9 @@ function renderLiqViews() {
   };
   const market = (state.data.markets || []).find((m) => m.id === state.liqView);
   $("liqViewHint").textContent = hints[state.liqView]
-    || (market ? `По данным ${market.title}: продажи за неделю, лоты в продаже и сколько лотов купили за 2 дня.` : "");
+    || (market ? (market.id === "starpets"
+      ? "По данным StarPets: продажи за неделю (их показывает сама площадка) и место в списке популярных."
+      : `По данным ${market.title}: лоты в продаже и сколько лотов купили и выставили за последние 2 дня.`) : "");
 }
 
 function renderLiqCategorySelect() {
@@ -961,7 +999,7 @@ function mkSortValue(item, key) {
     case "starpets": return sortValue(item, "starpets");
     case "dreampets": return sortValue(item, "dreampets");
     case "lots": return dp ? dp.stock : null;
-    case "sold": return dp ? (dp.sold_48h || 0) : null;
+    case "sold": return dp ? dp.sold_48h : null;
     case "sales": return sp ? sp.sales_week : null;
     default: return item.name.toLowerCase();
   }
@@ -1037,15 +1075,20 @@ function renderMarketsTab() {
       dpPrice,
       payoutCell(dp, "dreampets"),
       numCell(dp ? dp.stock : null),
-      numCell(dp ? (dp.sold_48h || 0) : null),
-      numCell(dp ? (dp.listed_48h || 0) : null),
+      numCell(dp ? dp.sold_48h : null),
+      numCell(dp ? dp.listed_48h : null),
     );
     tr.addEventListener("click", () => openDrawer(itemKey(item)));
     fragment.append(tr);
   }
   if (!rows.length) {
     const tr = el("tr");
-    const td = el("td", "empty", state.data.items.length ? "Ничего не найдено." : "Цен пока нет.");
+    let message = state.data.items.length ? "Ничего не найдено." : "Цен пока нет.";
+    if (state.data.items.length && marketsOff()) message = "Площадки выключены (программа запущена с --no-markets).";
+    else if (state.data.items.length && state.mkOnlyListed && !state.data.items.some((i) => i.market && Object.keys(i.market).length)) {
+      message = "Цены площадок ещё загружаются — первые появятся через минуту-две.";
+    }
+    const td = el("td", "empty", message);
     td.colSpan = 10;
     tr.append(td);
     fragment.append(tr);
@@ -1054,41 +1097,94 @@ function renderMarketsTab() {
   const rate = usdRub();
   $("mkHint").textContent = `Показано: ${Math.min(rows.length, 600)}${rows.length > 600 ? ` из ${rows.length}` : ""}. ` +
     `Цены пересчитаны ${rate ? `по курсу 1 $ = ${rate.toLocaleString("ru-RU", { maximumFractionDigits: 2 })} ₽ (Rapira)` : "— курс ещё не получен"}. ` +
-    "«Вы получите» — цена минус комиссия площадки: StarPets 20%, DreamPets 10%.";
+    `«Вы получите» — цена минус комиссия площадки: ${marketTitle("starpets")} ${feeText("starpets")}, ` +
+    `${marketTitle("dreampets")} ${feeText("dreampets")}.`;
+  $("mkSpPayout").textContent = `Вы получите (−${feeText("starpets")})`;
+  $("mkDpPayout").textContent = `Вы получите (−${feeText("dreampets")})`;
+  $("calcFeeSp").textContent = feeText("starpets");
+  $("calcFeeDp").textContent = feeText("dreampets");
 }
 
 // --- вкладка «Калькулятор продажи» --------------------------------------------
 
 const calc = { images: [], items: [] };
 
+const MAX_SHOTS = 8;
+const MAX_SHOT_SIDE = 2400;  // больше для распознавания не нужно, а запрос становится огромным
+const MAX_SHOT_BYTES = 6 * 1024 * 1024;
+const MAX_CALC_BYTES = 60 * 1024 * 1024;
+
+function readDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+// Большой скриншот (4K, несжатый PNG) уменьшается до MAX_SHOT_SIDE по длинной стороне.
+async function prepareShot(file) {
+  if (typeof createImageBitmap !== "function") return readDataUrl(file);
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch (error) {
+    return readDataUrl(file);
+  }
+  const scale = Math.min(1, MAX_SHOT_SIDE / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1 && file.size <= MAX_SHOT_BYTES) {
+    bitmap.close();
+    return readDataUrl(file);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return canvas.toDataURL("image/png");
+}
+
 function addCalcFiles(files) {
   for (const file of files) {
     if (!file.type.startsWith("image/")) continue;
-    if (calc.images.length >= 8) {
-      toast("Не больше 8 скриншотов за раз", "error");
+    if (calc.images.length >= MAX_SHOTS) {
+      toast(`Не больше ${MAX_SHOTS} скриншотов за раз`, "error");
       break;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      calc.images.push({ name: file.name || "скриншот", data: reader.result });
+    // Место занимается сразу: лимит работает и когда выбрано много файлов одновременно.
+    const image = { name: file.name || "скриншот", data: null };
+    calc.images.push(image);
+    prepareShot(file).then((data) => {
+      image.data = data;
       renderCalcThumbs();
-    };
-    reader.readAsDataURL(file);
+    }).catch(() => {
+      const index = calc.images.indexOf(image);
+      if (index >= 0) calc.images.splice(index, 1);
+      renderCalcThumbs();
+      toast(`Не удалось открыть картинку «${image.name}»`, "error");
+    });
   }
+  renderCalcThumbs();
 }
 
 function renderCalcThumbs() {
-  $("calcThumbs").replaceChildren(...calc.images.map((image, index) => {
+  $("calcThumbs").replaceChildren(...calc.images.map((image) => {
     const box = el("div", "thumb");
     const img = el("img");
-    img.src = image.data;
+    if (image.data) img.src = image.data;
+    else {
+      img.hidden = true;  // ещё открывается
+      box.classList.add("loading");
+    }
     img.alt = image.name;
     const remove = el("button", "ghost icon", "✕");
     remove.type = "button";
     remove.title = "Убрать скриншот";
     remove.addEventListener("click", (event) => {
       event.stopPropagation();
-      calc.images.splice(index, 1);
+      const index = calc.images.indexOf(image);
+      if (index >= 0) calc.images.splice(index, 1);
       renderCalcThumbs();
     });
     box.append(img, remove);
@@ -1098,6 +1194,15 @@ function renderCalcThumbs() {
 
 async function runCalc() {
   const button = $("calcBtn");
+  if (calc.images.some((image) => !image.data)) {
+    $("calcStatus").textContent = "Скриншоты ещё открываются — нажмите «Посчитать» через секунду.";
+    return;
+  }
+  const size = calc.images.reduce((sum, image) => sum + image.data.length, 0);
+  if (size > MAX_CALC_BYTES) {
+    $("calcStatus").textContent = "Скриншоты слишком большие вместе — уберите часть и посчитайте в два захода.";
+    return;
+  }
   button.disabled = true;
   $("calcStatus").textContent = calc.images.length ? "Распознаю скриншоты…" : "Считаю…";
   try {
@@ -1214,6 +1319,10 @@ function renderCalcTotals() {
   const box = $("calcTotals");
   box.replaceChildren();
   if (!calc.items.length) return;
+  if (marketsOff()) {
+    box.append(el("p", "hint", "Площадки выключены (программа запущена с --no-markets) — цен StarPets и DreamPets нет."));
+    return;
+  }
   const totals = {};
   const missing = {};
   let noRate = false;
@@ -1484,6 +1593,7 @@ function init() {
   const drop = $("calcDrop");
   drop.addEventListener("click", () => $("calcFiles").click());
   drop.addEventListener("keydown", (event) => {
+    if (event.target !== drop) return;  // Enter на ✕ у скриншота — убрать его
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       $("calcFiles").click();

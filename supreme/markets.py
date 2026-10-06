@@ -148,7 +148,7 @@ def _level(score):
     return liquidity.MEDIUM if score >= liquidity.MEDIUM_FROM else liquidity.ILLIQUID
 
 
-def assess_offer(offer, sold):
+def assess_offer(offer, sold, listed=None):
     """Балл 0–100 и причины по данным одной площадки.
 
     Если площадка не показывает ни продаж, ни количества, ни места по
@@ -173,6 +173,12 @@ def assess_offer(offer, sold):
     if sold:
         score = min(100.0, (score or 0) + min(40, 5 * sold))
         reasons.append(f"куплено за 2 дня (по проверкам): {sold}")
+    if listed:
+        reasons.append(f"новых лотов за 2 дня: {listed}")
+        surplus = listed - (sold or 0)
+        if score is not None and surplus > 0:
+            # Выставляют заметно больше, чем покупают, — продать будет труднее.
+            score = max(0.0, score - min(15, 2 * surplus))
     if score is None:
         return {"score": None, "level": NO_DATA, "reasons": ["есть в продаже, но площадка не показывает продажи"]}
     score = int(round(score))
@@ -447,7 +453,7 @@ class DreamPetsAdapter(Adapter):
     PAUSE = 0.5
     PAGE_TIMEOUT = 15
     CARD_SHARE = 0.5  # если у половины товаров на странице рынка видны цены — берём их оттуда
-    _CARD_PRICE_RE = re.compile(r"(\d[\d \u00a0]*(?:[.,]\d{1,2})?)\s*₽")
+    _CARD_PRICE_RE = re.compile(r"(\d{1,3}(?:[ \u00a0,.]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*₽")
     _BUTTON_RE = re.compile(r"^(купить|в корзину|продать|подробнее|от|лот\w*|шт\.?)$", re.I)
     _LINK_RE = re.compile(r"""href=["']((?:https?://[^"']*dreampets\.(?:gg|io))?/mm2/product/[^"'#?]+)["']""", re.I)
     _PRICE_RE = re.compile(r"от\s*([\d\s\u00a0.,]+?)\s*₽")
@@ -472,9 +478,13 @@ class DreamPetsAdapter(Adapter):
             now = time.time()
             for link, card in priced.items():
                 products[link].update({k: v for k, v in card.items() if v is not None}, at=now)
-        # Страницы товаров читаются только для тех, чьих цен нет на странице рынка.
-        waiting = [link for link in products if link not in priced] if from_cards else list(products)
-        due = sorted(waiting, key=lambda link: (products[link].get("at", 0), -(products[link].get("price") or 0)))
+        # Страницы товаров читаются для тех, у кого на странице рынка нет цены или числа лотов
+        # (по очереди: сначала давно не читанные).
+        waiting = [
+            link for link in products
+            if not (link in priced and priced[link].get("lots") is not None)
+        ] if from_cards else list(products)
+        due = sorted(waiting, key=lambda link: (products[link].get("page_at", 0), -(products[link].get("price") or 0)))
         read = failed = 0
         last_error = None
         for link in due[:self.PAGES_PER_POLL]:
@@ -484,13 +494,18 @@ class DreamPetsAdapter(Adapter):
             except (fetcher.BlockedError, fetcher.NetworkError):
                 raise  # нет связи или блок — опрос считается неудачным
             except fetcher.FetchError as error:
-                products[link]["at"] = time.time()  # в конец очереди
+                products[link]["at"] = products[link]["page_at"] = time.time()  # в конец очереди
                 last_error = error
                 failed += 1
                 if failed >= 2 and not read:
                     break
                 continue
-            products[link].update(self._parse_product(page_html), at=time.time())
+            parsed = self._parse_product(page_html)
+            if parsed["name"] is None:
+                parsed.pop("name")  # название уже известно со страницы рынка
+            if link in priced:
+                parsed.pop("price")  # цена со страницы рынка свежее
+            products[link].update(parsed, at=time.time(), page_at=time.time())
             read += 1
         if failed and not read and not from_cards:
             raise fetcher.FetchError(f"страницы товаров не открываются: {last_error}")
@@ -531,10 +546,17 @@ class DreamPetsAdapter(Adapter):
             link = self._absolute(match.group(1), root)
             end = matches[index + 1].start() if index + 1 < len(matches) else min(len(page_html), match.end() + 4000)
             start = page_html.rfind("<", 0, match.start())
-            lines = [line.strip() for line in parser.html_to_text(page_html[max(0, start):end]).splitlines() if line.strip()]
-            text = " ".join(lines)
-            price = self._CARD_PRICE_RE.search(text)
-            lots = self._LOTS_RE.search(text)
+            # Соседние теги карточки — разные надписи: "<i>114</i><b>23,71 ₽</b>" не "11423,71 ₽".
+            fragment = re.sub(r">(?=<)", "> ", page_html[max(0, start):end])
+            lines = [line.strip() for line in parser.html_to_text(fragment).splitlines() if line.strip()]
+            price = None
+            for number, line in enumerate(lines):
+                price = self._CARD_PRICE_RE.search(line)
+                if not price and number + 1 < len(lines) and lines[number + 1].startswith("₽"):
+                    price = self._CARD_PRICE_RE.search(f"{line} {lines[number + 1]}")  # "1 299" + "₽"
+                if price:
+                    break
+            lots = next((m for m in (self._LOTS_RE.search(line) for line in lines) if m), None)
             name = next(
                 (line for line in lines if re.search(r"[A-Za-z]", line) and "₽" not in line
                  and not self._LOTS_RE.search(line) and not self._BUTTON_RE.match(line)),
@@ -722,12 +744,17 @@ def html_unescape(text):
 
 
 def _rub(text):
-    """"328.98", "34,99", "1 299,50" -> число рублей."""
+    """"328.98", "34,99", "1 299,50", "1,299.50", "12,345", "1.299,50" -> число рублей."""
     cleaned = re.sub(r"[\s\u00a0]", "", text).rstrip(".,")
-    if "," in cleaned and "." not in cleaned:
-        cleaned = cleaned.replace(",", ".")
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):  # 1.299,50
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:                                        # 1,299.50
+            cleaned = cleaned.replace(",", "")
+    elif re.fullmatch(r"\d{1,3}(?:[,.]\d{3})+", cleaned):
+        cleaned = re.sub(r"[,.]", "", cleaned)       # 12,345 / 1.299 — разделители тысяч
     else:
-        cleaned = cleaned.replace(",", "")
+        cleaned = cleaned.replace(",", ".")
     try:
         return float(cleaned)
     except ValueError:
@@ -983,7 +1010,11 @@ class MarketMonitor:
         now = _now()
         cutoff = (now - timedelta(hours=HISTORY_HOURS)).timestamp()
         with self._lock:
-            if market.complete and adapter.complete:
+            # Прошлый снимок мог быть сделан давно (программа была закрыта, компьютер спал,
+            # не было сети): всё, что поменялось за это время, — не «за 2 дня по проверкам».
+            fresh = (market.last_ok_at is not None and
+                     (now - market.last_ok_at).total_seconds() <= max(3 * market.interval(self.interval), 30 * 60))
+            if fresh and market.complete and adapter.complete:
                 # Оба снимка полные: исчезнувшие лоты — купленные, появившиеся — новые.
                 for key, offer in matched.items():
                     old = market.offers.get(key)
@@ -1040,7 +1071,9 @@ class MarketMonitor:
                 if not isinstance(offer, dict):
                     continue
                 sold_48h, listed_48h = sold.get(key, (0, 0))
-                info = assess_offer(offer, sold_48h)
+                if not isinstance(offer.get("stock"), int):
+                    sold_48h = listed_48h = None  # площадка не показывает лоты — купленное не измерить
+                info = assess_offer(offer, sold_48h, listed_48h)
                 info.update({
                     "price": offer.get("price"),
                     "currency": offer.get("currency") or "USD",

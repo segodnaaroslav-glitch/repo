@@ -545,3 +545,5 @@ input.qty { width: 72px; text-align: right; }
 @media (prefers-color-scheme: light) {
   .tag { color: color-mix(in srgb, var(--cat) 55%, var(--text)); }
 }
+.thumb.loading { background: var(--panel-3); animation: pulse 1.2s ease-in-out infinite; }
+.price-cell { white-space: nowrap; font-size: 12px; }

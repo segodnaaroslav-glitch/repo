@@ -18,7 +18,8 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 MAX_BODY = 5 * 1024 * 1024
-MAX_CALC_BODY = 40 * 1024 * 1024  # несколько скриншотов
+MAX_CALC_BODY = 64 * 1024 * 1024  # несколько скриншотов (интерфейс уменьшает большие)
+DRAIN_LIMIT = 256 * 1024 * 1024  # слишком большой запрос дочитывается, чтобы браузер увидел ответ
 MAX_IMAGES = 8
 
 
@@ -177,6 +178,14 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status, message):
         self._json(status, {"error": message})
 
+    def _drain(self, length):
+        left = length
+        while left > 0:
+            chunk = self.rfile.read(min(left, 1024 * 1024))
+            if not chunk:
+                break
+            left -= len(chunk)
+
     def _calc(self, body):
         """Калькулятор продажи: текст и/или скриншоты -> предметы с ценами площадок."""
         text = body.get("text") if isinstance(body.get("text"), str) else ""
@@ -196,6 +205,8 @@ class Handler(BaseHTTPRequestHandler):
                 ocr_lines.extend(ocr.recognize(raw))
             except ocr.OcrError as error:
                 ocr_errors.append(f"скриншот {index}: {error}")
+            except Exception as error:  # одна картинка не должна ломать весь расчёт
+                ocr_errors.append(f"скриншот {index}: не удалось распознать ({error})")
         if not text.strip() and not ocr_lines:
             message = "; ".join(ocr_errors) or "Вставьте список предметов или добавьте скриншот"
             return self._error(400, message)
@@ -205,7 +216,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, f"Не удалось прочитать цены: {error}")
         items = [dict(i, liquidity=liquidity.assess(i)) for i in data["items"] if not parser.is_placeholder(i)]
         if self.monitor is not None:
-            self.monitor.annotate(items)
+            try:
+                self.monitor.annotate(items)
+            except Exception:  # без цен площадок, но с найденными предметами
+                pass
         found, unmatched = calc.match_text(text + "\n" + "\n".join(ocr_lines), items)
         result = []
         for entry in found:
@@ -283,7 +297,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "Неверная длина запроса")
         limit = MAX_CALC_BODY if self.path.split("?", 1)[0] == "/api/calc" else MAX_BODY
         if length < 0 or length > limit:
-            return self._error(413, "Слишком большой запрос")
+            if 0 < length <= DRAIN_LIMIT:
+                self._drain(length)  # иначе браузер видит обрыв связи вместо сообщения
+            else:
+                self.close_connection = True
+            message = ("Скриншоты слишком большие: добавьте меньше за раз" if limit == MAX_CALC_BODY
+                       else "Слишком большой запрос")
+            return self._error(413, message)
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except (UnicodeDecodeError, ValueError):
