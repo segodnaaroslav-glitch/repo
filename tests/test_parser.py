@@ -295,3 +295,55 @@ class SecondReviewRegressionTests(unittest.TestCase):
             self.assertIsNone(parser.range_low(text), text)
         for text in ("~1,320 - ~1,340", "1,320 to 1,340", "≈1,320 - 1,340"):
             self.assertEqual(parser.range_low(text), 1320, text)
+
+
+class CardDesignTests(unittest.TestCase):
+    """Картинки, состав набора и диапазон в строке значения (как в карточках сайта)."""
+
+    PAGE = """
+    <div class="card">
+      <img src="/images/icons/arrow.png" alt="">
+      <img data-src="/mm2/items/demo_set.webp" alt="Demo Ever Set">
+      <h3>Demo Ever Set</h3>
+      <div>Contains - Demo Evergreen, Demo Evergun</div>
+      <div>Value - <span>98,000</span> <span>[N/A]</span></div>
+      <div>Stability - Stable <img src="/icons/stable.svg"></div>
+      <div>Demand - 7 &bull; Rarity - 8</div>
+      <div>Change in Value - (+1,000) +1.0%</div>
+      <div>Inv. Controls - <button>+1</button> <button>-1</button> <button>~</button></div>
+    </div>
+    <div class="card">
+      <img src="https://cdn.example.com/demo_alien.png" alt="">
+      <h3>Demo Alien Set</h3>
+      <div>Contains - Demo Alienbeam, Demo Raygun</div>
+      <div>Value - 38,750 [38,750 - 39,000]</div>
+      <div>Stability - Doing Well</div>
+      <div>Demand - 6 &bull; Rarity - 6</div>
+    </div>
+    """
+
+    def test_set_cards(self):
+        items, _, orphans = parser.parse_category_page(self.PAGE, "sets", base_url="https://supremevalues.com/mm2/sets")
+        self.assertEqual(orphans, 0)
+        first, second = items
+        self.assertEqual(first["name"], "Demo Ever Set")
+        self.assertEqual(first["contains"], "Demo Evergreen, Demo Evergun")
+        self.assertEqual((first["value"], first["value_text"], first["range_text"]), (98000, "98,000", ""))
+        self.assertEqual(first["image"], "https://supremevalues.com/mm2/items/demo_set.webp")
+        self.assertEqual((first["demand"], first["rarity"], first["stability"]), (7, 8, "Stable"))
+        self.assertEqual(second["contains"], "Demo Alienbeam, Demo Raygun")
+        self.assertEqual((second["value"], second["range_text"]), (38750, "38,750 - 39,000"))
+        self.assertEqual(second["image"], "https://cdn.example.com/demo_alien.png")
+
+    def test_contains_on_separate_lines(self):
+        text = "Zeta Set\nContains -\nZeta Knife\nZeta Gun\nValue - 300\n"
+        items = parser.items_from_text(text, "sets")
+        self.assertEqual((items[0]["name"], items[0]["contains"]), ("Zeta Set", "Zeta Knife, Zeta Gun"))
+
+    def test_value_with_inline_range_text(self):
+        item = parser.make_item("X", "godlies", {"value": "1,330 [1,320 - 1,340]"})
+        self.assertEqual((item["value"], item["value_text"], item["range_text"]), (1320, "1,330", "1,320 - 1,340"))
+        self.assertEqual(parser.make_item("Y", "commons", {"value": "x2 T1 Commons"})["value_text"], "x2 T1 Commons")
+
+    def test_images_do_not_leak_into_other_text_users(self):
+        self.assertNotIn("img:", parser.html_to_text('<img src="/a/value-list.png"><p>Hi</p>'))

@@ -31,6 +31,7 @@ const state = {
   liqCategory: "weapons",
   liqSearch: "",
   selected: null,        // ключ предмета в карточке
+  view: "cards",         // "cards" или "table"
   offline: null,         // текст ошибки, если программа не отвечает
   userUpdate: false,     // обновление запущено кнопкой (о результате сообщить всплывающим окном)
   lastError: null,       // последняя показанная ошибка автообновления
@@ -335,20 +336,181 @@ function valueCell(item) {
   return td;
 }
 
-function renderValues() {
-  renderCategories();
+const CARD_CHUNK = 90;
+const STABILITY_ARROW = { good: "↗", mid: "↕", bad: "↘", none: "→" };
+
+function visibleRows() {
   const query = state.search.trim().toLowerCase();
   let rows = itemsIn(state.category).filter((item) => matchesSearch(item, query));
   if (state.onlyFav) rows = rows.filter((item) => state.favorites.has(itemKey(item)));
   const hiddenSecret = state.hideSecret ? rows.filter((item) => item.secret).length : 0;
   if (state.hideSecret) rows = rows.filter((item) => !item.secret);
   rows.sort(compareItems);
+  return { rows, hiddenSecret };
+}
 
+function renderValues() {
+  renderCategories();
+  const { rows, hiddenSecret } = visibleRows();
+  const cards = state.view === "cards";
+  $("cardsGrid").classList.toggle("hidden", !cards);
+  $("tableWrap").classList.toggle("hidden", cards);
+  $("sortLabel").classList.toggle("hidden", !cards);
+  $("sortSelect").value = `${state.sort.key}:${state.sort.dir}`;
+  for (const button of document.querySelectorAll("#viewToggle button")) {
+    button.classList.toggle("active", button.dataset.view === state.view);
+    button.setAttribute("aria-pressed", String(button.dataset.view === state.view));
+  }
+  if (cards) renderCards(rows); else renderTable(rows);
+  if (!state.data.items.length) {
+    $("valuesHint").textContent = "";
+    return;
+  }
+  let hint = `Показано: ${rows.length}. «Значение» — первое число диапазона с сайта (1,320 - 1,340 → 1,320); ` +
+    `если диапазона нет — число из Value. Нажмите на ${cards ? "карточку" : "строку"}, чтобы открыть подробности.`;
+  if (hiddenSecret) hint += ` Скрыто секретных предметов с условным значением 1,000,000: ${hiddenSecret}.`;
+  $("valuesHint").textContent = hint;
+}
+
+// --- карточки -----------------------------------------------------------------
+
+function monogram(item) {
+  const words = item.name.replace(/^Chroma\s+/i, "").split(/\s+/).filter(Boolean);
+  const letters = (words.length > 1 ? words[0][0] + words[1][0] : (words[0] || "?").slice(0, 2)).toUpperCase();
+  return el("span", "mono", letters);
+}
+
+function itemArt(item, size) {
+  const box = el("div", `art ${size || ""}`);
+  const sources = [item.image, item.image_market].filter(Boolean);
+  if (!sources.length) {
+    box.append(monogram(item));
+    return box;
+  }
+  const img = el("img");
+  img.alt = item.name;
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.referrerPolicy = "no-referrer";
+  let next = 0;
+  img.addEventListener("error", () => {
+    next += 1;
+    if (next < sources.length) img.src = sources[next];
+    else img.replaceWith(monogram(item));  // картинка не загрузилась — значок с буквами
+  });
+  img.src = sources[0];
+  box.append(img);
+  return box;
+}
+
+function statLine(label, value) {
+  const span = el("span", "stat");
+  span.append(`${label} `, el("b", "", value === null || value === undefined ? "—" : value));
+  return span;
+}
+
+function itemCard(item) {
+  const key = itemKey(item);
+  const card = el("article", `card cat-${item.category}${key === state.selected ? " selected" : ""}`);
+  card.tabIndex = 0;
+  card.setAttribute("role", "button");
+  card.setAttribute("aria-label", `${item.name}: подробнее`);
+  card.append(itemArt(item));
+
+  const info = el("div", "info");
+  const head = el("div", "title-row");
+  head.append(el("h3", "", item.name), starButton(item));
+  info.append(head);
+
+  const tags = el("div", "tags");
+  tags.append(el("span", "tag", categoryTitle(item.category)));
+  if (item.secret) tags.append(el("span", "badge secret", "секретный"));
+  info.append(tags);
+
+  if (item.contains) info.append(el("p", "contains", `Состав: ${item.contains}`));
+
+  const valueRow = el("div", "value-row");
+  if (item.value === null || item.value === undefined) {
+    valueRow.append(el("span", "value text", item.value_text || "—"));
+  } else {
+    valueRow.append(el("span", `value${item.secret ? " muted" : ""}`, fmtNum(item.value)));
+    if (item.secret) valueRow.append(el("span", "badge secret", "условно"));
+  }
+  if (item.range_text) valueRow.append(el("span", "range", item.range_text));
+  info.append(valueRow);
+
+  const stats = el("div", "stats");
+  if (item.stability) {
+    const kind = STABILITY_CLASS[item.stability.toLowerCase()] || "none";
+    stats.append(el("span", `chip ${kind}`, `${STABILITY_ARROW[kind]} ${item.stability}`));
+  }
+  stats.append(statLine("Спрос", item.demand), statLine("Редкость", item.rarity));
+  info.append(stats);
+
+  const foot = el("div", "foot");
+  foot.append(el("span", `change ${changeClass(item.change)}`, item.change || ""));
+  foot.append(liquidityChip(item.combined || item.liquidity));
+  info.append(foot);
+  card.append(info);
+
+  card.addEventListener("click", () => openDrawer(key));
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openDrawer(key);
+    }
+  });
+  return card;
+}
+
+let cardRows = [];
+let cardShown = 0;
+
+function renderCards(rows) {
+  const grid = $("cardsGrid");
+  cardRows = rows;
+  // При обновлении данных не сворачивать уже открытые карточки.
+  cardShown = Math.min(rows.length, Math.max(CARD_CHUNK, cardShown));
+  if (!state.data.items.length) {
+    grid.replaceChildren(el("p", "empty-cards", "Цен пока нет. Нажмите «Обновить цены» или загрузите их на вкладке «Импорт»."));
+    $("moreRow").classList.add("hidden");
+    return;
+  }
+  if (!rows.length) {
+    grid.replaceChildren(el("p", "empty-cards", "Ничего не найдено."));
+    $("moreRow").classList.add("hidden");
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const item of rows.slice(0, cardShown)) fragment.append(itemCard(item));
+  grid.replaceChildren(fragment);
+  updateMoreButton();
+}
+
+function showMoreCards() {
+  if (cardShown >= cardRows.length) return;
+  const grid = $("cardsGrid");
+  const fragment = document.createDocumentFragment();
+  const next = cardRows.slice(cardShown, cardShown + CARD_CHUNK);
+  for (const item of next) fragment.append(itemCard(item));
+  grid.append(fragment);
+  cardShown += next.length;
+  updateMoreButton();
+}
+
+function updateMoreButton() {
+  const left = cardRows.length - cardShown;
+  $("moreRow").classList.toggle("hidden", left <= 0);
+  $("moreBtn").textContent = `Показать ещё (${left})`;
+}
+
+// --- таблица ------------------------------------------------------------------
+
+function renderTable(rows) {
   for (const button of document.querySelectorAll("th .sort")) {
     if (button.dataset.sort === state.sort.key) button.dataset.dir = state.sort.dir;
     else delete button.dataset.dir;
   }
-
   const body = $("valuesBody");
   if (!state.data.items.length) {
     const tr = el("tr");
@@ -356,10 +518,8 @@ function renderValues() {
     td.colSpan = 10;
     tr.append(td);
     body.replaceChildren(tr);
-    $("valuesHint").textContent = "";
     return;
   }
-
   const fragment = document.createDocumentFragment();
   for (const item of rows) {
     const tr = el("tr");
@@ -400,10 +560,6 @@ function renderValues() {
     fragment.append(tr);
   }
   body.replaceChildren(fragment);
-  let hint = `Показано: ${rows.length}. «Значение» — первое число диапазона с сайта (1,320 - 1,340 → 1,320); ` +
-    "если диапазона нет — число из Value. Нажмите на строку, чтобы открыть подробности.";
-  if (hiddenSecret) hint += ` Скрыто секретных предметов с условным значением 1,000,000: ${hiddenSecret}.`;
-  $("valuesHint").textContent = hint;
 }
 
 // --- карточка предмета --------------------------------------------------------
@@ -439,6 +595,8 @@ function renderDrawer() {
   body.replaceChildren();
 
   const head = el("div");
+  head.append(itemArt(item, "large"));
+  if (item.contains) head.append(el("p", "contains", `Состав: ${item.contains}`));
   head.append(el("div", "big-value", item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value)));
   if (item.secret) head.append(el("p", "warn", "Секретный предмет: на сайте стоит условное значение 1,000,000, по нему не торгуют."));
   const fav = starButton(item);
@@ -814,6 +972,7 @@ function init() {
     if (sort && sort.key && sort.dir) state.sort = sort;
   } catch (e) { /* по умолчанию */ }
   state.hideSecret = storageGet("mm2.hideSecret") !== "0";
+  state.view = storageGet("mm2.view") === "table" ? "table" : "cards";
   $("hideSecret").checked = state.hideSecret;
 
   for (const tab of document.querySelectorAll(".tab")) {
@@ -827,6 +986,7 @@ function init() {
     if (!button) return;
     state.category = button.dataset.slug;
     storageSet("mm2.category", state.category);
+    cardShown = 0;
     renderValues();
   });
   for (const button of document.querySelectorAll("th .sort")) {
@@ -841,7 +1001,28 @@ function init() {
   }
   state.search = $("search").value;
   state.liqSearch = $("liqSearch").value;
-  $("search").addEventListener("input", (event) => { state.search = event.target.value; renderValues(); });
+  $("search").addEventListener("input", (event) => { state.search = event.target.value; cardShown = 0; renderValues(); });
+  for (const button of document.querySelectorAll("#viewToggle button")) {
+    button.addEventListener("click", () => {
+      state.view = button.dataset.view;
+      storageSet("mm2.view", state.view);
+      renderValues();
+    });
+  }
+  $("sortSelect").addEventListener("change", (event) => {
+    const [key, dir] = event.target.value.split(":");
+    state.sort = { key, dir };
+    storageSet("mm2.sort", JSON.stringify(state.sort));
+    cardShown = 0;
+    renderValues();
+  });
+  $("moreBtn").addEventListener("click", showMoreCards);
+  if ("IntersectionObserver" in window) {
+    // Карточки подгружаются сами, когда пользователь докручивает до конца списка.
+    new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) showMoreCards();
+    }, { rootMargin: "600px" }).observe($("moreRow"));
+  }
   $("onlyFav").addEventListener("change", (event) => { state.onlyFav = event.target.checked; renderValues(); });
   $("hideSecret").addEventListener("change", (event) => {
     state.hideSecret = event.target.checked;

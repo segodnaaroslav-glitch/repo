@@ -76,7 +76,7 @@ def _clean_item(item):
     item["secret"] = parser.is_secret(item["value"])
     for key in ("demand", "rarity"):
         item[key] = item[key] if isinstance(item.get(key), int) and not isinstance(item.get(key), bool) else None
-    for key in ("value_text", "range_text", "stability", "change", "origin", "aliases"):
+    for key in ("value_text", "range_text", "stability", "change", "origin", "aliases", "contains", "image"):
         if not isinstance(item.get(key), str):
             item[key] = ""
     return item
@@ -216,7 +216,9 @@ def update_from_site(fetch=None, log=print, path=None):
             log(f"{title}: загрузка…")
             try:
                 page_html = fetch(fetcher.BASE_URL + slug)
-                items, last_updated, orphans = parser.parse_category_page(page_html, slug)
+                items, last_updated, orphans = parser.parse_category_page(
+                    page_html, slug, base_url=fetcher.BASE_URL + slug
+                )
             except fetcher.NetworkError as error:
                 network_failures += 1
                 errors.append(_error(slug, str(error)))

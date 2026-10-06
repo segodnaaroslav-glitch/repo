@@ -56,11 +56,29 @@
           <div class="search">
             <input id="search" type="search" placeholder="Поиск по названию…  ( / )" autocomplete="off" aria-label="Поиск по названию">
           </div>
+          <div class="segmented compact" id="viewToggle" role="group" aria-label="Вид">
+            <button type="button" data-view="cards">Карточки</button>
+            <button type="button" data-view="table">Таблица</button>
+          </div>
+          <label id="sortLabel">Сортировка
+            <select id="sortSelect" autocomplete="off">
+              <option value="value:desc">Значение ↓</option>
+              <option value="value:asc">Значение ↑</option>
+              <option value="name:asc">Название А–Я</option>
+              <option value="demand:desc">Спрос ↓</option>
+              <option value="rarity:desc">Редкость ↓</option>
+              <option value="liquidity:desc">Ликвидность ↓</option>
+            </select>
+          </label>
           <label class="check"><input type="checkbox" id="onlyFav"> Только избранное</label>
           <label class="check"><input type="checkbox" id="hideSecret" checked> Скрыть секретные</label>
         </div>
         <p class="hint" id="valuesHint"></p>
-        <div class="table-wrap">
+        <div class="cards" id="cardsGrid"></div>
+        <div class="more-row hidden" id="moreRow">
+          <button class="ghost" id="moreBtn" type="button">Показать ещё</button>
+        </div>
+        <div class="table-wrap hidden" id="tableWrap">
           <table class="values">
             <thead>
               <tr>

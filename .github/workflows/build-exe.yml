@@ -44,7 +44,8 @@ jobs:
             if ($page.Content -notmatch "MM2 Values") { throw "index.html not served" }
             $js = Invoke-WebRequest http://127.0.0.1:8799/app.js -UseBasicParsing
             if ($js.StatusCode -ne 200) { throw "app.js not served" }
-            if (-not (Test-Path dist\data)) { throw "data folder not created next to exe" }
+            if (Test-Path dist\data) { throw "exe must not create a data folder next to itself" }
+            if (-not (Test-Path "$env:LOCALAPPDATA\MM2Values\data")) { throw "data folder not created in LOCALAPPDATA" }
             Set-Content -Path sample.txt -Encoding utf8 -Value "Smoke Knife`nValue - 1,330`nRange - [1,320 - 1,340]`nDemand - 6"
             & $exe import sample.txt --category godlies
             if ($LASTEXITCODE -ne 0) { throw "exe import failed" }
@@ -74,4 +75,4 @@ jobs:
           gh release create mm2-values-latest dist/MM2Values.exe \
             --target "${{ github.sha }}" \
             --title "MM2 Values для Windows" \
-            --notes "Скачайте MM2Values.exe и запустите двойным щелчком. Программа откроется в браузере. Сборка из коммита ${{ github.sha }}."
+            --notes "Скачайте файл **MM2Values.exe** ниже (архивы Source code — это исходный код, они не нужны) и запустите его двойным щелчком. Программа откроется в браузере. Цены хранятся в %LOCALAPPDATA%\MM2Values, рядом с exe ничего не создаётся. Сборка из коммита ${{ github.sha }}."

@@ -126,3 +126,20 @@ class StatusBlockTests(unittest.TestCase):
         with mock.patch.object(fetcher.time, "sleep"):
             with self.assertRaises(fetcher.NetworkError):
                 fetcher.fetch_plain("http://127.0.0.1:9/", timeout=2)
+
+
+class FrozenPathTests(unittest.TestCase):
+    def test_exe_keeps_data_in_localappdata_and_moves_old_folder(self):
+        with TemporaryDirectory() as tmp:
+            exe_dir = Path(tmp) / "Загрузки"
+            old = exe_dir / "data"
+            old.mkdir(parents=True)
+            (old / "values.json").write_text("{}", encoding="utf-8")
+            local = Path(tmp) / "Local"
+            with mock.patch.object(paths, "FROZEN", True), \
+                    mock.patch.object(paths.sys, "executable", str(exe_dir / "MM2Values.exe")), \
+                    mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local)}):
+                folder = paths.data_dir()
+            self.assertEqual(folder, local / "MM2Values" / "data")
+            self.assertTrue((folder / "values.json").exists())
+            self.assertFalse(old.exists())  # рядом с exe папки больше нет

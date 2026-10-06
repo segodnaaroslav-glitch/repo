@@ -23,6 +23,7 @@
 import html as html_lib
 import json
 import re
+from urllib.parse import urljoin
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 
@@ -165,11 +166,15 @@ SECTION_BREAK = "\x00"
 _INLINE = "\x1f"  # граница строчного тега; решается в html_to_text
 _ANCHOR = "\x02"  # место начала ссылки <a>; решается при её закрытии
 _BADGE_CLASS_RE = re.compile(r"(?<![\w-])badge(?![\w-])", re.I)
+IMAGE_MARK = "\x01img:"  # строка-метка картинки: IMAGE_MARK + адрес + "\x03" + подпись
+_IMAGE_SEP = "\x03"
+_ICON_RE = re.compile(r"icon|arrow|logo|sprite|emoji|avatar|badge|\.svg(?:$|\?)", re.I)
 
 
 class _TextExtractor(HTMLParser):
-    def __init__(self):
+    def __init__(self, images=False):
         super().__init__(convert_charrefs=True)
+        self.images = images
         self.parts = []
         self.skip_depth = 0
         self.anchors = []  # индексы открытых <a> в self.parts
@@ -181,6 +186,16 @@ class _TextExtractor(HTMLParser):
         else:
             self.parts.append("\n" if tag in _BLOCK_TAGS else _INLINE)
 
+    def _image(self, attrs):
+        """Картинка предмета — отдельной строкой-меткой (только для разбора карточек)."""
+        values = dict(attrs)
+        url = next((values.get(k) for k in ("data-src", "data-lazy-src", "data-original", "src") if values.get(k)), "")
+        if not url and values.get("srcset"):
+            url = values["srcset"].split(",")[0].strip().split(" ")[0]
+        if url and not url.startswith("data:"):
+            alt = re.sub(r"\s+", " ", values.get("alt") or "").strip()
+            self.parts.append(f"\n{IMAGE_MARK}{url.strip()}{_IMAGE_SEP}{alt}\n")
+
     def handle_starttag(self, tag, attrs):
         if self.badge:
             if tag == self.badge[0]:
@@ -189,6 +204,8 @@ class _TextExtractor(HTMLParser):
         if tag in _SKIP_TAGS:
             self.skip_depth += 1
             return
+        if tag == "img" and self.images and not self.skip_depth:
+            self._image(attrs)
         if tag not in _BLOCK_TAGS and _BADGE_CLASS_RE.search(dict(attrs).get("class") or ""):
             self.badge = [tag, 1]
             return
@@ -200,6 +217,8 @@ class _TextExtractor(HTMLParser):
 
     def handle_startendtag(self, tag, attrs):
         if not self.badge and tag not in _SKIP_TAGS:
+            if tag == "img" and self.images and not self.skip_depth:
+                self._image(attrs)
             self._boundary(tag)
 
     def handle_endtag(self, tag):
@@ -230,9 +249,12 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
 
-def html_to_text(page_html):
-    """Видимый текст страницы: блоки — отдельные строки."""
-    extractor = _TextExtractor()
+def html_to_text(page_html, images=False):
+    """Видимый текст страницы: блоки — отдельные строки.
+
+    images=True — ещё и строки-метки картинок (для карточек предметов).
+    """
+    extractor = _TextExtractor(images)
     extractor.feed(page_html)
     extractor.close()
     text = "".join(extractor.parts).replace(_ANCHOR, _INLINE)
@@ -288,6 +310,19 @@ def _is_name_like(text):
     return 2 <= len(text) <= 80 and bool(re.search(r"[A-Za-z]", text))
 
 
+def _pick_image(images, name):
+    """Картинка карточки: с подписью-названием, иначе последняя перед названием
+    (значки вроде стрелки стабильности — у предыдущей карточки и отсеиваются)."""
+    key = name_key(name)
+    for url, alt in reversed(images):
+        if alt and name_key(alt) == key:
+            return url
+    for url, _ in reversed(images):
+        if not _ICON_RE.search(url):
+            return url
+    return None
+
+
 def _pick_name(candidates, known_keys):
     if known_keys:
         for candidate in reversed(candidates):
@@ -339,6 +374,8 @@ def parse_cards(text, known_names=()):
     candidates = []
     name_before_contains = None
     contains_first = None  # на странице наборов "Contains" идёт до "Value"?
+    contains = None   # состав набора, пока карточка ещё не создана (или собирается по строкам)
+    images = []       # картинки после предыдущей карточки: (адрес, подпись)
     pending = None    # метка, значение которой ожидается на следующей строке
     tentative = None  # (метка, текст): значение поля или название следующей карточки
 
@@ -352,6 +389,10 @@ def parse_cards(text, known_names=()):
             tentative = None
 
     for raw_line in text.splitlines():
+        if raw_line.startswith(IMAGE_MARK):
+            url, _, alt = raw_line[len(IMAGE_MARK):].partition(_IMAGE_SEP)
+            images.append((url.strip(), alt.strip()))
+            continue
         if raw_line.strip(" ") == SECTION_BREAK:
             # Начался другой раздел страницы (подвал, меню): дальше не поля карточки.
             commit_tentative()
@@ -365,6 +406,9 @@ def parse_cards(text, known_names=()):
         for index, (key, value) in enumerate(segments):
             if key is None:
                 commit_tentative()
+                if contains is not None and contains_first and pending is None and _is_name_like(value):
+                    contains.append(clean_name(value))  # состав набора по строкам: до "Value"
+                    continue
                 if pending and not clean_name(value):
                     pending = None  # служебная надпись ("Inv. Controls") — не значение поля
                     continue
@@ -402,14 +446,25 @@ def parse_cards(text, known_names=()):
                 card = {"name": name} if name else None
                 if card:
                     cards.append(card)
+                    image = _pick_image(images, name)
+                    if image:
+                        card["image"] = image
+                    if contains:
+                        card["contains"] = ", ".join(contains)
                 else:
                     orphans += 1
                 candidates = []
+                images = []
+                contains = None
                 name_before_contains = None
             elif key == "contains" and contains_first and name_before_contains is None:
                 name_before_contains = _pick_name(candidates, known_keys)
 
             if key == "contains":
+                if contains_first:
+                    contains = [value] if value else []
+                elif value:
+                    _set_field(card, "contains", value)  # "Value … Contains - …": поле этой карточки
                 continue
             next_name = None
             if index + 1 < len(segments) and segments[index + 1][0] == "value":
@@ -436,6 +491,8 @@ _POPUP_FIELDS = {
     "change": ("change", "changeinvalue", "lastchange"),
     "origin": ("origin",),
     "aliases": ("aliases", "alias"),
+    "contains": ("contains", "items", "setitems"),
+    "image": ("image", "img", "imageurl", "imagesrc", "icon", "thumbnail", "picture"),
 }
 
 
@@ -490,8 +547,14 @@ def is_secret(value):
 
 
 def make_item(name, category, fields):
-    value_text = fields.get("value") or ""
+    value_text = (fields.get("value") or "").strip()
     range_text = fields.get("range") or ""
+    # Сайт пишет диапазон в той же строке: "38,750 [38,750 - 39,000]" или "98,000 [N/A]".
+    inline = re.match(r"^(.*?\S)\s*\[([^\]]*)\]\s*$", value_text)
+    if inline and parse_number(inline.group(1)) is not None:
+        value_text = inline.group(1).strip()
+        if not range_text:
+            range_text = inline.group(2)
     if range_text.strip("[] ").lower() in ("n/a", "na", "none", ""):
         range_text = ""
     range_text = range_text.strip().strip("[]").strip()
@@ -509,7 +572,17 @@ def make_item(name, category, fields):
         "change": fields.get("change") or "",
         "origin": fields.get("origin") or "",
         "aliases": fields.get("aliases") or "",
+        "contains": fields.get("contains") or "",
+        "image": _image_url(fields.get("image")),
     }
+
+
+def _image_url(value):
+    """Адрес картинки, если поле похоже на адрес (а не на служебный ключ)."""
+    text = str(value or "").strip()
+    if re.match(r"^(https?:)?//", text) or (("/" in text) and re.search(r"\.(png|jpe?g|webp|gif)(\?|$)", text, re.I)):
+        return text
+    return ""
 
 
 def _dedupe(items):
@@ -570,13 +643,20 @@ def find_last_updated(text):
     return None
 
 
-def parse_category_page(page_html, category):
+def parse_category_page(page_html, category, base_url=None):
     """HTML страницы категории -> (предметы, дата обновления на сайте,
-    сколько меток Value остались без названия)."""
-    text = html_to_text(page_html)
+    сколько меток Value остались без названия).
+
+    base_url — адрес страницы, чтобы относительные адреса картинок стали полными.
+    """
+    text = html_to_text(page_html, images=True)
     popup = parse_popup(page_html)
     items, orphans = parse_items(text, category, popup)
     if not items and popup:
         items = _dedupe([make_item(name, category, fields) for name, fields in popup.items()])
         orphans = 0
+    if base_url:
+        for item in items:
+            if item["image"]:
+                item["image"] = urljoin(base_url, item["image"])
     return items, find_last_updated(text), orphans

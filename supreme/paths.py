@@ -1,6 +1,7 @@
 """Пути программы: и при запуске из исходников, и внутри MM2Values.exe."""
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -29,9 +30,30 @@ def _writable(folder):
     return True
 
 
+def _user_data_dir():
+    if os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "MM2Values" / "data"
+    return Path.home() / ".mm2values" / "data"
+
+
 def data_dir():
-    """Папка с ценами: data рядом с программой, а если туда нельзя писать —
-    %LOCALAPPDATA%\\MM2Values\\data (или ~/.mm2values/data)."""
+    """Папка с ценами.
+
+    В MM2Values.exe — системная папка пользователя (%LOCALAPPDATA%\\MM2Values\\data),
+    чтобы рядом с exe не появлялось никаких папок. Папка data от прошлых версий
+    (рядом с exe) переносится туда. Из исходников — data рядом с mm2_values.py.
+    """
+    if FROZEN:
+        target = _user_data_dir()
+        old = app_dir() / "data"
+        if old.is_dir() and not target.exists():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old), str(target))
+            except OSError:
+                return old  # не получилось перенести — работаем со старой папкой
+        if _writable(target):
+            return target
     preferred = app_dir() / "data"
     if _writable(preferred):
         return preferred

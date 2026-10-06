@@ -377,8 +377,10 @@ class StarPetsAdapter(Adapter):
         slug = re.sub(r"[^a-z0-9]+", "-", str(row.get("name") or "").lower().replace("'", "")).strip("-")
         url = f"https://starpets.gg/mm2/shop/{kind}/{slug}/{product_id}" if product_id else self.config["url"]
         subtype = str(row.get("subtype") or "").lower()
+        image = row.get("imageUri")
         return {
             "name": name,
+            "image": image if isinstance(image, str) and image.startswith("https://") else None,
             "kind": "pet" if kind == "pet" else subtype,
             "price": price,
             "currency": "USD",
@@ -969,6 +971,11 @@ class MarketMonitor:
                 infos[config["id"]] = info
             item["market"] = infos
             item["combined"] = combine(item, list(infos.values()))
+            if not item.get("image"):  # картинка с площадки, если на сайте её не нашлось
+                item["image_market"] = next(
+                    (offers.get(key, {}).get("image") for _, offers, _ in snapshot if offers.get(key, {}).get("image")),
+                    None,
+                )
         return items
 
 

@@ -323,3 +323,108 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
   .categories li button { width: auto; border-color: var(--line); }
   .columns { grid-template-columns: 1fr; }
 }
+
+/* --- карточки предметов ------------------------------------------------------- */
+
+.segmented.compact button { padding: 5px 12px; }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+.card {
+  --cat: var(--accent);
+  position: relative;
+  display: flex;
+  gap: 14px;
+  padding: 12px;
+  border-radius: 14px;
+  background: linear-gradient(160deg, color-mix(in srgb, var(--cat) 10%, var(--panel-2)), var(--panel-2) 55%);
+  border: 1px solid color-mix(in srgb, var(--cat) 35%, var(--line));
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+  min-width: 0;
+}
+.card:hover, .card:focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--cat) 22%, transparent);
+  border-color: var(--cat);
+  outline: none;
+}
+.card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.card.cat-chromas {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(160deg, var(--panel-2), var(--panel-2)) padding-box,
+    linear-gradient(120deg, #ff6b6b, #ffd93d, #6bcb77, #4d96ff, #b06bff) border-box;
+}
+.cat-ancients { --cat: #e8b84a; }
+.cat-godlies { --cat: #ff5f8f; }
+.cat-chromas { --cat: #b06bff; }
+.cat-uniques { --cat: #c58bff; }
+.cat-evos { --cat: #3ad0e6; }
+.cat-vintages { --cat: #e88a4a; }
+.cat-legendaries { --cat: #ff5a5a; }
+.cat-rares { --cat: #5b8cff; }
+.cat-uncommons { --cat: #4fcf86; }
+.cat-commons { --cat: #9aa3b5; }
+.cat-pets { --cat: #2fc4b2; }
+.cat-sets { --cat: #8f7bff; }
+.cat-misc { --cat: #b5a17a; }
+.cat-untradables { --cat: #6b7385; }
+
+.art {
+  width: 96px;
+  height: 96px;
+  flex-shrink: 0;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle at 50% 40%, color-mix(in srgb, var(--cat, var(--accent)) 30%, transparent), transparent 70%), var(--panel-3);
+  overflow: hidden;
+}
+.art img { width: 88%; height: 88%; object-fit: contain; filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.35)); }
+.art.large { width: 140px; height: 140px; margin-bottom: 10px; }
+.mono {
+  font-weight: 800;
+  font-size: 26px;
+  letter-spacing: 1px;
+  color: #fff;
+  width: 64%;
+  height: 64%;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--cat, var(--accent)), color-mix(in srgb, var(--cat, var(--accent)) 45%, #000));
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+.info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
+.title-row h3 { font-size: 16px; line-height: 1.25; overflow-wrap: anywhere; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.tag {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--cat);
+}
+.tags .badge { margin-left: 0; }
+.contains { margin: 0; font-size: 12px; color: var(--muted); font-style: italic; overflow-wrap: anywhere; }
+.value-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; }
+.value-row .value { font-size: 22px; font-weight: 800; color: var(--accent-2); font-variant-numeric: tabular-nums; }
+.value-row .value.text { font-size: 15px; color: var(--text); }
+.value-row .value.muted { color: var(--muted); }
+.value-row .range { font-size: 12px; color: var(--muted); }
+.stats { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px; color: var(--muted); }
+.stats b { color: var(--text); }
+.foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; font-size: 12px; }
+.change.up { color: var(--good); }
+.change.down { color: var(--bad); }
+.more-row { display: flex; justify-content: center; margin-top: 14px; }
+.empty-cards { color: var(--muted); text-align: center; padding: 30px; grid-column: 1 / -1; }
+
+@media (max-width: 520px) {
+  .cards { grid-template-columns: 1fr; }
+  .art { width: 76px; height: 76px; }
+}
