@@ -73,6 +73,7 @@ def _clean_item(item):
     """Привести предмет к ожидаемым типам (файл мог быть изменён вручную)."""
     item = dict(item)
     item["value"] = _number_or_none(item.get("value"))
+    item["secret"] = parser.is_secret(item["value"])
     for key in ("demand", "rarity"):
         item[key] = item[key] if isinstance(item.get(key), int) and not isinstance(item.get(key), bool) else None
     for key in ("value_text", "range_text", "stability", "change", "origin", "aliases"):

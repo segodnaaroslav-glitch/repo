@@ -5,7 +5,7 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import liquidity, parser, paths, store
+from . import autosync, liquidity, markets, parser, paths, store
 
 WEB_DIR = paths.resource_dir() / "web"
 STATIC_FILES = {
@@ -70,12 +70,14 @@ class UpdateJob:
             }
 
 
-def build_payload(data, load_error=None):
+def build_payload(data, load_error=None, monitor=None):
     items = []
     for item in data.get("items", []):
         item = dict(item)
         item["liquidity"] = liquidity.assess(item)
         items.append(item)
+    if monitor is not None:
+        monitor.annotate(items)
     counts = {}
     for item in items:
         counts[item["category"]] = counts.get(item["category"], 0) + 1
@@ -104,6 +106,7 @@ def build_payload(data, load_error=None):
             "medium_from": liquidity.MEDIUM_FROM,
             "stability": {name: bonus for name, (bonus, _) in liquidity.STABILITY.items()},
         },
+        "markets": monitor.status_list() if monitor is not None else [],
         "items": items,
     }
 
@@ -111,6 +114,8 @@ def build_payload(data, load_error=None):
 class Handler(BaseHTTPRequestHandler):
     server_version = "MM2Values"
     job = None  # UpdateJob, задаётся в make_server
+    sync = None  # AutoSync или None
+    monitor = None  # MarketMonitor или None
     data_path = None
 
     def log_message(self, format, *args):
@@ -157,6 +162,18 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status, message):
         self._json(status, {"error": message})
 
+    def _status(self):
+        status = self.job.status()
+        status["now"] = store.now_iso()
+        status["sync"] = self.sync.status() if self.sync else None
+        status["markets"] = self.monitor.status_list() if self.monitor else []
+        status["market_version"] = self.monitor.version if self.monitor else 0
+        try:
+            status["data_version"] = os.stat(self.data_path or store.DATA_FILE).st_mtime_ns
+        except OSError:
+            status["data_version"] = 0
+        return status
+
     # --- маршруты --------------------------------------------------------
 
     def do_GET(self):
@@ -168,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, (WEB_DIR / name).read_bytes(), content_type)
         if path == "/api/data":
             try:
-                payload = build_payload(store.load(self.data_path))
+                payload = build_payload(store.load(self.data_path), monitor=self.monitor)
             except PermissionError as error:
                 payload = build_payload(store.empty_data(), f"Файл с ценами сейчас занят ({error}). Обновите страницу.")
             except Exception as error:
@@ -179,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             return self._json(200, payload)
         if path == "/api/status":
-            return self._json(200, self.job.status())
+            return self._json(200, self._status())
         return self._error(404, "Не найдено")
 
     def do_POST(self):
@@ -203,7 +220,17 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/update":
             started = self.job.start()
-            return self._json(202, {"started": started, **self.job.status()})
+            return self._json(202, {"started": started, **self._status()})
+        if path == "/api/markets/poll":
+            if self.monitor is None:
+                return self._error(409, "Площадки выключены")
+            self.monitor.poll_now()
+            return self._json(202, self._status())
+        if path == "/api/check":
+            if self.sync is None:
+                return self._error(409, "Автообновление выключено")
+            self.sync.check_now()
+            return self._json(202, self._status())
         if path == "/api/import":
             text = body.get("text")
             category = body.get("category")
@@ -221,10 +248,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "Не найдено")
 
 
-def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=20):
-    """Создать сервер; если порт занят — взять следующий свободный."""
+def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=20, auto_sync=False,
+                check_site=None, monitor=None):
+    """Создать сервер; если порт занят — взять следующий свободный.
+
+    auto_sync=True — следить за сайтом и обновлять цены автоматически
+    (поток запускается методом server.sync.start()).
+    """
     job = UpdateJob(update or (lambda log: store.update_from_site(log=log, path=data_path)))
-    handler = type("BoundHandler", (Handler,), {"job": job, "data_path": data_path})
+    sync = None
+    if auto_sync:
+        sync = autosync.AutoSync(job, data_path, **({"check_site": check_site} if check_site else {}))
+    handler = type(
+        "BoundHandler", (Handler,), {"job": job, "sync": sync, "monitor": monitor, "data_path": data_path}
+    )
     server_class = _ExclusiveServer if os.name == "nt" else ThreadingHTTPServer
     last_error = None
     for offset in range(tries):
@@ -237,5 +274,7 @@ def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=
             continue
         server.daemon_threads = True
         server.job = job
+        server.sync = sync
+        server.monitor = monitor
         return server
     raise OSError(f"Не удалось занять порт для программы: {last_error}")

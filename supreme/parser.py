@@ -480,16 +480,27 @@ def parse_popup(page_html):
 
 # --- предметы ---------------------------------------------------------------
 
+# Секретные предметы (Batwing Godly, Black Luger…) сайт показывает с условным
+# значением 1,000,000: по нему никто не торгует, это не настоящая цена.
+SECRET_VALUE = 1_000_000
+
+
+def is_secret(value):
+    return isinstance(value, (int, float)) and value >= SECRET_VALUE
+
+
 def make_item(name, category, fields):
     value_text = fields.get("value") or ""
     range_text = fields.get("range") or ""
     if range_text.strip("[] ").lower() in ("n/a", "na", "none", ""):
         range_text = ""
     range_text = range_text.strip().strip("[]").strip()
+    value = program_value(value_text, range_text)
     return {
         "name": clean_name(name),
         "category": category,
-        "value": program_value(value_text, range_text),
+        "value": value,
+        "secret": is_secret(value),
         "value_text": value_text,
         "range_text": range_text,
         "demand": _to_int(fields["demand"]) if fields.get("demand") else None,

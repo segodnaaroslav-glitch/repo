@@ -384,3 +384,24 @@ class SecondReviewCliTests(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class AutoSyncServerTests(unittest.TestCase):
+    def test_status_has_sync_and_check_endpoint(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        httpd = server.make_server(port=0, data_path=Path(tmp.name) / "v.json", update=lambda log: None,
+                                   auto_sync=True, check_site=lambda: None)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        port = httpd.server_address[1]
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/status", headers={"Host": f"127.0.0.1:{port}"})
+        status = json.loads(connection.getresponse().read())
+        self.assertIn("next_check_at", status["sync"])
+        self.assertIn("data_version", status)
+        connection.request("POST", "/api/check", body=b"{}",
+                           headers={"Host": f"127.0.0.1:{port}", "Content-Type": "application/json"})
+        self.assertEqual(connection.getresponse().status, 202)
+        connection.close()

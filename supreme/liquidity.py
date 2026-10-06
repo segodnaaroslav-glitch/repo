@@ -14,6 +14,7 @@ LIQUID = "liquid"
 MEDIUM = "medium"
 ILLIQUID = "illiquid"
 UNTRADABLE = "untradable"
+SECRET = "secret"
 
 LIQUID_FROM = 60
 MEDIUM_FROM = 30
@@ -49,6 +50,12 @@ def assess(item):
     """{"score": 0–100, "level": ..., "reasons": [...]} для одного предмета."""
     if item.get("category") == "untradables":
         return {"score": 0, "level": UNTRADABLE, "reasons": ["предмет нельзя обменять"]}
+    if item.get("secret"):
+        return {
+            "score": 0,
+            "level": SECRET,
+            "reasons": ["секретный предмет: на сайте условное значение 1,000,000, по нему не торгуют"],
+        }
 
     reasons = []
     demand = item.get("demand")

@@ -15,7 +15,7 @@ import threading
 import urllib.request
 import webbrowser
 
-from supreme import parser, paths, server, store
+from supreme import markets, parser, paths, server, store
 
 
 def running_instance(port, tries=20):
@@ -42,10 +42,15 @@ def cmd_run(args):
         if not args.no_browser:
             webbrowser.open(existing)
         return
-    httpd = server.make_server(port=args.port)
+    monitor = None if args.no_markets else markets.MarketMonitor()
+    httpd = server.make_server(port=args.port, auto_sync=not (args.no_update or args.no_auto), monitor=monitor)
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     if not args.no_update and not store.DATA_FILE.exists():
         httpd.job.start()  # первый запуск: сразу скачать цены
+    if httpd.sync:
+        httpd.sync.start()  # следить за сайтом и подтягивать новые цены
+    if monitor:
+        monitor.start()  # опрашивать торговые площадки
     print(f"Программа открыта: {url}")
     print(f"Цены хранятся в: {store.DATA_FILE}")
     print("Чтобы закрыть программу, закройте это окно или нажмите Ctrl+C.")
@@ -142,7 +147,9 @@ def main(argv=None):
     arg_parser = argparse.ArgumentParser(description="Цены MM2 по сайту Supreme Values")
     arg_parser.add_argument("--port", type=int, default=8765, help="порт программы (по умолчанию 8765)")
     arg_parser.add_argument("--no-browser", action="store_true", help="не открывать браузер")
-    arg_parser.add_argument("--no-update", action="store_true", help="не скачивать цены при первом запуске")
+    arg_parser.add_argument("--no-update", action="store_true", help="не скачивать цены при запуске и не следить за сайтом")
+    arg_parser.add_argument("--no-auto", action="store_true", help="не проверять сайт автоматически")
+    arg_parser.add_argument("--no-markets", action="store_true", help="не опрашивать торговые площадки")
     commands = arg_parser.add_subparsers(dest="command")
     commands.add_parser("update", help="обновить цены с сайта")
     find = commands.add_parser("find", help="найти предмет")
