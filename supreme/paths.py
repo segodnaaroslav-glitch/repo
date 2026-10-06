@@ -36,27 +36,82 @@ def _user_data_dir():
     return Path.home() / ".mm2values" / "data"
 
 
+# Файлы программы в папке с ценами (переносятся из папки data прошлых версий).
+# values.json переносится последним: его появление в новой папке значит, что перенос закончен.
+_OWNED_FILES = ("markets-state.json", "markets.json", "rate.json")
+_OWNED_DIRS = ("debug",)
+
+
+def _old_data_dir():
+    return app_dir() / "data"
+
+
+def _migration_pending(old, target):
+    return (old / "values.json").is_file() and not (target / "values.json").exists()
+
+
 def data_dir():
-    """Папка с ценами.
+    """Папка с ценами (без побочных действий: ничего не создаёт и не переносит).
 
     В MM2Values.exe — системная папка пользователя (%LOCALAPPDATA%\\MM2Values\\data),
-    чтобы рядом с exe не появлялось никаких папок. Папка data от прошлых версий
-    (рядом с exe) переносится туда. Из исходников — data рядом с mm2_values.py.
+    чтобы рядом с exe не появлялось никаких папок; пока цены прошлой версии
+    (data рядом с exe) не перенесены — та папка. Из исходников — data рядом
+    с mm2_values.py.
     """
     if FROZEN:
         target = _user_data_dir()
-        old = app_dir() / "data"
-        if old.is_dir() and not target.exists():
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(old), str(target))
-            except OSError:
-                return old  # не получилось перенести — работаем со старой папкой
-        if _writable(target):
-            return target
+        old = _old_data_dir()
+        return old if _migration_pending(old, target) else target
     preferred = app_dir() / "data"
     if _writable(preferred):
         return preferred
-    if os.environ.get("LOCALAPPDATA"):
-        return Path(os.environ["LOCALAPPDATA"]) / "MM2Values" / "data"
-    return Path.home() / ".mm2values" / "data"
+    return _user_data_dir()
+
+
+def _copy_file(src, dst):
+    part = dst.with_name(dst.name + ".part")
+    shutil.copy2(str(src), str(part))
+    os.replace(str(part), str(dst))
+
+
+def migrate_old_data():
+    """Перенести цены прошлой версии из папки data рядом с exe в папку пользователя.
+
+    Переносятся только файлы программы (чужие файлы и сама папка остаются на месте).
+    Сначала всё копируется, и только потом старые файлы удаляются; если копирование
+    не удалось, программа работает со старой папкой и повторит перенос при следующем
+    запуске. Возвращает папку, с которой работать.
+    """
+    if not FROZEN:
+        return data_dir()
+    target = _user_data_dir()
+    old = _old_data_dir()
+    if not _migration_pending(old, target):
+        return data_dir()
+    names = [name for name in _OWNED_FILES if (old / name).is_file()]
+    names += sorted(path.name for path in old.glob("values.broken-*.json") if path.is_file())
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            _copy_file(old / name, target / name)
+        for name in _OWNED_DIRS:
+            if (old / name).is_dir():
+                try:  # отладочные страницы не важны — их ошибка перенос не останавливает
+                    shutil.copytree(str(old / name), str(target / name), dirs_exist_ok=True)
+                except (OSError, shutil.Error):
+                    pass
+        _copy_file(old / "values.json", target / "values.json")
+    except OSError:
+        return old
+    for name in names + ["values.json"]:
+        try:
+            (old / name).unlink()
+        except OSError:
+            pass
+    for name in _OWNED_DIRS:
+        shutil.rmtree(str(old / name), ignore_errors=True)
+    try:
+        old.rmdir()  # только если в ней больше ничего нет
+    except OSError:
+        pass
+    return target

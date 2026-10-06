@@ -13,6 +13,13 @@ from . import fetcher, parser, paths
 DATA_DIR = paths.data_dir()
 DATA_FILE = DATA_DIR / "values.json"
 
+
+def use_data_dir(folder):
+    """Работать с ценами в другой папке (после переноса цен прошлой версии)."""
+    global DATA_DIR, DATA_FILE
+    DATA_DIR = Path(folder)
+    DATA_FILE = DATA_DIR / "values.json"
+
 # Защита от испорченной загрузки: если в категории стало намного меньше предметов,
 # чем было, или много карточек без названия — старые цены не трогаем.
 MIN_KEEP_SHARE = 0.5

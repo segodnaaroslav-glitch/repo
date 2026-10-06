@@ -31,6 +31,9 @@ jobs:
         shell: pwsh
         run: |
           $exe = Resolve-Path dist\MM2Values.exe
+          # Чужая папка data рядом с exe (не от программы) должна остаться нетронутой.
+          New-Item -ItemType Directory -Force dist\data | Out-Null
+          Set-Content -Path dist\data\keep.txt -Value "not ours"
           $proc = Start-Process -FilePath $exe -ArgumentList "--no-browser", "--no-update", "--port", "8799" -PassThru
           try {
             $ok = $false
@@ -39,20 +42,42 @@ jobs:
               try { $data = Invoke-RestMethod http://127.0.0.1:8799/api/data; $ok = $true; break } catch { }
             }
             if (-not $ok) { throw "exe did not start" }
-            if ($data.categories.Count -ne 14) { throw "unexpected categories: $($data.categories.Count)" }
+            if ($data.categories.Count -ne 12) { throw "unexpected categories: $($data.categories.Count)" }
             $page = Invoke-WebRequest http://127.0.0.1:8799/ -UseBasicParsing
             if ($page.Content -notmatch "MM2 Values") { throw "index.html not served" }
             $js = Invoke-WebRequest http://127.0.0.1:8799/app.js -UseBasicParsing
             if ($js.StatusCode -ne 200) { throw "app.js not served" }
-            if (Test-Path dist\data) { throw "exe must not create a data folder next to itself" }
-            if (-not (Test-Path "$env:LOCALAPPDATA\MM2Values\data")) { throw "data folder not created in LOCALAPPDATA" }
             Set-Content -Path sample.txt -Encoding utf8 -Value "Smoke Knife`nValue - 1,330`nRange - [1,320 - 1,340]`nDemand - 6"
             & $exe import sample.txt --category godlies
             if ($LASTEXITCODE -ne 0) { throw "exe import failed" }
+            if (-not (Test-Path "$env:LOCALAPPDATA\MM2Values\data\values.json")) { throw "prices not saved in LOCALAPPDATA" }
+            $left = @(Get-ChildItem dist\data -Recurse | ForEach-Object Name)
+            if ($left.Count -ne 1 -or $left[0] -ne "keep.txt") { throw "exe touched a foreign data folder: $left" }
             $found = & $exe find smoke | Out-String
             if ($LASTEXITCODE -ne 0 -or $found -notmatch "Smoke Knife .*: 1320") { throw "exe find failed: $found" }
             $data = Invoke-RestMethod http://127.0.0.1:8799/api/data
             if ($data.items[0].value -ne 1320) { throw "server did not see imported price" }
+            $calc = Invoke-RestMethod -Method Post -ContentType "application/json" -Body '{"text":"Smoke Knife x2"}' http://127.0.0.1:8799/api/calc
+            if ($calc.items.Count -ne 1 -or $calc.items[0].qty -ne 2) { throw "calculator failed: $($calc | ConvertTo-Json -Depth 5)" }
+            # Скриншот: распознавание текста внутри exe (Windows.Media.Ocr через PowerShell).
+            Add-Type -AssemblyName System.Drawing
+            $png = Join-Path $env:RUNNER_TEMP "calc.png"
+            $bmp = New-Object System.Drawing.Bitmap 900, 200
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::White)
+            $g.DrawString("Smoke Knife", (New-Object System.Drawing.Font("Arial", 40)), [System.Drawing.Brushes]::Black, 20, 40)
+            $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($png))
+            $body = @{ text = ""; images = @("data:image/png;base64,$b64") } | ConvertTo-Json
+            try {
+              $shot = Invoke-RestMethod -Method Post -ContentType "application/json" -Body $body http://127.0.0.1:8799/api/calc
+              if ($shot.items.Count -ne 1 -or $shot.items[0].name -ne "Smoke Knife") { throw "screenshot not recognized: $($shot | ConvertTo-Json -Depth 5)" }
+              Write-Host "Screenshot OCR passed"
+            } catch {
+              $detail = $_.ErrorDetails.Message
+              if ($detail -match "язык распознавания") { Write-Host "::warning::no OCR language on runner: $detail" } else { throw "screenshot calc failed: $($_.Exception.Message) $detail" }
+            }
             Write-Host "Smoke test passed"
             $global:LASTEXITCODE = 0
           } finally {

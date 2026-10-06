@@ -129,17 +129,62 @@ class StatusBlockTests(unittest.TestCase):
 
 
 class FrozenPathTests(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.exe_dir = Path(tmp.name) / "Загрузки"
+        self.old = self.exe_dir / "data"
+        self.local = Path(tmp.name) / "Local"
+        self.target = self.local / "MM2Values" / "data"
+        for patch in (mock.patch.object(paths, "FROZEN", True),
+                      mock.patch.object(paths.sys, "executable", str(self.exe_dir / "MM2Values.exe")),
+                      mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.local)})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def make_old(self, files):
+        for name, text in files.items():
+            path = self.old / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+
     def test_exe_keeps_data_in_localappdata_and_moves_old_folder(self):
-        with TemporaryDirectory() as tmp:
-            exe_dir = Path(tmp) / "Загрузки"
-            old = exe_dir / "data"
-            old.mkdir(parents=True)
-            (old / "values.json").write_text("{}", encoding="utf-8")
-            local = Path(tmp) / "Local"
-            with mock.patch.object(paths, "FROZEN", True), \
-                    mock.patch.object(paths.sys, "executable", str(exe_dir / "MM2Values.exe")), \
-                    mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local)}):
-                folder = paths.data_dir()
-            self.assertEqual(folder, local / "MM2Values" / "data")
-            self.assertTrue((folder / "values.json").exists())
-            self.assertFalse(old.exists())  # рядом с exe папки больше нет
+        self.make_old({"values.json": "{}", "markets-state.json": "[]", "debug/godlies.html": "x"})
+        self.assertEqual(paths.data_dir(), self.old)  # до переноса читаются старые цены
+        self.assertFalse(self.local.exists())          # и ничего не создаётся
+        folder = paths.migrate_old_data()
+        self.assertEqual(folder, self.target)
+        self.assertEqual(paths.data_dir(), self.target)
+        self.assertEqual((folder / "values.json").read_text(encoding="utf-8"), "{}")
+        self.assertTrue((folder / "markets-state.json").exists())
+        self.assertTrue((folder / "debug" / "godlies.html").exists())
+        self.assertFalse(self.old.exists())  # рядом с exe папки больше нет
+
+    def test_foreign_data_folder_is_left_alone(self):
+        self.make_old({"thesis.docx": "my work", "photos/cat.jpg": "meow"})
+        self.assertEqual(paths.migrate_old_data(), self.target)
+        self.assertTrue((self.old / "thesis.docx").exists())
+        self.assertTrue((self.old / "photos" / "cat.jpg").exists())
+
+    def test_only_program_files_are_moved(self):
+        self.make_old({"values.json": "{}", "notes.txt": "mine"})
+        paths.migrate_old_data()
+        self.assertTrue((self.target / "values.json").exists())
+        self.assertFalse((self.target / "notes.txt").exists())
+        self.assertEqual((self.old / "notes.txt").read_text(encoding="utf-8"), "mine")
+        self.assertFalse((self.old / "values.json").exists())
+
+    def test_existing_empty_target_does_not_block_migration(self):
+        self.make_old({"values.json": "{}"})
+        self.target.mkdir(parents=True)
+        self.assertEqual(paths.migrate_old_data(), self.target)
+        self.assertTrue((self.target / "values.json").exists())
+
+    def test_failed_copy_keeps_old_folder_and_retries_later(self):
+        self.make_old({"values.json": "{}", "markets.json": "[]"})
+        with mock.patch.object(paths.shutil, "copy2", side_effect=OSError("disk full")):
+            self.assertEqual(paths.migrate_old_data(), self.old)
+        self.assertTrue((self.old / "values.json").exists())
+        self.assertFalse((self.target / "values.json").exists())
+        self.assertEqual(paths.data_dir(), self.old)  # следующий запуск — снова старая папка
+        self.assertEqual(paths.migrate_old_data(), self.target)

@@ -15,6 +15,8 @@
   --none: #7a8295;
   --radius: 12px;
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --sp: #f5b942;
+  --dp: #6fd3ff;
 }
 
 @media (prefers-color-scheme: light) {
@@ -33,6 +35,8 @@
     --bad: #c93a47;
     --none: #6c7486;
     --shadow: 0 10px 30px rgba(20, 30, 60, 0.15);
+    --sp: #9a6400;
+    --dp: #0a74a0;
   }
 }
 
@@ -446,8 +450,8 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
 .card-prices { display: grid; gap: 2px; font-size: 12px; padding: 6px 0 2px; border-top: 1px dashed var(--line); }
 .mp { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; }
 .mp-name { min-width: 72px; font-weight: 700; }
-.mp.starpets .mp-name, th.sp { color: #f5b942; }
-.mp.dreampets .mp-name, th.dp { color: #6fd3ff; }
+.mp.starpets .mp-name, th.sp { color: var(--sp); }
+.mp.dreampets .mp-name, th.dp { color: var(--dp); }
 
 /* --- окно предмета ------------------------------------------------------------ */
 
@@ -467,11 +471,11 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
   display: grid;
   gap: 8px;
 }
-.tile.starpets { border-left: 4px solid #f5b942; }
-.tile.dreampets { border-left: 4px solid #6fd3ff; }
+.tile.starpets { border-left: 4px solid var(--sp); }
+.tile.dreampets { border-left: 4px solid var(--dp); }
 .tile-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.tile.starpets .tile-name { color: #f5b942; }
-.tile.dreampets .tile-name { color: #6fd3ff; }
+.tile.starpets .tile-name { color: var(--sp); }
+.tile.dreampets .tile-name { color: var(--dp); }
 .tile-price { font-size: 20px; }
 .tile-payout { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; font-size: 13px; }
 .mstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 6px; }
@@ -526,8 +530,8 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
   flex-direction: column;
   gap: 4px;
 }
-.total.starpets { border-left: 4px solid #f5b942; }
-.total.dreampets { border-left: 4px solid #6fd3ff; }
+.total.starpets { border-left: 4px solid var(--sp); }
+.total.dreampets { border-left: 4px solid var(--dp); }
 .total-sum { font-size: 24px; }
 .totals .hint { flex-basis: 100%; margin: 0; }
 input.qty { width: 72px; text-align: right; }
@@ -535,4 +539,9 @@ input.qty { width: 72px; text-align: right; }
 @media (max-width: 760px) {
   .calc-input { grid-template-columns: 1fr; }
   .rate { min-width: 0; }
+}
+
+/* Светлая тема: цвет категории на светлом фоне читается плохо — темнее. */
+@media (prefers-color-scheme: light) {
+  .tag { color: color-mix(in srgb, var(--cat) 55%, var(--text)); }
 }

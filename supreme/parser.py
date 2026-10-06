@@ -186,11 +186,18 @@ class _TextExtractor(HTMLParser):
 
     def _image(self, attrs):
         """Картинка предмета — отдельной строкой-меткой (только для разбора карточек)."""
-        values = dict(attrs)
-        url = next((values.get(k) for k in ("data-src", "data-lazy-src", "data-original", "src") if values.get(k)), "")
-        if not url and values.get("srcset"):
-            url = values["srcset"].split(",")[0].strip().split(" ")[0]
-        if url and not url.startswith("data:"):
+        values = {k: (v or "").strip() for k, v in attrs}
+
+        def first_src(srcset):
+            return srcset.split(",")[0].strip().split(" ")[0] if srcset else ""
+
+        # Сначала адреса ленивой загрузки (в src у них часто заглушка), затем src
+        # (если это не встроенная data:-картинка), затем srcset.
+        candidates = [values.get(k) for k in ("data-src", "data-lazy-src", "data-original")]
+        candidates += [first_src(values.get(k)) for k in ("data-srcset", "data-lazy-srcset")]
+        candidates += [values.get("src"), first_src(values.get("srcset"))]
+        url = next((u for u in candidates if u and not u.startswith("data:")), "")
+        if url:
             alt = re.sub(r"\s+", " ", values.get("alt") or "").strip()
             self.parts.append(f"\n{IMAGE_MARK}{url.strip()}{_IMAGE_SEP}{alt}\n")
 
@@ -308,16 +315,23 @@ def _is_name_like(text):
     return 2 <= len(text) <= 80 and bool(re.search(r"[A-Za-z]", text))
 
 
+def _is_icon(url):
+    path = url.split("?")[0].split("#")[0].rstrip("/")
+    return bool(_ICON_RE.search(path.rsplit("/", 1)[-1]))
+
+
 def _pick_image(images, name):
-    """Картинка карточки: с подписью-названием, иначе последняя перед названием
-    (значки вроде стрелки стабильности — у предыдущей карточки и отсеиваются)."""
+    """Картинка карточки: с подписью-названием, иначе последняя перед названием,
+    кроме значков и картинок, подписанных другим названием (стрелка "Stable",
+    картинка соседнего предмета)."""
     key = name_key(name)
     for url, alt in reversed(images):
         if alt and name_key(alt) == key:
             return url
-    for url, _ in reversed(images):
-        if not _ICON_RE.search(url):
-            return url
+    for url, alt in reversed(images):
+        if _is_icon(url) or (alt and _is_name_like(alt)):
+            continue
+        return url
     return None
 
 
@@ -342,7 +356,8 @@ def _set_field(card, key, text):
 
 
 _SPLIT_NUMERIC_RE = re.compile(
-    rf"^([\[(]?\s*[~≈*+]*{_NUMBER}(?:\s*(?:[-–—]|to)\s*[~≈*+]*{_NUMBER})?\s*[\])]?\*?)\s+(\S.*)$", re.I
+    rf"^([\[(]?\s*[~≈*+]*{_NUMBER}(?:\s*(?:[-–—]|to)\s*[~≈*+]*{_NUMBER})?\s*[\])]?\*?"
+    r"(?:\s*\[[^\]]*\])?)\s+(\S.*)$", re.I
 )
 _SPLIT_STABILITY_RE = re.compile(r"^(" + "|".join(STABILITIES) + r")\s+(\S.*)$", re.I)
 
@@ -404,8 +419,9 @@ def parse_cards(text, known_names=()):
         for index, (key, value) in enumerate(segments):
             if key is None:
                 commit_tentative()
-                if contains is not None and contains_first and pending is None and _is_name_like(value):
-                    contains.append(clean_name(value))  # состав набора по строкам: до "Value"
+                if (contains is not None and contains_first and name_before_contains and pending is None
+                        and _is_name_like(value)):
+                    contains.append(clean_name(value).strip(",;"))  # состав набора по строкам: до "Value"
                     continue
                 if pending and not clean_name(value):
                     pending = None  # служебная надпись ("Inv. Controls") — не значение поля
@@ -426,7 +442,9 @@ def parse_cards(text, known_names=()):
                 continue
 
             if key == "contains" and contains_first is None:
-                contains_first = not cards
+                # Новое название после предыдущего Value — значит, "Contains" относится
+                # к следующей карточке (служебная "Your Inventory - Value 0" не мешает).
+                contains_first = not cards or (bool(candidates) and not tentative)
             if tentative and key == "value":
                 tentative = None  # это было название следующей карточки
             elif tentative and key == "contains":
@@ -460,10 +478,18 @@ def parse_cards(text, known_names=()):
 
             if key == "contains":
                 if contains_first:
-                    contains = [value] if value else []
+                    contains = [value.strip(" ,;")] if value.strip(" ,;") else []
                 elif value:
                     _set_field(card, "contains", value)  # "Value … Contains - …": поле этой карточки
                 continue
+            if key not in ("value", "contains") and card is not None and images:
+                # Картинки между полями карточки (стрелка стабильности и т. п.) — её, а не
+                # следующей: подходит только подписанная её названием.
+                if "image" not in card:
+                    own = next((u for u, a in images if a and name_key(a) == name_key(card["name"])), None)
+                    if own:
+                        card["image"] = own
+                images = []
             next_name = None
             if index + 1 < len(segments) and segments[index + 1][0] == "value":
                 # Несколько карточек в одной строке: "Value - 10 Beta Value - 20".
@@ -578,7 +604,9 @@ def make_item(name, category, fields):
 def _image_url(value):
     """Адрес картинки, если поле похоже на адрес (а не на служебный ключ)."""
     text = str(value or "").strip()
-    if re.match(r"^(https?:)?//", text) or (("/" in text) and re.search(r"\.(png|jpe?g|webp|gif)(\?|$)", text, re.I)):
+    if not text or re.search(r"\s", text) or text.lower().startswith(("data:", "javascript:")):
+        return ""
+    if re.match(r"^(https?:)?//", text) or "/" in text or re.search(r"\.(png|jpe?g|webp|gif|avif)(\?|#|$)", text, re.I):
         return text
     return ""
 
@@ -657,7 +685,8 @@ def parse_category_page(page_html, category, base_url=None):
         for item in items:
             if item["image"]:
                 item["image"] = urljoin(base_url, item["image"])
-    return items, find_last_updated(text), orphans
+    # Дата — по тексту без строк-меток картинок (значок часов рядом с датой).
+    return items, find_last_updated(html_to_text(page_html)), orphans
 
 
 def is_placeholder(item):

@@ -347,3 +347,64 @@ class CardDesignTests(unittest.TestCase):
 
     def test_images_do_not_leak_into_other_text_users(self):
         self.assertNotIn("img:", parser.html_to_text('<img src="/a/value-list.png"><p>Hi</p>'))
+
+
+class CardReviewRegressionTests(unittest.TestCase):
+    """Найдено при проверке карточек: дата, состав наборов, картинки, диапазон в строке."""
+
+    def test_icon_next_to_date_is_not_the_date(self):
+        page = ("<span>Values Last Updated</span><img src='/static/img/clock-16.png'>"
+                "<span>October 5th, 2026 at 12:49 PM</span>"
+                "<h3>Alpha</h3><div>Value - 10</div><div>Demand - 1</div>")
+        _, updated, _ = parser.parse_category_page(page, "godlies")
+        self.assertEqual(updated, "October 5th, 2026 at 12:49 PM")
+
+    def test_contains_after_junk_card(self):
+        page = ("<h4>Your Inventory</h4><div>Value - 0</div>"
+                "<h3>Ever Set</h3><div>Contains - Evergreen, Evergun</div><div>Value - 98,000</div>"
+                "<div>Demand - 7</div>"
+                "<h3>Alien Set</h3><div>Contains - Alienbeam, Raygun</div><div>Value - 38,750</div>"
+                "<div>Demand - 6</div>")
+        items, _, _ = parser.parse_category_page(page, "sets")
+        contains = {item["name"]: item["contains"] for item in items}
+        self.assertEqual(contains["Ever Set"], "Evergreen, Evergun")
+        self.assertEqual(contains["Alien Set"], "Alienbeam, Raygun")
+        self.assertEqual(contains["Your Inventory"], "")
+
+    def test_contains_before_set_name(self):
+        text = "Contains - A1, B1\nSet One\nValue - 10\nContains - A2, B2\nSet Two\nValue - 20\n"
+        items, orphans = parser.parse_items(text, "sets")
+        self.assertEqual(orphans, 0)
+        self.assertEqual([(i["name"], i["value"]) for i in items], [("Set One", 10), ("Set Two", 20)])
+
+    def test_wrapped_contains_has_single_commas(self):
+        for page in ("<h3>Ever Set</h3><div>Contains - Evergreen,<br>Evergun</div><div>Value - 98,000 [N/A]</div>",
+                     "<h3>Ever Set</h3><div>Contains -</div><div>Evergreen,</div><div>Evergun</div>"
+                     "<div>Value - 98,000</div>"):
+            items, _, _ = parser.parse_category_page(page, "sets")
+            self.assertEqual(items[0]["contains"], "Evergreen, Evergun")
+
+    def test_one_line_cards_with_inline_range(self):
+        items = parser.items_from_text(
+            "Alpha Value - 38,750 [38,500 - 39,000] Beta Value - 98,000 [N/A] Gamma Value - 20", "godlies")
+        self.assertEqual([(i["name"], i["value"]) for i in items], [("Alpha", 38500), ("Beta", 98000), ("Gamma", 20)])
+
+    def test_picture_without_own_image_is_not_borrowed(self):
+        page = ("<img src='/img/alpha.png' alt='Alpha'><h3>Alpha</h3><div>Value - 10</div>"
+                "<div>Stability - <img src='/images/stability/up.png' alt='Stable'> Stable</div><div>Demand - 3</div>"
+                "<h3>Beta</h3><div>Value - 20</div><div>Demand - 2</div>")
+        items, _, _ = parser.parse_category_page(page, "godlies", base_url="https://example.com/")
+        self.assertEqual(items[0]["image"], "https://example.com/img/alpha.png")
+        self.assertEqual(items[1]["image"], "")
+
+    def test_lazy_and_relative_pictures(self):
+        cases = {
+            "<img src='/img/placeholder.png' data-srcset='/img/alpha.png 1x'>": "/img/alpha.png",
+            "<img src='data:image/gif;base64,R0lG' srcset='/img/alpha.png 1x, /img/alpha@2x.png 2x'>": "/img/alpha.png",
+            "<img src='/_next/image?url=%2Fitems%2Falpha.png&amp;w=128'>": "/_next/image?url=%2Fitems%2Falpha.png&w=128",
+            "<img src='/images/items/alpha.avif'>": "/images/items/alpha.avif",
+            "<img src='/images/icons/godlies/alpha.png' alt=''>": "/images/icons/godlies/alpha.png",
+        }
+        for img, expected in cases.items():
+            items, _, _ = parser.parse_category_page(img + "<h3>Alpha</h3><div>Value - 10</div>", "godlies")
+            self.assertEqual(items[0]["image"], expected, img)

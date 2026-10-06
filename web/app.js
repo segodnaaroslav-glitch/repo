@@ -346,7 +346,7 @@ function renderCategories() {
   );
   if (focused) {
     const again = list.querySelector(`button[data-slug="${CSS.escape(focused)}"]`);
-    if (again) again.focus();
+    if (again) again.focus({ preventScroll: true });  // не прокручивать страницу к списку
   }
 }
 
@@ -428,7 +428,8 @@ function renderValues() {
   $("cardsGrid").classList.toggle("hidden", !cards);
   $("tableWrap").classList.toggle("hidden", cards);
   $("sortLabel").classList.toggle("hidden", !cards);
-  $("sortSelect").value = `${state.sort.key}:${state.sort.dir}`;
+  syncSortSelect();
+  if (!cards) $("moreRow").classList.add("hidden");
   for (const button of document.querySelectorAll("#viewToggle button")) {
     button.classList.toggle("active", button.dataset.view === state.view);
     button.setAttribute("aria-pressed", String(button.dataset.view === state.view));
@@ -444,7 +445,27 @@ function renderValues() {
   $("valuesHint").textContent = hint;
 }
 
+// Сортировка из заголовка таблицы, которой нет в списке, — временным пунктом списка.
+function syncSortSelect() {
+  const select = $("sortSelect");
+  const wanted = `${state.sort.key}:${state.sort.dir}`;
+  for (const option of select.querySelectorAll("option[data-temp]")) {
+    if (option.value !== wanted) option.remove();
+  }
+  if (![...select.options].some((option) => option.value === wanted)) {
+    const header = document.querySelector(`th .sort[data-sort="${CSS.escape(state.sort.key)}"]`);
+    const title = header ? header.textContent.trim() : state.sort.key;
+    const option = el("option", "", `${title} ${state.sort.dir === "asc" ? "↑" : "↓"}`);
+    option.value = wanted;
+    option.dataset.temp = "1";
+    select.append(option);
+  }
+  select.value = wanted;
+}
+
 // --- карточки -----------------------------------------------------------------
+
+const failedImages = new Set();  // адреса, которые не загрузились, — не запрашивать снова
 
 function monogram(item) {
   const words = item.name.replace(/^Chroma\s+/i, "").split(/\s+/).filter(Boolean);
@@ -454,7 +475,7 @@ function monogram(item) {
 
 function itemArt(item, size) {
   const box = el("div", `art ${size || ""}`);
-  const sources = [item.image, item.image_market].filter(Boolean);
+  const sources = [item.image, item.image_market].filter((url) => url && !failedImages.has(url));
   if (!sources.length) {
     box.append(monogram(item));
     return box;
@@ -466,6 +487,7 @@ function itemArt(item, size) {
   img.referrerPolicy = "no-referrer";
   let next = 0;
   img.addEventListener("error", () => {
+    failedImages.add(sources[next]);
     next += 1;
     if (next < sources.length) img.src = sources[next];
     else img.replaceWith(monogram(item));  // картинка не загрузилась — значок с буквами
@@ -485,6 +507,7 @@ function itemCard(item) {
   const key = itemKey(item);
   const card = el("article", `card cat-${item.category}${key === state.selected ? " selected" : ""}`);
   card.tabIndex = 0;
+  card.dataset.key = key;
   card.setAttribute("role", "button");
   card.setAttribute("aria-label", `${item.name}: подробнее`);
   card.append(itemArt(item));
@@ -541,6 +564,7 @@ function itemCard(item) {
 
   card.addEventListener("click", () => openDrawer(key));
   card.addEventListener("keydown", (event) => {
+    if (event.target !== card) return;  // Enter на звёздочке — её собственное действие
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       openDrawer(key);
@@ -567,14 +591,26 @@ function renderCards(rows) {
     $("moreRow").classList.add("hidden");
     return;
   }
+  // Карточки создаются заново: запомнить, на какой был фокус клавиатуры, и вернуть его.
+  const active = document.activeElement;
+  const focusedCard = active && active.closest ? active.closest("#cardsGrid .card") : null;
+  const focus = focusedCard ? { key: focusedCard.dataset.key, star: active.classList.contains("star") } : null;
   const fragment = document.createDocumentFragment();
   for (const item of rows.slice(0, cardShown)) fragment.append(itemCard(item));
   grid.replaceChildren(fragment);
   updateMoreButton();
+  if (focus) focusCard(focus.key, focus.star);
+}
+
+function focusCard(key, star) {
+  const card = $("cardsGrid").querySelector(`.card[data-key="${CSS.escape(key)}"]`);
+  if (!card) return;
+  const target = star ? card.querySelector(".star") || card : card;
+  target.focus({ preventScroll: true });
 }
 
 function showMoreCards() {
-  if (cardShown >= cardRows.length) return;
+  if (state.view !== "cards" || cardShown >= cardRows.length) return;
   const grid = $("cardsGrid");
   const fragment = document.createDocumentFragment();
   const next = cardRows.slice(cardShown, cardShown + CARD_CHUNK);
@@ -654,12 +690,15 @@ function openDrawer(key) {
   state.selected = key;
   renderDrawer();
   renderValues();
+  $("drawerClose").focus({ preventScroll: true });  // Tab — дальше по окну предмета
 }
 
 function closeDrawer() {
+  const key = state.selected;
   state.selected = null;
   $("drawer").classList.add("hidden");
   renderValues();
+  if (key && state.view === "cards") focusCard(key, false);  // вернуться к карточке
 }
 
 function fact(list, title, value) {

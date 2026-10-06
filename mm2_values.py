@@ -42,6 +42,8 @@ def cmd_run(args):
         if not args.no_browser:
             webbrowser.open(existing)
         return
+    # Перенос цен прошлой версии — только когда точно не запущена другая копия.
+    store.use_data_dir(paths.migrate_old_data())
     monitor = None if args.no_markets else markets.MarketMonitor()
     rate = rates.RateWatcher()
     httpd = server.make_server(
@@ -74,6 +76,7 @@ def program_command():
 
 
 def cmd_update(args):
+    store.use_data_dir(paths.migrate_old_data())
     try:
         store.update_from_site()
     except store.UpdateError as error:
@@ -124,6 +127,7 @@ def read_text_file(path):
 
 
 def cmd_import(args):
+    store.use_data_dir(paths.migrate_old_data())
     try:
         text = read_text_file(args.file)
         items, last_updated = store.import_text(text, args.category)
