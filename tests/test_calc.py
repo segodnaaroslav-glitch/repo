@@ -78,7 +78,8 @@ class CalcEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         harvester = payload["items"][0]
         self.assertEqual((harvester["name"], harvester["qty"]), ("Harvester", 2))
-        self.assertEqual(harvester["prices"]["starpets"], {"price": 8.83, "currency": "USD", "fee": 0.2, "stock": None})
+        self.assertEqual(harvester["prices"]["starpets"], {"price": 8.83, "currency": "USD", "price_rub": None,
+                                                           "price_rub_approx": False, "fee": 0.2, "stock": None})
         self.assertEqual(payload["unmatched"], ["Something Else"])
         self.assertEqual(payload["fees"], {"starpets": 0.2})
 

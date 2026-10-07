@@ -235,6 +235,8 @@ class Handler(BaseHTTPRequestHandler):
                 "seen": entry["seen"],
                 "prices": {
                     market_id: {"price": info.get("price"), "currency": info.get("currency"),
+                                "price_rub": info.get("price_rub"),
+                                "price_rub_approx": bool(info.get("price_rub_approx")),
                                 "fee": info.get("fee", 0), "stock": info.get("stock")}
                     for market_id, info in market.items()
                 },

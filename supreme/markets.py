@@ -20,7 +20,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import fetcher, liquidity, parser, store
+from . import cdp, dreampets, fetcher, liquidity, parser, store
 
 POLL_EVERY = 120                 # секунд между опросами одной площадки
 MAX_BACKOFF = 30 * 60            # при ошибках — реже, но не реже раза в 30 минут
@@ -44,7 +44,10 @@ DEFAULT_MARKETS = [
 
 # --- HTTP ---------------------------------------------------------------------
 
-def _request(url, data=None, headers=None, timeout=30):
+HTML_HEADERS = {"Accept": fetcher.HEADERS["Accept"], "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
+
+
+def _request(url, data=None, headers=None, timeout=30, raw=False):
     all_headers = dict(fetcher.HEADERS)
     all_headers["Accept"] = "application/json, text/html;q=0.9, */*;q=0.8"
     if data is not None:
@@ -54,7 +57,7 @@ def _request(url, data=None, headers=None, timeout=30):
     request = urllib.request.Request(url, data=body, headers=all_headers, method="POST" if body else "GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
+            body_bytes = response.read()
             charset = response.headers.get_content_charset() or "utf-8"
     except urllib.error.HTTPError as error:
         if error.code in fetcher.BLOCK_STATUSES:
@@ -62,7 +65,7 @@ def _request(url, data=None, headers=None, timeout=30):
         raise fetcher.FetchError(f"HTTP {error.code}: {url}") from error
     except (urllib.error.URLError, OSError) as error:
         raise fetcher.NetworkError(f"нет соединения ({error}): {url}") from error
-    return raw.decode(charset, "replace")
+    return body_bytes if raw else body_bytes.decode(charset, "replace")
 
 
 def get_json(url, **kwargs):
@@ -135,6 +138,26 @@ def find_item(index, offer):
 
 def item_id(item):
     return f"{item['category']}:{item['name']}"
+
+
+_YEAR_RE = re.compile(r"(?<!\d)(20[0-4]\d)(?!\d)")
+
+
+def _item_years(item):
+    text = " ".join(str(item.get(field) or "") for field in ("name", "origin", "aliases"))
+    return {int(year) for year in _YEAR_RE.findall(text)}
+
+
+def _variant_rank(item, offer):
+    """Насколько товар площадки подходит предмету (меньше — лучше): совпадение года
+    из названия/происхождения, точное название, есть ли цена, популярность."""
+    years = _item_years(item)
+    year = offer.get("year")
+    year_miss = 0 if not years else (0 if year in years else 1)
+    exact = 0 if parser.name_key(offer.get("name") or "") == parser.name_key(item["name"]) else 1
+    priced = 0 if offer.get("price") is not None or offer.get("price_rub") is not None else 1
+    popularity = offer.get("popularity")
+    return (year_miss, priced, exact, popularity if isinstance(popularity, (int, float)) else 1.0)
 
 
 # --- оценка ликвидности на площадке ------------------------------------------
@@ -336,65 +359,137 @@ def _jsonld_products(data, page_url):
 class StarPetsAdapter(Adapter):
     """StarPets: открытый JSON API mm2-market.apineural.com.
 
-    items/all — самая низкая цена каждого предмета (price=null — нет в продаже);
-    products/{id}/info — продажи за неделю (numberOfSalesPerWeek). Запросов к API
-    мало: ~15 на обход каталога и несколько запросов продаж, по очереди для
-    самых дорогих предметов (каждый — не чаще раза в 6 часов).
+    items/all — самая низкая цена каждого товара (price=null — нет в продаже) в
+    валюте запроса. Цены в рублях StarPets задаёт сам (это не доллары по курсу),
+    поэтому каталог читается и в долларах, и в рублях — по очереди, чтобы не
+    превысить лимит запросов (~50, иначе блокировка). products/{id}/info —
+    продажи за неделю (numberOfSalesPerWeek), по нескольку предметов за опрос.
+    Один товар StarPets — один вариант (год, тип, хрома): разные товары с одним
+    названием не смешиваются.
     """
 
     API = "https://mm2-market.apineural.com"
     TYPES = ("weapon", "pet", "misc")
+    CURRENCIES = ("usd", "rub")
     PAGE = 72
     HEADERS = {"Origin": "https://starpets.gg", "Referer": "https://starpets.gg/"}
-    INFO_PER_POLL = 10  # ~15 запросов каталога + 10 продаж за 5 минут — с запасом до блокировки (~50)
+    INFO_PER_POLL = 4  # каталог (~15 запросов) + продажи — с запасом до блокировки (~50)
     INFO_MAX_AGE = 6 * 60 * 60
     PAUSE = 0.4
 
     def fetch(self):
         api = self.config.get("api", self.API).rstrip("/")
-        offers = []
-        for kind in self.TYPES:
-            group = []
-            count = 0
-            for page in range(1, MAX_PAGES + 1):
-                body = {"currency": "usd", "page": page, "amount": self.PAGE,
-                        "filter": {"types": [{"type": kind}]}, "sort": {"popularity": "desc"}}
-                data = post_json(f"{api}/api/v2/store/items/all", body, headers=self.HEADERS)
-                rows = data.get("items") if isinstance(data, dict) else None
-                if not isinstance(rows, list):
-                    raise fetcher.FetchError("StarPets ответил в незнакомом формате")
-                group.extend(self._offer(row, kind) for row in rows if isinstance(row, dict))
-                count = data.get("count") if isinstance(data.get("count"), int) else 0
-                if not rows or page * self.PAGE >= count:
-                    break
-                _pause(self.PAUSE)
-            # Список отсортирован по популярности на StarPets: место в нём — тоже сигнал.
-            total = max(len(group), count, 1)
-            for rank, offer in enumerate(group):
-                offer["popularity"] = rank / total
-            offers.extend(group)
+        prices = self.cache.setdefault("prices", {})  # валюта -> {"at", "rows": {id: цена}}
+        # Каждый опрос — одна валюта (та, что читалась давнее); в первый раз — обе.
+        due = [c for c in self.CURRENCIES if "at" not in prices.get(c, {})]
+        if not due:
+            due = [min(self.CURRENCIES, key=lambda c: prices[c]["at"])]
+        rows_by_id, complete, notes = {}, True, []
+        for currency in due:
+            try:
+                rows, whole = self._sweep(api, currency)
+            except fetcher.FetchError as error:
+                blocked = isinstance(error, (fetcher.BlockedError, fetcher.NetworkError))
+                if currency == "usd" or (blocked and not rows_by_id):
+                    raise
+                # Рубли не получены: в следующий раз — доллары, рубли — последние известные.
+                prices.setdefault(currency, {"rows": {}})["at"] = time.time()
+                notes.append(f"цены в рублях сейчас не получены ({error}) — показаны последние известные")
+                continue
+            prices[currency] = {"at": time.time(), "rows": {key: row.get("price") for key, row in rows.items()}}
+            complete = complete and whole
+            for key, row in rows.items():
+                rows_by_id.setdefault(key, row)
+        if not rows_by_id:
+            # Каталог этой валюты не прочитан — товары берём из прошлого обхода.
+            rows_by_id = self.cache.get("rows") or {}
+            complete = False
+        else:
+            self.cache["rows"] = {key: {k: row.get(k) for k in self._ROW_FIELDS} for key, row in rows_by_id.items()}
+        self.complete = complete
+        offers = self._offers(rows_by_id, prices)
         self._add_sales(api, offers)
+        if notes:
+            self.note = "; ".join([self.note] + notes) if self.note else "; ".join(notes)
         return offers
 
-    def _offer(self, row, kind):
+    _ROW_FIELDS = ("id", "name", "type", "subtype", "year", "chroma", "realName", "imageUri", "_rank", "_type")
+
+    def _sweep(self, api, currency):
+        """Весь каталог в одной валюте: {id: строка}, прочитан ли он целиком."""
+        rows, whole = {}, True
+        for kind in self.TYPES:
+            group, count = [], 0
+            for page in range(1, MAX_PAGES + 1):
+                body = {"currency": currency, "page": page, "amount": self.PAGE,
+                        "filter": {"types": [{"type": kind}]}, "sort": {"popularity": "desc"}}
+                data = post_json(f"{api}/api/v2/store/items/all", body, headers=self.HEADERS)
+                items = data.get("items") if isinstance(data, dict) else None
+                if not isinstance(items, list):
+                    raise fetcher.FetchError("StarPets ответил в незнакомом формате")
+                group.extend(row for row in items if isinstance(row, dict) and row.get("id") is not None)
+                count = data.get("count") if isinstance(data.get("count"), int) else 0
+                if not items or page * self.PAGE >= count:
+                    break
+                _pause(self.PAUSE)
+            seen = {}
+            for row in group:  # список мог сдвинуться между страницами — без повторов
+                seen.setdefault(str(row["id"]), row)
+            if count and len(seen) < count:
+                whole = False
+            # Список отсортирован по популярности на StarPets: место в нём — тоже сигнал.
+            total = max(len(seen), count, 1)
+            for rank, (key, row) in enumerate(seen.items()):
+                rows.setdefault(key, dict(row, _rank=rank / total, _type=kind))
+        return rows, whole
+
+    def _offers(self, rows, prices):
+        usd = prices.get("usd", {}).get("rows", {})
+        rub = prices.get("rub", {}).get("rows", {})
+        # Курс самой площадки (медиана рубли/доллары) — только для товаров, у которых
+        # рублёвой цены ещё нет; такие цены помечаются как примерные.
+        ratios = sorted(_price(rub[k]) / _price(usd[k]) for k in usd
+                        if _price(usd.get(k)) and _price(rub.get(k)) and _price(usd[k]) >= 1)
+        site_rate = ratios[len(ratios) // 2] if ratios else None
+        offers = []
+        for key, row in rows.items():
+            price = _price(usd.get(key))
+            price_rub = _price(rub.get(key))
+            approx = False
+            if price_rub is None and price is not None and site_rate and key not in rub:
+                price_rub, approx = round(price * site_rate, 2), True
+            offers.append(self._offer(row, price, price_rub, approx))
+        return offers
+
+    def _offer(self, row, price, price_rub=None, rub_approx=False):
+        kind = row.get("_type") or row.get("type") or "weapon"
         name = str(row.get("name") or "")
         if row.get("chroma") and not name.lower().startswith("chroma"):
             name = "Chroma " + name
-        price = _price(row.get("price"))
         product_id = row.get("id")
         slug = re.sub(r"[^a-z0-9]+", "-", str(row.get("name") or "").lower().replace("'", "")).strip("-")
         url = f"https://starpets.gg/mm2/shop/{kind}/{slug}/{product_id}" if product_id else self.config["url"]
         subtype = str(row.get("subtype") or "").lower()
         image = row.get("imageUri")
+        year = row.get("year")
+        try:
+            year = int(year) if year is not None else None
+        except (TypeError, ValueError):
+            year = None
         return {
             "name": name,
             "image": image if isinstance(image, str) and image.startswith("https://") else None,
             "kind": "pet" if kind == "pet" else subtype,
+            "year": year,
+            "real_name": row.get("realName"),
             "price": price,
+            "price_rub": price_rub,
+            "price_rub_approx": rub_approx,
             "currency": "USD",
             "stock": None,
             "sales_week": None,
-            "available": price is not None,
+            "available": price is not None or (price_rub is not None and not rub_approx),
+            "popularity": row.get("_rank"),
             "url": url,
             "id": product_id,
         }
@@ -442,194 +537,427 @@ class StarPetsAdapter(Adapter):
 
 
 class DreamPetsAdapter(Adapter):
-    """DreamPets (dreampets.gg): у площадки нет открытого API.
+    """DreamPets (dreampets.gg): открытого API нет, поэтому товары и цены ищутся
+    всеми способами, а не одним:
 
-    Страница рынка даёт список товаров; страницы товаров — минимальную цену
-    («от 328.98 ₽») и число лотов в продаже («674 лотов»). Страницы товаров
-    читаются по очереди, понемногу за каждый опрос, начиная с самых дорогих.
+    1. страница рынка: карточки со ссылками, ссылки внутри данных страницы
+       (Next.js/Nuxt), встроенные данные с ценами;
+    2. адреса данных, которые раньше нашёл браузер (если они открываются напрямую);
+    3. карта сайта (robots.txt, sitemap, вложенные и сжатые) — раз в час;
+    4. страницы товаров — параллельно, по очереди (сначала давно не читанные):
+       «от 328.98 ₽» и «674 лотов» из данных страницы, описания или текста;
+       ошибка одной страницы не мешает остальным;
+    5. если площадка не пускает программу или рисует всё скриптом — скрытый Edge:
+       открывает рынок как обычный посетитель, докручивает список и читает карточки.
+
+    Если цен не нашлось, в папку debug/dreampets кладётся отчёт для проверки.
     """
 
-    PAGES_PER_POLL = 25
-    PAUSE = 0.5
-    PAGE_TIMEOUT = 15
-    CARD_SHARE = 0.5  # если у половины товаров на странице рынка видны цены — берём их оттуда
-    _CARD_PRICE_RE = re.compile(r"(\d{1,3}(?:[ \u00a0,.]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*₽")
-    _BUTTON_RE = re.compile(r"^(купить|в корзину|продать|подробнее|от|лот\w*|шт\.?)$", re.I)
+    PAGES_PER_POLL = 120
+    PAGES_TIME = 90  # секунд на страницы товаров за опрос (другие площадки ждут)
+    BROWSER_PAGES = 60
+    WORKERS = 4
+    PAGE_TIMEOUT = 20
+    PAUSE = 0.15
+    SITEMAP_EVERY = 60 * 60
+    BROWSER_EVERY = 10 * 60
+    MAX_SITEMAPS = 40
+    USELESS_PAGES = 6  # столько страниц подряд без цены — страницы рисуются скриптом
     _LINK_RE = re.compile(r"""href=["']((?:https?://[^"']*dreampets\.(?:gg|io))?/mm2/product/[^"'#?]+)["']""", re.I)
-    _PRICE_RE = re.compile(r"от\s*([\d\s\u00a0.,]+?)\s*₽")
-    # "674 лотов", "1 234 лота"; число не склеивается с соседними словами ("ММ2 114 лотов").
-    _LOTS_RE = re.compile(r"(?<![\w.,])(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)[ \u00a0]*лот", re.I)
+    _CARD_SELECTOR = 'a[href*="/mm2/product/"]'
 
     def fetch(self):
         base = self.config["url"]
-        root = re.match(r"https?://[^/]+", base).group(0)
-        products = self.cache.setdefault("products", {})  # ссылка -> данные товара
-        market_html = self._market_page(base)
-        cards = self._cards(market_html, root) if market_html else {}
-        links = list(cards) or self._catalog(base, root)
-        for link in links:
-            products.setdefault(link, {"at": 0})
-        if not products:
-            raise fetcher.FetchError("на странице рынка не нашлось ни одного товара")
-        priced = {link: card for link, card in cards.items() if card.get("price") is not None}
-        from_cards = len(priced) >= max(1, len(cards) * self.CARD_SHARE)
-        if from_cards:
-            # Цены и лоты видны прямо на странице рынка — весь рынок за один запрос.
-            now = time.time()
-            for link, card in priced.items():
-                products[link].update({k: v for k, v in card.items() if v is not None}, at=now)
-        # Страницы товаров читаются для тех, у кого на странице рынка нет цены или числа лотов
-        # (по очереди: сначала давно не читанные).
-        waiting = [
-            link for link in products
-            if not (link in priced and priced[link].get("lots") is not None)
-        ] if from_cards else list(products)
-        due = sorted(waiting, key=lambda link: (products[link].get("page_at", 0), -(products[link].get("price") or 0)))
-        read = failed = 0
-        last_error = None
-        for link in due[:self.PAGES_PER_POLL]:
-            _pause(self.PAUSE)
+        self.root = re.match(r"https?://[^/]+", base).group(0)
+        now = time.time()
+        products = self.cache.setdefault("products", {})  # uuid -> данные товара
+        self._migrate_cache(products)
+        self.report = {"time": store.now_iso(), "base": base, "steps": []}
+        self.sources = {}
+        self.fresh = set()  # товары, у которых цена и лоты уже получены в этом опросе
+        self.fresh_price = set()  # товары с ценой из списка (рынок, данные, браузер) в этом опросе
+        blocked = None
+
+        market_html = None
+        try:
+            market_html = self._market_page(base)
+        except fetcher.BlockedError as error:
+            blocked = error
+        if market_html:
+            self._absorb_market(market_html, products, now)
+
+        for url in list(self.cache.get("api_urls") or [])[:5]:
+            if blocked:
+                break
             try:
-                page_html = _request(link, headers={"Accept-Language": "ru,en;q=0.8"}, timeout=self.PAGE_TIMEOUT)
-            except (fetcher.BlockedError, fetcher.NetworkError):
-                raise  # нет связи или блок — опрос считается неудачным
+                self._absorb_json(get_json(url, headers={"Origin": self.root, "Referer": base}), products, now, "api")
+            except fetcher.BlockedError as error:
+                blocked = error
             except fetcher.FetchError as error:
-                products[link]["at"] = products[link]["page_at"] = time.time()  # в конец очереди
-                last_error = error
-                failed += 1
-                if failed >= 2 and not read:
-                    break
-                continue
-            parsed = self._parse_product(page_html)
-            if parsed["name"] is None:
-                parsed.pop("name")  # название уже известно со страницы рынка
-            if link in priced:
-                parsed.pop("price")  # цена со страницы рынка свежее
-            products[link].update(parsed, at=time.time(), page_at=time.time())
-            read += 1
-        if failed and not read and not from_cards:
-            raise fetcher.FetchError(f"страницы товаров не открываются: {last_error}")
-        self.complete = all(entry.get("at") for entry in products.values())
-        known = [p for p in products.values() if p.get("name")]
-        if from_cards:
-            self.note = f"товаров на рынке: {len(products)}, цены и лоты со страницы рынка: {len(priced)}"
-        else:
-            self.note = (f"товаров на рынке: {len(products)}, прочитано: {len(known)} "
-                         f"(по {self.PAGES_PER_POLL} страниц за опрос)")
-        return [
-            {
-                "name": entry["name"],
-                "price": entry.get("price"),
-                "currency": "RUB",
-                "stock": entry.get("lots"),
-                "sales_week": None,
-                "available": bool(entry.get("lots")) if entry.get("lots") is not None else entry.get("price") is not None,
-                "url": link,
-            }
-            for link, entry in products.items() if entry.get("name")
-        ]
+                self._step("api", url, str(error))
+
+        if not blocked and (not products or now - self.cache.get("sitemap_at", 0) >= self.SITEMAP_EVERY):
+            try:
+                self._sitemaps(products)
+            except fetcher.BlockedError as error:
+                blocked = error
+
+        pages_useless = self.cache.get("pages_useless_until", 0) > now
+        priced_now = sum(1 for key in products if key in self.fresh)
+        need_browser = blocked or not products or (pages_useless and priced_now < len(products) / 2)
+        if need_browser and now - self.cache.get("browser_at", 0) >= self.BROWSER_EVERY:
+            self.cache["browser_at"] = now
+            try:
+                self._browser_pass(base, products, now, read_pages=bool(blocked) and not pages_useless)
+            except Exception as error:  # браузер — запасной путь, его сбой не ломает опрос
+                self._step("browser", "error", f"{type(error).__name__}: {error}")
+
+        if not blocked and not pages_useless:
+            try:
+                self._read_pages(products)
+            except fetcher.BlockedError as error:
+                blocked = error
+
+        offers = self._offers(products)
+        priced = sum(1 for offer in offers if offer["price"] is not None)
+        self.complete = bool(products) and all(entry.get("at") for entry in products.values())
+        parts = [f"товаров: {len(products)}, с ценой: {priced}"]
+        parts += [f"{name}: {count}" for name, count in self.sources.items() if count]
+        self.note = ", ".join(parts)
+        if not priced:
+            self._save_report(market_html)
+            reason = self._why_empty(blocked, products, market_html)
+            if blocked:
+                raise fetcher.BlockedError(reason)
+            raise fetcher.FetchError(reason)
+        if blocked:
+            self.note += f" (часть данных не обновлена: {blocked})"
+        return offers
+
+    # --- общие части ---
+
+    def _step(self, name, what, result):
+        self.report["steps"].append({"step": name, "what": str(what)[:300], "result": str(result)[:500]})
+
+    def _count(self, source, number=1):
+        self.sources[source] = self.sources.get(source, 0) + number
+
+    def _migrate_cache(self, products):
+        """Кэш прошлой версии хранил товары по ссылке — переводим на uuid."""
+        for key in [k for k in products if k.startswith("http") and dreampets.uuid_of(k)]:
+            entry = products.pop(key)
+            if isinstance(entry, dict):
+                entry.setdefault("url", self._absolute(key))
+                products.setdefault(dreampets.uuid_of(key), entry)
+        for key in [k for k, e in products.items() if not isinstance(e, dict)]:
+            products.pop(key)
+
+    def _key(self, link):
+        """Ключ товара: uuid из ссылки (одинаковый на .gg и .io), иначе сама ссылка."""
+        return dreampets.uuid_of(link) or self._absolute(link)
+
+    def _absolute(self, href):
+        link = href if href.startswith("http") else self.root + href
+        return re.sub(r"https?://[^/]+", self.root, link)  # одно зеркало, без двойного счёта
+
+    def _upsert(self, products, data, now, source, link=None, key=None):
+        """Добавить или обновить товар: по ссылке (uuid), иначе по названию."""
+        if key is None and link:
+            key = self._key(link)
+        if key is None and data.get("id") is not None:
+            key = dreampets.uuid_of(str(data["id"]))
+        name = dreampets.clean_name(data.get("name")) if data.get("name") else None
+        if key is None:
+            if not name:
+                return None
+            wanted = parser.name_key(name)
+            key = next((k for k, e in products.items() if parser.name_key(e.get("name") or "") == wanted), None)
+            key = key or "name:" + wanted
+        entry = products.setdefault(key, {"at": 0})
+        if link:
+            entry["url"] = self._absolute(link)
+        if name and (not entry.get("name") or source != "slug"):
+            entry["name"] = name
+        elif not entry.get("name") and link:
+            entry["name"] = dreampets.slug_name(link)
+        got = False
+        if data.get("price") is not None:
+            entry["price"] = data["price"]
+            got = True
+        if data.get("lots") is not None:
+            entry["lots"] = data["lots"]
+        if got:
+            entry["at"] = now
+            entry["source"] = source
+            if source != "страницы товаров":
+                self.fresh_price.add(key)  # цена со списка свежее страницы товара
+            if data.get("lots") is not None:
+                self.fresh.add(key)
+            self._count(source)
+        return key
 
     def _market_page(self, base):
-        try:
-            return _request(base, headers={"Accept-Language": "ru,en;q=0.8"})
-        except (fetcher.BlockedError, fetcher.NetworkError):
-            raise
-        except fetcher.FetchError:
-            return ""
+        """Страница рынка (при недоступности — зеркало dreampets.io)."""
+        urls = [base]
+        mirror = re.sub(r"dreampets\.gg", "dreampets.io", base) if "dreampets.gg" in base else None
+        if mirror:
+            urls.append(mirror)
+        last = None
+        for url in urls:
+            try:
+                page_html = _request(url, headers=HTML_HEADERS, timeout=self.PAGE_TIMEOUT)
+                self._step("market", url, f"ok, {len(page_html)} символов")
+                return page_html
+            except fetcher.BlockedError as error:
+                self._step("market", url, str(error))
+                raise
+            except fetcher.NetworkError as error:
+                self._step("market", url, str(error))
+                last = error
+            except fetcher.FetchError as error:
+                self._step("market", url, str(error))
+                return None
+        raise last
 
-    def _cards(self, page_html, root):
-        """Товары со страницы рынка: {ссылка: {"name", "price", "lots"}} — текст между
-        соседними ссылками на товары считается карточкой товара."""
+    # --- страница рынка ---
+
+    def _absorb_market(self, page_html, products, now):
+        links = dreampets.product_links(page_html, self.root)
+        for link in links:
+            self._upsert(products, {"name": None}, now, "slug", link)
+        cards = self._cards(page_html)
+        for link, card in cards.items():
+            self._upsert(products, card, now, "страница рынка", link)
+        embedded = 0
+        for blob in dreampets.embedded_json(page_html):
+            embedded += self._absorb_json(blob, products, now, "данные страницы")
+        self._step("market-parse", "links/cards/embedded", f"{len(links)}/{len(cards)}/{embedded}")
+
+    def _cards(self, page_html):
+        """Карточки со ссылками: текст от ссылки на товар до ссылки на другую страницу."""
+        anchors = [(m.start(), m.group(1)) for m in re.finditer(r"""<a\b[^>]*href=["']([^"']+)["']""", page_html, re.I)]
         matches = list(self._LINK_RE.finditer(page_html))
         cards = {}
-        for index, match in enumerate(matches):
-            link = self._absolute(match.group(1), root)
-            end = matches[index + 1].start() if index + 1 < len(matches) else min(len(page_html), match.end() + 4000)
+        for match in matches:
+            link = self._absolute(match.group(1))
+            end = next((pos for pos, href in anchors if pos > match.end() and self._absolute(href) != link),
+                       min(len(page_html), match.end() + 4000))
+            end = min(end, match.end() + 4000)
             start = page_html.rfind("<", 0, match.start())
             # Соседние теги карточки — разные надписи: "<i>114</i><b>23,71 ₽</b>" не "11423,71 ₽".
             fragment = re.sub(r">(?=<)", "> ", page_html[max(0, start):end])
-            lines = [line.strip() for line in parser.html_to_text(fragment).splitlines() if line.strip()]
-            price = None
-            for number, line in enumerate(lines):
-                price = self._CARD_PRICE_RE.search(line)
-                if not price and number + 1 < len(lines) and lines[number + 1].startswith("₽"):
-                    price = self._CARD_PRICE_RE.search(f"{line} {lines[number + 1]}")  # "1 299" + "₽"
-                if price:
-                    break
-            lots = next((m for m in (self._LOTS_RE.search(line) for line in lines) if m), None)
-            name = next(
-                (line for line in lines if re.search(r"[A-Za-z]", line) and "₽" not in line
-                 and not self._LOTS_RE.search(line) and not self._BUTTON_RE.match(line)),
-                "",
-            )
-            card = cards.setdefault(link, {"name": None, "price": None, "lots": None})
-            card["name"] = card["name"] or (re.split(r"\s+(?:/|—|-)\s+", name, maxsplit=1)[0].strip()
-                                            or self._name_from_link(link))
-            if price and card["price"] is None:
-                card["price"] = _rub(price.group(1))
-            if lots and card["lots"] is None:
-                card["lots"] = int(re.sub(r"\D", "", lots.group(1)))
+            card = dreampets.parse_card_text(parser.html_to_text(fragment))
+            if not card["name"]:
+                card["name"] = dreampets.slug_name(link)
+            known = cards.setdefault(link, {"name": None, "price": None, "lots": None})
+            for field in ("name", "price", "lots"):
+                if known[field] is None:
+                    known[field] = card[field]
         return cards
 
-    @staticmethod
-    def _name_from_link(link):
-        """/mm2/product/eternal-iii/<uuid> -> "eternal iii" (для сопоставления регистр не важен)."""
-        match = re.search(r"/mm2/product/([a-z0-9-]+)/[0-9a-f-]{8,}", link, re.I)
-        return match.group(1).replace("-", " ") if match else None
-
-    @staticmethod
-    def _absolute(href, root):
-        link = href if href.startswith("http") else root + href
-        return re.sub(r"https?://[^/]+", root, link)  # одно зеркало (.gg), без двойного счёта
-
-    def _catalog(self, base, root):
-        """Ссылки на товары со страницы рынка (обновляются раз в час)."""
-        if time.time() - self.cache.get("catalog_at", 0) < 3600 and self.cache.get("products"):
-            return []
-        try:
-            page_html = _request(base, headers={"Accept-Language": "ru,en;q=0.8"})
-            links = self._links(page_html, root)
-            if not links:  # рынок рисуется скриптом — откроем как браузер
-                browser = fetcher.find_system_browser()
-                if browser:
-                    links = self._links(fetcher.SystemBrowserFetcher(browser).fetch(base), root)
-            if not links:
-                links = self._links(_request(root + "/sitemap.xml"), root)
-        except (fetcher.BlockedError, fetcher.NetworkError):
-            raise
-        except fetcher.FetchError:
-            links = []
-        if links:
-            self.cache["catalog_at"] = time.time()
-        return links
-
-    def _links(self, page_html, root):
-        found = []
-        for href in self._LINK_RE.findall(page_html) + re.findall(r"<loc>\s*([^<]*/mm2/product/[^<]+?)\s*</loc>", page_html):
-            link = self._absolute(href, root)
-            if link not in found:
-                found.append(link)
+    def _absorb_json(self, data, products, now, source):
+        """Товары с ценами из любых данных (JSON страницы или API). Возвращает их число."""
+        found = 0
+        for product in dreampets.walk_products(data):
+            link = None
+            slug = product.get("slug")
+            if product.get("id") is not None and dreampets.uuid_of(str(product["id"])):
+                uid = dreampets.uuid_of(str(product["id"]))
+                link = f"{self.root}/mm2/product/{slug + '/' if slug else ''}{uid}"
+            if self._upsert(products, product, now, source, link):
+                found += 1
         return found
 
-    def _parse_product(self, page_html):
-        title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.S | re.I)
-        name = html_unescape(title.group(1)) if title else ""
-        name = re.split(r"\s+(?:/|—|-)\s+", name.strip(), maxsplit=1)[0].strip()
-        # Описание страницы ("от 328.98 ₽, 674 лотов"), затем видимый текст — по строкам,
-        # чтобы числа из разных мест не склеивались.
-        texts = [
-            html_unescape(content) for content in re.findall(
-                r"<meta[^>]+(?:name|property)=[\"'](?:description|og:description)[\"'][^>]*content=[\"']([^\"']*)[\"']",
-                page_html, re.I,
-            )
-        ] + parser.html_to_text(page_html).splitlines()
-        price = next((m for m in (self._PRICE_RE.search(t) for t in texts) if m), None)
-        lots = next((m for m in (self._LOTS_RE.search(t) for t in texts) if m), None)
-        return {
-            "name": name or None,
-            "price": _rub(price.group(1)) if price else None,
-            "lots": int(re.sub(r"\D", "", lots.group(1))) if lots else None,
-        }
+    # --- карта сайта ---
+
+    def _sitemaps(self, products):
+        queue = []
+        try:
+            queue += dreampets.sitemap_urls_from_robots(_request(self.root + "/robots.txt", headers=HTML_HEADERS,
+                                                                 timeout=self.PAGE_TIMEOUT))
+        except fetcher.BlockedError:
+            raise
+        except fetcher.FetchError as error:
+            self._step("robots", self.root + "/robots.txt", str(error))
+        for default in (self.root + "/sitemap.xml", self.root + "/sitemap_index.xml"):
+            if default not in queue:
+                queue.append(default)
+        seen, found = set(), 0
+        while queue and len(seen) < self.MAX_SITEMAPS:
+            url = queue.pop(0)
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                raw = _request(url, headers=HTML_HEADERS, timeout=self.PAGE_TIMEOUT, raw=True)
+            except fetcher.BlockedError:
+                raise
+            except fetcher.FetchError as error:
+                self._step("sitemap", url, str(error))
+                continue
+            children, pages = dreampets.parse_sitemap(raw)
+            queue += [c for c in children if c not in seen]
+            for page in pages:
+                if dreampets.PRODUCT_PATH_RE.search(page):
+                    if self._upsert(products, {"name": None}, 0, "slug", dreampets.PRODUCT_PATH_RE.search(page).group(1)):
+                        found += 1
+            self._step("sitemap", url, f"страниц: {len(pages)}, вложенных карт: {len(children)}")
+        self.cache["sitemap_at"] = time.time()
+        if found:
+            self._count("карта сайта", found)
+
+    # --- страницы товаров ---
+
+    def _read_pages(self, products):
+        from concurrent.futures import ThreadPoolExecutor  # noqa: E402 (нужен только здесь)
+        waiting = [key for key, entry in products.items() if key not in self.fresh and entry.get("url")]
+        due = sorted(waiting, key=lambda k: (products[k].get("page_at", 0), -(products[k].get("price") or 0)))
+        due = due[:self.PAGES_PER_POLL]
+        if not due:
+            return
+        stop = threading.Event()
+        blocked = []
+        deadline = time.time() + self.PAGES_TIME  # остальные страницы — в следующий опрос
+
+        def read(key):
+            if stop.is_set() or time.time() > deadline:
+                return key, None, None
+            url = products[key]["url"]
+            try:
+                return key, _request(url, headers=HTML_HEADERS, timeout=self.PAGE_TIMEOUT), None
+            except fetcher.BlockedError as error:
+                stop.set()  # площадка просит остановиться — остальные страницы в следующий раз
+                blocked.append(error)
+                return key, None, error
+            except fetcher.FetchError as error:
+                return key, None, error
+            finally:
+                _pause(self.PAUSE)
+
+        read_ok = useless = 0
+        failures = []
+        with ThreadPoolExecutor(max_workers=self.WORKERS) as pool:
+            for key, page_html, error in pool.map(read, due):
+                entry = products[key]
+                if page_html is None and error is None:
+                    continue  # не запрашивалась (остановка)
+                entry["page_at"] = time.time()  # в конец очереди — и при ошибке
+                if error is not None:
+                    failures.append(str(error))
+                    entry.setdefault("at", 0)
+                    continue
+                parsed = dreampets.parse_product_page(page_html)
+                read_ok += 1
+                if parsed["price"] is None and parsed["lots"] is None:
+                    useless += 1
+                    if not entry.get("at"):
+                        entry["at"] = time.time()  # прочитана: на этой странице цены нет
+                    continue
+                useless = 0
+                data = dict(parsed)
+                if key in self.fresh_price:
+                    data.pop("price")  # цена со страницы рынка свежее
+                elif data["price"] is None:
+                    data.pop("price")  # продан: цены нет, но лоты известны
+                    entry["price"] = None
+                    entry["at"] = time.time()
+                if key in self.fresh_price and data.get("lots") is not None:
+                    entry["lots"] = data["lots"]
+                    entry["at"] = time.time()
+                    self.fresh.add(key)
+                self._upsert(products, data, time.time(), "страницы товаров", key=key)
+        self._step("pages", f"{len(due)} в очереди", f"прочитано {read_ok}, ошибок {len(failures)}"
+                   + (f": {failures[-1]}" if failures else ""))
+        if read_ok >= self.USELESS_PAGES and useless >= self.USELESS_PAGES:
+            # Страницы товаров рисуются скриптом: обычным запросом цен не прочитать.
+            self.cache["pages_useless_until"] = time.time() + 6 * 3600
+        if blocked:
+            raise blocked[0]
+
+    # --- скрытый браузер ---
+
+    def _browser_pass(self, base, products, now, read_pages):
+        with cdp.Browser() as browser:
+            browser.open(base, settle=4)
+            result = browser.evaluate(cdp.JS_COLLECT_CARDS % (json.dumps(self._CARD_SELECTOR), 30), timeout=150) or {}
+            cards = result.get("cards") or []
+            for card in cards:
+                data = dreampets.parse_card_text(card.get("text"))
+                link = dreampets.PRODUCT_PATH_RE.search(card.get("href") or "")
+                if link:
+                    self._upsert(products, data, now, "браузер", link.group(1))
+            self._step("browser", base, f"карточек: {len(cards)}, заголовок: {result.get('title')}")
+            # Запросы, которые сделала сама страница: если в ответе товары с ценами —
+            # запоминаем адрес и дальше читаем его напрямую.
+            api = [u for u in (result.get("api") or []) if not re.search(r"\.(js|css|png|jpe?g|webp|svg|woff2?)(\?|$)", u)]
+            responses = browser.evaluate(cdp.JS_FETCH_MANY % json.dumps(api[:20]), timeout=120) or {} if api else {}
+            useful = []
+            for url, (status, text) in responses.items():
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    continue
+                if self._absorb_json(data, products, now, "данные площадки") >= 10:
+                    useful.append(url)
+            self.report["api_seen"] = api[:50]
+            if useful:
+                self.cache["api_urls"] = useful[:5]
+            if read_pages:
+                # Обычные запросы не пускают — страницы товаров через браузер (с его cookies).
+                due = [e["url"] for k, e in sorted(products.items(), key=lambda kv: kv[1].get("page_at", 0))
+                       if e.get("url") and k not in self.fresh][:self.BROWSER_PAGES]
+                pages = browser.evaluate(cdp.JS_FETCH_MANY % json.dumps(due), timeout=240) or {} if due else {}
+                for url, (status, text) in pages.items():
+                    key = self._key(url)
+                    if status == 200:
+                        parsed = dreampets.parse_product_page(text)
+                        if parsed["price"] is not None or parsed["lots"] is not None:
+                            self._upsert(products, parsed, time.time(), "браузер", key=key)
+                    if key in products:
+                        products[key]["page_at"] = time.time()
+
+    # --- результат ---
+
+    def _offers(self, products):
+        offers = []
+        for key, entry in products.items():
+            lots = entry.get("lots")
+            price = entry.get("price")
+            if not entry.get("name") or (price is None and lots is None):
+                continue  # ещё не прочитан — данных нет (это не «нет в продаже»)
+            offers.append({
+                "id": key,
+                "name": entry["name"],
+                "price": price,
+                "currency": "RUB",
+                "stock": lots,
+                "sales_week": None,
+                "available": bool(lots) if lots is not None else price is not None,
+                "url": entry.get("url") or self.config["url"],
+            })
+        return offers
+
+    def _why_empty(self, blocked, products, market_html):
+        if blocked:
+            return f"DreamPets не пускает программу ({blocked}); отчёт сохранён в папке debug/dreampets"
+        if not products:
+            if market_html is None:
+                return "страница рынка DreamPets не открылась; отчёт сохранён в папке debug/dreampets"
+            return ("на странице рынка DreamPets не нашлось товаров (сайт рисует их скриптом, а Edge/Chrome "
+                    "не помог); отчёт сохранён в папке debug/dreampets")
+        return (f"товаров DreamPets: {len(products)}, но цены пока не прочитаны — страницы читаются по очереди; "
+                "если так и останется, пришлите папку debug/dreampets")
+
+    def _save_report(self, market_html):
+        try:
+            folder = Path(store.DATA_FILE).parent / "debug" / "dreampets"
+            folder.mkdir(parents=True, exist_ok=True)
+            if market_html:
+                (folder / "market.html").write_text(market_html[:3_000_000], encoding="utf-8")
+            report = dict(self.report, sources=self.sources, products=len(self.cache.get("products", {})))
+            (folder / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
 
 
 class EldoradoAdapter(Adapter):
@@ -986,6 +1314,7 @@ class MarketMonitor:
             self._save_state()  # кэш адаптера мог пополниться и до ошибки
             return
         index = build_index(items)
+        by_key = {item_id(item): item for item in items}
         matched = {}
         unmatched = 0
         for offer in offers:
@@ -997,7 +1326,12 @@ class MarketMonitor:
             previous = matched.get(key)
             if previous is None:
                 matched[key] = dict(offer)
-            else:  # несколько предложений одного предмета: самое дешёвое, количество суммируется
+            elif offer.get("id") is not None and previous.get("id") is not None and offer["id"] != previous["id"]:
+                # Разные товары площадки с одним названием (Cane 2015 / 2018 / 2021):
+                # не смешивать, а выбрать подходящий этому предмету.
+                if _variant_rank(by_key[key], offer) < _variant_rank(by_key[key], previous):
+                    matched[key] = dict(offer)
+            else:  # несколько предложений одного товара: самое дешёвое, количество суммируется
                 prices = [p for p in (previous.get("price"), offer.get("price")) if p]
                 previous["price"] = min(prices) if prices else None
                 if offer.get("stock") is not None:
@@ -1076,6 +1410,9 @@ class MarketMonitor:
                 info = assess_offer(offer, sold_48h, listed_48h)
                 info.update({
                     "price": offer.get("price"),
+                    "price_rub": offer.get("price_rub"),
+                    "price_rub_approx": bool(offer.get("price_rub_approx")),
+                    "year": offer.get("year"),
                     "currency": offer.get("currency") or "USD",
                     "fee": config.get("fee", 0),
                     "stock": offer.get("stock"),

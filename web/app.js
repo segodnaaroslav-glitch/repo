@@ -128,6 +128,68 @@ function priceNode(value, currency, className) {
   return box;
 }
 
+function finite(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+// Цена площадки в обеих валютах. Точные — как на самой площадке (StarPets сам
+// задаёт и доллары, и рубли); пересчитанные по курсу — с пометкой «≈».
+// factor — множитель (комиссия, количество).
+function infoMoney(info, factor = 1) {
+  if (!info) return null;
+  const rate = usdRub();
+  let usd = info.currency === "RUB" ? null : finite(info.price);
+  let rub = info.currency === "RUB" ? finite(info.price) : finite(info.price_rub);
+  let usdApprox = false;
+  let rubApprox = info.currency !== "RUB" && Boolean(info.price_rub_approx) && rub !== null;
+  if (usd === null && rub === null) return null;
+  if (rub === null && rate) {
+    rub = usd * rate;
+    rubApprox = true;
+  }
+  if (usd === null && rate) {
+    usd = rub / rate;
+    usdApprox = true;
+  }
+  return {
+    usd: usd === null ? null : usd * factor,
+    rub: rub === null ? null : rub * factor,
+    usdApprox,
+    rubApprox,
+    primary: info.currency === "RUB" ? "rub" : "usd",
+  };
+}
+
+function moneyText(money, currency) {
+  const value = money[currency];
+  if (value === null || value === undefined) return null;
+  const approx = currency === "usd" ? money.usdApprox : money.rubApprox;
+  return `${approx ? "≈" : ""}${currency === "usd" ? fmtUsd(value) : fmtRub(value)}`;
+}
+
+function moneyNode(money, className) {
+  if (!money) return el("span", "muted", "нет в продаже");
+  const box = el("span", `price ${className || ""}`);
+  const order = money.primary === "rub" ? ["rub", "usd"] : ["usd", "rub"];
+  const first = moneyText(money, order[0]) || moneyText(money, order[1]);
+  const second = moneyText(money, order[0]) ? moneyText(money, order[1]) : null;
+  box.append(el("b", "", first));
+  if (second) box.append(el("span", "muted", ` · ${second}`));
+  if (money.usdApprox || money.rubApprox) {
+    box.title = "≈ — пересчитано по курсу; без знака — цена самой площадки";
+  }
+  return box;
+}
+
+function addMoney(total, money) {
+  for (const currency of ["usd", "rub"]) {
+    if (money[currency] === null) total.incomplete = true;
+    else total[currency] += money[currency];
+  }
+  total.usdApprox = total.usdApprox || money.usdApprox;
+  total.rubApprox = total.rubApprox || money.rubApprox;
+}
+
 function marketInfo(item, id) {
   return item.market && item.market[id] ? item.market[id] : null;
 }
@@ -219,10 +281,9 @@ function sortValue(item, key) {
     case "liquidity": return (item.combined || {}).score;
     case "starpets":
     case "dreampets": {
-      const info = marketInfo(item, key);
-      if (!info || info.price === null || info.price === undefined) return null;
-      const rate = usdRub() || 1;
-      return info.currency === "RUB" ? info.price / rate : info.price;
+      const money = infoMoney(marketInfo(item, key));
+      if (!money) return null;
+      return money.usd !== null ? money.usd : money.rub / 100;
     }
     default: return item.secret ? null : item.value;  // секретные — в конец
   }
@@ -573,7 +634,7 @@ function itemCard(item) {
     const info = marketInfo(item, id);
     const row = el("div", `mp ${id}`);
     row.append(el("span", "mp-name", marketTitle(id)));
-    row.append(info ? priceNode(info.price, info.currency) : el("span", "muted", "нет в продаже"));
+    row.append(info ? moneyNode(infoMoney(info)) : el("span", "muted", "нет в продаже"));
     if (info && id === "dreampets" && info.stock !== null && info.stock !== undefined) {
       row.append(el("span", "muted", ` · ${info.stock} лот.`));
     }
@@ -687,7 +748,7 @@ function renderTable(rows) {
     const prices = MARKET_ORDER.map((id) => {
       const info = marketInfo(item, id);
       const td = el("td", "num price-cell");
-      td.append(info ? priceNode(info.price, info.currency) : el("span", "muted", "—"));
+      td.append(info ? moneyNode(infoMoney(info)) : el("span", "muted", "—"));
       return td;
     });
     tr.append(
@@ -768,13 +829,13 @@ function marketTile(item, id) {
     return tile;
   }
   const priceRow = el("div", "tile-price");
-  priceRow.append(priceNode(info.price, info.currency));
+  priceRow.append(moneyNode(infoMoney(info)));
   tile.append(priceRow);
   const fee = typeof info.fee === "number" ? info.fee : feeOf(id);
   if (info.price !== null && info.price !== undefined) {
     const payout = el("div", "tile-payout");
     payout.append(el("span", "muted", `Вы получите (−${Math.round(fee * 100)}%)`));
-    payout.append(priceNode(info.price * (1 - fee), info.currency, "payout"));
+    payout.append(moneyNode(infoMoney(info, 1 - fee), "payout"));
     tile.append(payout);
   }
   const stats = el("div", "mstats");
@@ -938,9 +999,11 @@ function liqItem(item, info) {
   const prices = el("div", "liq-meta");
   for (const id of MARKET_ORDER) {
     const market = marketInfo(item, id);
-    if (market && market.price !== null && market.price !== undefined) {
-      const pair = bothPrices(market.price, market.currency);
-      prices.append(`${marketTitle(id)}: ${pair[0]}${pair[1] ? ` (${pair[1]})` : ""}  `);
+    const money = infoMoney(market);
+    if (money) {
+      const order = money.primary === "rub" ? ["rub", "usd"] : ["usd", "rub"];
+      const texts = order.map((currency) => moneyText(money, currency)).filter(Boolean);
+      prices.append(`${marketTitle(id)}: ${texts[0]}${texts[1] ? ` (${texts[1]})` : ""}  `);
     }
   }
   if (prices.textContent) li.append(prices);
@@ -1012,7 +1075,7 @@ function payoutCell(info, id) {
     return td;
   }
   const fee = typeof info.fee === "number" ? info.fee : feeOf(id);
-  td.append(priceNode(info.price * (1 - fee), info.currency, "payout"));
+  td.append(moneyNode(infoMoney(info, 1 - fee), "payout"));
   return td;
 }
 
@@ -1063,9 +1126,9 @@ function renderMarketsTab() {
     nameCell.append(art, el("span", "", item.name));
     const supreme = item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value);
     const spPrice = el("td", "num");
-    spPrice.append(sp ? priceNode(sp.price, sp.currency) : el("span", "muted", "—"));
+    spPrice.append(sp ? moneyNode(infoMoney(sp)) : el("span", "muted", "—"));
     const dpPrice = el("td", "num");
-    dpPrice.append(dp ? priceNode(dp.price, dp.currency) : el("span", "muted", "—"));
+    dpPrice.append(dp ? moneyNode(infoMoney(dp)) : el("span", "muted", "—"));
     tr.append(
       nameCell,
       el("td", "num muted", supreme),
@@ -1230,26 +1293,16 @@ function calcFee(id) {
   return calc.fees && typeof calc.fees[id] === "number" ? calc.fees[id] : feeOf(id);
 }
 
-const CALC_CURRENCY = { starpets: "USD", dreampets: "RUB" };
-
-function calcPayout(item, id) {
+function calcMoney(item, id) {
   const info = item.prices[id];
-  if (!info || info.price === null || info.price === undefined) return null;
-  return info.price * (1 - calcFee(id)) * item.qty;
-}
-
-function inCurrency(amount, from, to) {
-  if (from === to) return amount;
-  const rate = usdRub();
-  if (!rate) return null;
-  return to === "USD" ? amount / rate : amount * rate;
+  if (!info || (finite(info.price) === null && finite(info.price_rub) === null)) return null;
+  return infoMoney(info, (1 - calcFee(id)) * item.qty);
 }
 
 function fillCalcSums(item, sums) {
   for (const id of MARKET_ORDER) {
-    const payout = calcPayout(item, id);
-    sums[id].replaceChildren(payout === null ? el("span", "muted", "—")
-      : priceNode(payout, item.prices[id].currency, "payout"));
+    const money = calcMoney(item, id);
+    sums[id].replaceChildren(money === null ? el("span", "muted", "—") : moneyNode(money, "payout"));
   }
 }
 
@@ -1273,8 +1326,9 @@ function renderCalc() {
     for (const id of MARKET_ORDER) {
       const info = item.prices[id];
       const unit = el("td", "num");
-      if (info && info.price !== null && info.price !== undefined) {
-        unit.append(priceNode(info.price, info.currency));
+      const unitMoney = infoMoney(info);
+      if (unitMoney) {
+        unit.append(moneyNode(unitMoney));
       } else {
         unit.append(el("span", "muted", "нет в продаже"));
       }
@@ -1325,37 +1379,36 @@ function renderCalcTotals() {
   }
   const totals = {};
   const missing = {};
-  let noRate = false;
   for (const id of MARKET_ORDER) {
-    totals[id] = 0;
+    totals[id] = { usd: 0, rub: 0, usdApprox: false, rubApprox: false, incomplete: false,
+      primary: id === "dreampets" ? "rub" : "usd" };
     missing[id] = 0;
     for (const item of calc.items) {
-      const payout = calcPayout(item, id);
-      if (payout === null) {
-        missing[id] += item.qty;
-        continue;
-      }
-      const converted = inCurrency(payout, item.prices[id].currency, CALC_CURRENCY[id]);
-      if (converted === null) noRate = true;
-      else totals[id] += converted;
+      const money = calcMoney(item, id);
+      if (money === null) missing[id] += item.qty;
+      else addMoney(totals[id], money);
     }
   }
   for (const id of MARKET_ORDER) {
     const card = el("div", `total ${id}`);
     card.append(el("span", "muted", `${marketTitle(id)} — вы получите (−${Math.round(calcFee(id) * 100)}%)`));
     const sum = el("div", "total-sum");
-    sum.append(priceNode(totals[id], CALC_CURRENCY[id]));
+    sum.append(moneyNode(totals[id]));
     card.append(sum);
     if (missing[id]) card.append(el("span", "muted small", `не продаётся там: ${missing[id]} шт.`));
     box.append(card);
   }
-  if (noRate) box.append(el("p", "hint", "Нет курса доллара — часть цен не пересчитана."));
-  const rate = usdRub();
-  if (rate && (totals.starpets || totals.dreampets)) {
-    const star = totals.starpets * rate;
-    const best = star > totals.dreampets ? "starpets" : "dreampets";
-    const diff = Math.abs(star - totals.dreampets);
-    box.append(el("p", "hint", `Выгоднее продать на ${marketTitle(best)} — больше на ${fmtRub(diff)}.`));
+  if (MARKET_ORDER.some((id) => totals[id].incomplete)) {
+    box.append(el("p", "hint", "Нет курса доллара — часть сумм не пересчитана в другую валюту."));
+  }
+  const star = totals.starpets;
+  const dream = totals.dreampets;
+  if ((star.rub || dream.rub) && !star.incomplete && !dream.incomplete) {
+    // Сравнение в рублях: у StarPets — его собственные рублёвые цены, у DreamPets — рубли.
+    const best = star.rub > dream.rub ? "starpets" : "dreampets";
+    const diff = Math.abs(star.rub - dream.rub);
+    const approx = star.rubApprox || dream.rubApprox ? "≈" : "";
+    box.append(el("p", "hint", `Выгоднее продать на ${marketTitle(best)} — больше на ${approx}${fmtRub(diff)}.`));
   }
 }
 

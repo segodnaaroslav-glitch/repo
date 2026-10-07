@@ -230,6 +230,7 @@ class FakeApi(BaseHTTPRequestHandler):
     """StarPets API для тестов."""
     calls = []
     info_status = 200
+    rub_status = 200
 
     def log_message(self, *args):
         pass
@@ -245,10 +246,15 @@ class FakeApi(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.calls.append(("POST", self.path, body))
         kind = body["filter"]["types"][0]["type"]
+        if body["currency"] == "rub" and self.rub_status != 200:
+            return self._send(self.rub_status, {"status": False, "message": '"currency" must be one of [usd]'})
+        rub = body["currency"] == "rub"
         rows = {
             "weapon": [
-                {"id": 485, "name": "Luger", "type": "weapon", "subtype": "gun", "chroma": False, "price": 1.02},
-                {"id": 756, "name": "Luger", "type": "weapon", "subtype": "gun", "chroma": True, "price": 2.0},
+                {"id": 485, "name": "Luger", "type": "weapon", "subtype": "gun", "chroma": False,
+                 "price": 75.0 if rub else 1.02},
+                {"id": 756, "name": "Luger", "type": "weapon", "subtype": "gun", "chroma": True,
+                 "price": 150.5 if rub else 2.0},
                 {"id": 900, "name": "Gone", "type": "weapon", "subtype": "knife", "chroma": False, "price": None},
             ],
             "pet": [], "misc": [],
@@ -265,6 +271,7 @@ class StarPetsTests(unittest.TestCase):
     def setUp(self):
         FakeApi.calls = []
         FakeApi.info_status = 200
+        FakeApi.rub_status = 200
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeApi)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.addCleanup(self.httpd.server_close)
@@ -284,11 +291,36 @@ class StarPetsTests(unittest.TestCase):
         self.assertFalse(by_name["Gone"]["available"])
         self.assertEqual(by_name["Chroma Luger"]["sales_week"], 75)  # самые дорогие — первыми
         self.assertEqual(by_name["Luger"]["url"], "https://starpets.gg/mm2/shop/weapon/luger/485")
+        # Рубли — цены самой площадки, а не доллары по курсу.
+        self.assertEqual((by_name["Luger"]["price_rub"], by_name["Chroma Luger"]["price_rub"]), (75.0, 150.5))
+        self.assertFalse(by_name["Luger"]["price_rub_approx"])
         posts = [c for c in FakeApi.calls if c[0] == "POST"]
-        self.assertEqual([p[2]["filter"]["types"][0]["type"] for p in posts], ["weapon", "pet", "misc"])
+        self.assertEqual([(p[2]["currency"], p[2]["filter"]["types"][0]["type"]) for p in posts],
+                         [("usd", "weapon"), ("usd", "pet"), ("usd", "misc"),
+                          ("rub", "weapon"), ("rub", "pet"), ("rub", "misc")])
         gets_before = len([c for c in FakeApi.calls if c[0] == "GET"])
-        markets.StarPetsAdapter(self.config, cache).fetch()  # продажи уже свежие — не запрашиваются снова
-        self.assertEqual(len([c for c in FakeApi.calls if c[0] == "GET"]), gets_before)
+        FakeApi.calls = []
+        offers = markets.StarPetsAdapter(self.config, cache).fetch()  # продажи уже свежие — не запрашиваются снова
+        self.assertEqual(len([c for c in FakeApi.calls if c[0] == "GET"]), 0)
+        self.assertGreater(gets_before, 0)
+        # Дальше — по одной валюте за опрос (меньше запросов), цены другой — из прошлого раза.
+        self.assertEqual({p[2]["currency"] for p in FakeApi.calls if p[0] == "POST"}, {"usd"})
+        self.assertEqual({o["name"]: o["price_rub"] for o in offers}["Luger"], 75.0)
+        FakeApi.calls = []
+        markets.StarPetsAdapter(self.config, cache).fetch()
+        self.assertEqual({p[2]["currency"] for p in FakeApi.calls if p[0] == "POST"}, {"rub"})
+
+    def test_rubles_unavailable_falls_back_to_site_rate(self):
+        FakeApi.rub_status = 400
+        cache = {}
+        adapter = markets.StarPetsAdapter(self.config, cache)
+        offers = {o["name"]: o for o in adapter.fetch()}
+        self.assertEqual(offers["Luger"]["price"], 1.02)
+        self.assertIsNone(offers["Luger"]["price_rub"])  # курса площадки ещё нет — рублей нет, а не выдумка
+        self.assertIn("рублях", adapter.note)
+        FakeApi.calls = []
+        markets.StarPetsAdapter(self.config, cache).fetch()  # следующий опрос — доллары, а не снова рубли
+        self.assertEqual({p[2]["currency"] for p in FakeApi.calls if p[0] == "POST"}, {"usd"})
 
     def test_sales_endpoint_missing_is_paused(self):
         FakeApi.info_status = 404
@@ -306,11 +338,18 @@ class StarPetsTests(unittest.TestCase):
         self.assertTrue(all(o["sales_week"] is None for o in offers))
 
 
+def no_browser(test):
+    patcher = unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=None)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class DreamPetsTests(unittest.TestCase):
     def setUp(self):
         patcher = unittest.mock.patch.object(markets, "_pause")
         patcher.start()
         self.addCleanup(patcher.stop)
+        no_browser(self)
 
     def test_market_and_product_pages(self):
         routes = {
@@ -331,7 +370,7 @@ class DreamPetsTests(unittest.TestCase):
         self.assertEqual((offers["Harvester"]["price"], offers["Harvester"]["stock"], offers["Harvester"]["currency"]),
                          (328.98, 674, "RUB"))
         self.assertEqual((offers["Seer"]["price"], offers["Seer"]["stock"]), (17.0, 82))
-        self.assertIn("товаров на рынке: 2", adapter.note)
+        self.assertIn("товаров: 2, с ценой: 2", adapter.note)
 
     def test_empty_market_is_an_error(self):
         httpd, base = serve({"/mm2/": "<html>nothing</html>"})
@@ -527,6 +566,9 @@ class StarPetsRotationTests(unittest.TestCase):
 
 
 class DreamPetsReviewTests(unittest.TestCase):
+    def setUp(self):
+        no_browser(self)
+
     def test_all_pages_failing_is_an_error(self):
         httpd, base = serve({"/mm2/": '<a href="/mm2/product/a/1">A</a><a href="/mm2/product/b/2">B</a>'})
         self.addCleanup(httpd.server_close)
@@ -536,11 +578,10 @@ class DreamPetsReviewTests(unittest.TestCase):
                 markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": base + "/mm2/"}).fetch()
 
     def test_lots_do_not_join_neighbouring_numbers(self):
-        adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dreampets.gg/mm2/"})
         page = ('<title>Seer - ММ2</title><meta name="description" content="Seer в ММ2 от 17 ₽, 114 лотов">'
                 '<p>ММ2</p><p>2 лота</p>')
-        self.assertEqual(adapter._parse_product(page)["lots"], 114)
-        self.assertEqual(adapter._parse_product("<title>X</title><p>1 234 лота</p>")["lots"], 1234)
+        self.assertEqual(markets.dreampets.parse_product_page(page)["lots"], 114)
+        self.assertEqual(markets.dreampets.parse_product_page("<title>X</title><p>1 234 лота</p>")["lots"], 1234)
 
 
 if __name__ == "__main__":
@@ -548,6 +589,9 @@ if __name__ == "__main__":
 
 
 class DreamPetsMarketCardsTests(unittest.TestCase):
+    def setUp(self):
+        no_browser(self)
+
     def test_prices_and_lots_from_market_page(self):
         market = (
             '<div class="product-card"><a href="/mm2/product/eternal-iii/43948eb3-1e25-4564">'
@@ -566,12 +610,12 @@ class DreamPetsMarketCardsTests(unittest.TestCase):
             offers = {o["name"]: o for o in adapter.fetch()}
         self.assertEqual((offers["Eternal III"]["price"], offers["Eternal III"]["stock"]), (23.71, 114))
         self.assertEqual((offers["Harvester"]["price"], offers["Harvester"]["stock"]), (328.98, 1234))
-        self.assertIn("со страницы рынка: 2", adapter.note)
+        self.assertIn("страница рынка: 2", adapter.note)
         self.assertNotIn("Candy", offers)  # без цены и без страницы товара (404) — пока нет данных
         self.assertTrue(any("/product/candy/" in str(call) for call in request.call_args_list))
 
     def test_name_from_link(self):
-        self.assertEqual(markets.DreamPetsAdapter._name_from_link("https://dreampets.gg/mm2/product/eternal-iii/43948eb3-1e25"),
+        self.assertEqual(markets.dreampets.slug_name("https://dreampets.gg/mm2/product/eternal-iii/43948eb3-1e25-4564-8102-65bcaeea06db"),
                          "eternal iii")
 
 
@@ -605,16 +649,19 @@ class MarketsCalcReviewTests(MonitorTests):
 
 
 class DreamPetsReviewV4Tests(unittest.TestCase):
+    def setUp(self):
+        no_browser(self)
+
     def test_card_prices(self):
-        cards = markets.DreamPetsAdapter._cards
         adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dreampets.gg/mm2/"})
+        adapter.root = "https://dreampets.gg"
         page = ('<a href="/mm2/product/a/11111111-1111"><p>Alpha</p><span>от 1,299.50 ₽</span></a>'
                 '<a href="/mm2/product/b/22222222-2222"><p>Beta</p><span>от 12,345 ₽</span></a>'
                 '<a href="/mm2/product/c/33333333-3333"><p>Eternal III / Вечный 3</p><b>23,71 ₽</b></a>'
                 '<a href="/mm2/product/d/44444444-4444"><p>Delta</p><i>114</i><b>23,71 ₽</b></a>'
                 '<a href="/mm2/product/e/55555555-5555"><p>Echo</p><span>от 1 299,50 ₽</span></a>'
                 '<a href="/mm2/product/f/66666666-6666"><p>Foxtrot</p><span>2 499</span><span>₽</span></a>')
-        prices = {c["name"]: c["price"] for c in cards(adapter, page, "https://dreampets.gg").values()}
+        prices = {c["name"]: c["price"] for c in adapter._cards(page).values()}
         self.assertEqual(prices, {"Alpha": 1299.5, "Beta": 12345.0, "Eternal III": 23.71, "Delta": 23.71,
                                   "Echo": 1299.5, "Foxtrot": 2499.0})
         self.assertEqual([markets._rub(t) for t in ("328.98", "34,99", "1.299,50", "1 234")], [328.98, 34.99, 1299.5, 1234.0])
@@ -644,3 +691,227 @@ class ListedLotsTests(unittest.TestCase):
         self.assertIn("новых лотов за 2 дня: 10", flooded["reasons"])
         balanced = markets.assess_offer({"stock": 20, "available": True}, 10, 10)
         self.assertGreaterEqual(balanced["score"], base["score"])
+
+
+class StarPetsVariantTests(unittest.TestCase):
+    def test_same_name_products_of_different_years_are_not_mixed(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "values.json"
+        data = store.empty_data()
+        store.replace_category(data, "ancients", [
+            parser.make_item("Cane", "ancients", {"value": "100", "demand": "3", "rarity": "3",
+                                                  "origin": "Christmas 2018"}),
+            parser.make_item("Elf", "pets", {"value": "50", "demand": "2", "rarity": "2"}),
+        ], "site")
+        store.save(data, path)
+
+        class Fake(markets.Adapter):
+            def fetch(self):
+                return [
+                    {"id": 1, "name": "Cane", "kind": "knife", "year": 2021, "price": 0.06, "price_rub": 4.0, "popularity": 0.1},
+                    {"id": 2, "name": "Cane", "kind": "knife", "year": 2018, "price": 13.7, "price_rub": 1000.0, "popularity": 0.5},
+                    {"id": 3, "name": "Elf", "kind": "pet", "year": 2016, "price": 0.72, "popularity": 0.9},
+                    {"id": 4, "name": "Elf", "kind": "pet", "year": 2019, "price": 18.52, "popularity": 0.2},
+                ]
+
+        monitor = markets.MarketMonitor(path, [{"id": "sp", "title": "SP", "kind": "fake", "url": "u"}],
+                                        adapters={"fake": Fake})
+        monitor.poll(monitor.markets[0])
+        items = {i["name"]: i for i in monitor.annotate([dict(i, liquidity=liquidity.assess(i))
+                                                          for i in store.load(path)["items"]])}
+        self.assertEqual((items["Cane"]["market"]["sp"]["price"], items["Cane"]["market"]["sp"]["price_rub"]), (13.7, 1000.0))
+        self.assertEqual(items["Elf"]["market"]["sp"]["price"], 18.52)  # без года — самый популярный, а не самый дешёвый
+
+
+U1 = "2c0af45a-9134-4c09-9b86-502e81ac758e"
+U2 = "3a61a47a-fde2-4740-8de8-c214e8aefca8"
+PRODUCT_PAGE = ('<html><head><title>Harvester — купить в ММ2 (Murder Mystery 2)</title>'
+                '<meta name="description" content="Купить Harvester в ММ2 от 328.98 ₽, 674 лотов."></head></html>')
+
+
+def serve_bytes(routes, status=None, delay=None):
+    """Как serve(), но тело может быть bytes (сжатая карта сайта), есть коды ответа и задержки."""
+    import time as _time
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            path = self.path
+            if delay and path in delay:
+                _time.sleep(delay[path])
+            if status and path in status:
+                self.send_response(status[path])
+                self.end_headers()
+                self.wfile.write(b"<html>Just a moment...</html>")
+                return
+            body = routes.get(path)
+            if body is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = body if isinstance(body, bytes) else body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json" if path.startswith("/api/") else "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+
+class DreamPetsDiscoveryTests(unittest.TestCase):
+    """Разные формы сайта: рынок рисуется скриптом, ссылки только в данных, карта сайта и т. д."""
+
+    def setUp(self):
+        for patch in (unittest.mock.patch.object(markets, "_pause"),
+                      unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=None)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data_file = Path(tmp.name) / "values.json"
+        patch = unittest.mock.patch.object(markets.store, "DATA_FILE", self.data_file)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_adapter(self, routes, cache=None, **kwargs):
+        httpd, base = serve_bytes(routes, **kwargs)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        for key, value in list(routes.items()):
+            if isinstance(value, str):
+                routes[key] = value.replace("http://X", base)
+        adapter = markets.DreamPetsAdapter({"id": "dreampets", "title": "DreamPets", "kind": "dreampets",
+                                            "url": base + "/mm2/"}, cache if cache is not None else {})
+        return adapter, base
+
+    def test_spa_market_with_nested_gzip_sitemap(self):
+        import gzip
+        routes = {
+            "/mm2/": '<div id="app"></div><script src="/assets/index.js"></script>',
+            "/robots.txt": "User-agent: *\nSitemap: http://X/sitemap-index.xml\n",
+            "/sitemap-index.xml": '<sitemapindex><sitemap><loc>http://X/sitemaps/mm2.xml.gz</loc></sitemap></sitemapindex>',
+            f"/mm2/product/harvester/{U1}": PRODUCT_PAGE,
+        }
+        adapter, base = self.run_adapter(routes)
+        routes["/sitemaps/mm2.xml.gz"] = gzip.compress(
+            f'<urlset><url><loc>{base}/mm2/product/harvester/{U1}</loc></url>'
+            f'<url><loc>{base}/mm2-legacy/product/plasmite/{U2}</loc></url></urlset>'.encode())
+        offers = adapter.fetch()
+        self.assertEqual([(o["name"], o["price"], o["stock"]) for o in offers], [("Harvester", 328.98, 674)])
+        self.assertIn("карта сайта: 1", adapter.note)
+
+    def test_links_only_inside_next_data(self):
+        flight = '[\\"$\\",\\"a\\",null,{\\"href\\":\\"/mm2/product/harvester/%s\\",\\"children\\":\\"Harvester\\"}]' % U1
+        routes = {"/mm2/": '<div></div><script>self.__next_f.push([1,"%s"])</script>' % flight,
+                  f"/mm2/product/harvester/{U1}": PRODUCT_PAGE}
+        adapter, _ = self.run_adapter(routes)
+        self.assertEqual([(o["name"], o["price"]) for o in adapter.fetch()], [("Harvester", 328.98)])
+
+    def test_prices_inside_page_data_need_one_request(self):
+        data = {"props": {"pageProps": {"products": [
+            {"id": U1, "slug": "harvester", "name": "Harvester", "minPrice": 328.98, "lotsCount": 674},
+            {"id": U2, "slug": "gemstone", "name": {"en": "Gemstone", "ru": "Самоцвет"}, "minPrice": "52.99", "lotsCount": 60},
+        ]}}}
+        routes = {"/mm2/": '<script id="__NEXT_DATA__" type="application/json">%s</script>' % json.dumps(data)}
+        adapter, _ = self.run_adapter(routes)
+        offers = {o["name"]: (o["price"], o["stock"]) for o in adapter.fetch()}
+        self.assertEqual(offers, {"Harvester": (328.98, 674), "Gemstone": (52.99, 60)})
+
+    def test_slow_or_broken_page_does_not_stop_the_rest(self):
+        links = "".join(f'<a href="/mm2/product/{n}/{u}">{n}</a>' for n, u in (("harvester", U1), ("gemstone", U2)))
+        routes = {"/mm2/": links, f"/mm2/product/harvester/{U1}": PRODUCT_PAGE}
+        adapter, _ = self.run_adapter(routes, delay={f"/mm2/product/gemstone/{U2}": 3})
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "PAGE_TIMEOUT", 1):
+            offers = adapter.fetch()
+        self.assertEqual([(o["name"], o["price"]) for o in offers], [("Harvester", 328.98)])
+        gem = next(e for e in adapter.cache["products"].values() if e.get("name") == "gemstone")
+        self.assertGreater(gem.get("page_at", 0), 0)  # в конец очереди, а не первым снова
+
+    def test_block_midway_keeps_what_was_read(self):
+        links = "".join(f'<a href="/mm2/product/{n}/{u}">{n}</a>' for n, u in (("harvester", U1), ("gemstone", U2)))
+        routes = {"/mm2/": links, f"/mm2/product/harvester/{U1}": PRODUCT_PAGE}
+        adapter, _ = self.run_adapter(routes, status={f"/mm2/product/gemstone/{U2}": 429})
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "WORKERS", 1):
+            offers = adapter.fetch()
+        self.assertEqual([(o["name"], o["price"]) for o in offers], [("Harvester", 328.98)])
+        self.assertIn("не обновлена", adapter.note)
+
+    def test_nothing_found_saves_report(self):
+        adapter, _ = self.run_adapter({"/mm2/": '<div id="app"></div>'})
+        with self.assertRaises(markets.fetcher.FetchError) as caught:
+            adapter.fetch()
+        self.assertIn("debug/dreampets", str(caught.exception))
+        report = json.loads((self.data_file.parent / "debug" / "dreampets" / "report.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(step["step"] == "market" for step in report["steps"]))
+
+    def test_old_cache_keyed_by_link_is_migrated(self):
+        cache = {"products": {f"https://dreampets.gg/mm2/product/harvester/{U1}": {"name": "Harvester", "price": 300.0,
+                                                                                  "lots": 600, "at": 1}}}
+        routes = {"/mm2/": f'<a href="/mm2/product/harvester/{U1}"><p>Harvester</p><b>от 328.98 ₽</b><i>674 лотов</i></a>'}
+        adapter, _ = self.run_adapter(routes, cache=cache)
+        offers = adapter.fetch()
+        self.assertEqual([(o["name"], o["price"], o["stock"]) for o in offers], [("Harvester", 328.98, 674)])
+        self.assertEqual(list(cache["products"]), [U1])
+
+
+def _test_browser():
+    import os
+    path = os.environ.get("MM2_TEST_BROWSER") or markets.fetcher.find_system_browser()
+    if not path and os.path.exists("/opt/pw-browsers/chromium"):
+        path = "/opt/pw-browsers/chromium"
+    return path
+
+
+@unittest.skipUnless(_test_browser(), "нет Edge/Chrome для проверки скрытого браузера")
+class DreamPetsBrowserTests(unittest.TestCase):
+    """Рынок рисуется скриптом: карточки появляются только в браузере."""
+
+    SPA = """<html><head><title>DreamPets — MM2</title></head><body><div id="app">Загрузка…</div>
+<script>
+fetch('/api/catalog?game=mm2').then((r) => r.json()).then((data) => {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  for (const p of data.items) {
+    const a = document.createElement('a');
+    a.href = '/mm2/product/' + p.slug + '/' + p.id;
+    a.innerHTML = '<span>Ancient</span><p>' + p.title + '</p><b>от ' + p.minPrice + ' ₽</b><i>' + p.lotsCount + ' лотов</i>';
+    app.appendChild(a);
+  }
+});
+</script></body></html>"""
+
+    def test_browser_reads_rendered_cards_and_remembers_the_api(self):
+        import uuid
+        items = [{"id": U1, "slug": "harvester", "title": "Harvester", "minPrice": 328.98, "lotsCount": 674}]
+        items += [{"id": str(uuid.UUID(int=i)), "slug": f"item-{i}", "title": f"Item {i}", "minPrice": 10 + i,
+                   "lotsCount": i} for i in range(1, 12)]
+        routes = {"/mm2/": self.SPA, "/api/catalog?game=mm2": json.dumps({"items": items})}
+        httpd, base = serve_bytes(routes)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (unittest.mock.patch.object(markets, "_pause"),
+                      unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=_test_browser()),
+                      unittest.mock.patch.object(markets.store, "DATA_FILE", Path(tmp.name) / "values.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        cache = {}
+        config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": base + "/mm2/"}
+        adapter = markets.DreamPetsAdapter(config, cache)
+        offers = {o["name"]: (o["price"], o["stock"]) for o in adapter.fetch()}
+        self.assertEqual(offers["Harvester"], (328.98, 674))  # «Ancient» — значок, а не название
+        self.assertEqual(len(offers), 12)
+        self.assertTrue(any("/api/catalog" in url for url in cache.get("api_urls", [])))
+        # Дальше — без браузера: найденный адрес данных читается напрямую.
+        with unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=None):
+            adapter = markets.DreamPetsAdapter(config, cache)
+            offers = {o["name"]: o["price"] for o in adapter.fetch()}
+        self.assertEqual(offers["Harvester"], 328.98)
+        self.assertIn("api", adapter.note)
