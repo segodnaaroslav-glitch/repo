@@ -162,7 +162,7 @@ function infoMoney(info, factor = 1) {
 
 function moneyText(money, currency) {
   const value = money[currency];
-  if (value === null || value === undefined) return null;
+  if (value === null || value === undefined || money[`missing_${currency}`]) return null;  // неполная сумма — не показывать
   const approx = currency === "usd" ? money.usdApprox : money.rubApprox;
   return `${approx ? "≈" : ""}${currency === "usd" ? fmtUsd(value) : fmtRub(value)}`;
 }
@@ -172,6 +172,7 @@ function moneyNode(money, className) {
   const box = el("span", `price ${className || ""}`);
   const order = money.primary === "rub" ? ["rub", "usd"] : ["usd", "rub"];
   const first = moneyText(money, order[0]) || moneyText(money, order[1]);
+  if (!first) return el("span", "muted", "—");
   const second = moneyText(money, order[0]) ? moneyText(money, order[1]) : null;
   box.append(el("b", "", first));
   if (second) box.append(el("span", "muted", ` · ${second}`));
@@ -183,8 +184,12 @@ function moneyNode(money, className) {
 
 function addMoney(total, money) {
   for (const currency of ["usd", "rub"]) {
-    if (money[currency] === null) total.incomplete = true;
-    else total[currency] += money[currency];
+    if (money[currency] === null) {
+      total.incomplete = true;
+      total[`missing_${currency}`] = true;
+    } else {
+      total[currency] += money[currency];
+    }
   }
   total.usdApprox = total.usdApprox || money.usdApprox;
   total.rubApprox = total.rubApprox || money.rubApprox;
@@ -1403,7 +1408,7 @@ function renderCalcTotals() {
   }
   const star = totals.starpets;
   const dream = totals.dreampets;
-  if ((star.rub || dream.rub) && !star.incomplete && !dream.incomplete) {
+  if ((star.rub || dream.rub) && !star.missing_rub && !dream.missing_rub) {
     // Сравнение в рублях: у StarPets — его собственные рублёвые цены, у DreamPets — рубли.
     const best = star.rub > dream.rub ? "starpets" : "dreampets";
     const diff = Math.abs(star.rub - dream.rub);

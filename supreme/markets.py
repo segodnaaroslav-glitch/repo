@@ -385,6 +385,7 @@ class StarPetsAdapter(Adapter):
         if not due:
             due = [min(self.CURRENCIES, key=lambda c: prices[c]["at"])]
         rows_by_id, complete, notes = {}, True, []
+        blocked_seen = False
         for currency in due:
             try:
                 rows, whole = self._sweep(api, currency)
@@ -392,11 +393,15 @@ class StarPetsAdapter(Adapter):
                 blocked = isinstance(error, (fetcher.BlockedError, fetcher.NetworkError))
                 if currency == "usd" or (blocked and not rows_by_id):
                     raise
-                # Рубли не получены: в следующий раз — доллары, рубли — последние известные.
+                # Рубли не получены: в следующий раз — доллары, рубли — последние известные
+                # (помечаются «≈», если устарели). at — когда пробовали, ok_at — когда получили.
                 prices.setdefault(currency, {"rows": {}})["at"] = time.time()
-                notes.append(f"цены в рублях сейчас не получены ({error}) — показаны последние известные")
+                blocked_seen = blocked_seen or blocked
+                notes.append(f"цены в рублях сейчас не получены ({error})")
                 continue
-            prices[currency] = {"at": time.time(), "rows": {key: row.get("price") for key, row in rows.items()}}
+            now = time.time()
+            prices[currency] = {"at": now, "ok_at": now,
+                                "rows": {key: row.get("price") for key, row in rows.items()}}
             complete = complete and whole
             for key, row in rows.items():
                 rows_by_id.setdefault(key, row)
@@ -408,7 +413,16 @@ class StarPetsAdapter(Adapter):
             self.cache["rows"] = {key: {k: row.get(k) for k in self._ROW_FIELDS} for key, row in rows_by_id.items()}
         self.complete = complete
         offers = self._offers(rows_by_id, prices)
-        self._add_sales(api, offers)
+        if self._rub_stale(prices) and not notes:
+            notes.append("цены в рублях StarPets сейчас не получены — показаны последние известные (≈)")
+        try:
+            # После блокировки в этом опросе продажи не запрашиваем: площадка ещё не пускает.
+            self._add_sales(api, offers, request=not blocked_seen)
+        except (fetcher.BlockedError, fetcher.NetworkError) as error:
+            if not rows_by_id:
+                raise
+            self.cache["info_off_until"] = time.time() + BLOCKED_PAUSE
+            notes.append(f"продажи за неделю сейчас не получены ({error})")
         if notes:
             self.note = "; ".join([self.note] + notes) if self.note else "; ".join(notes)
         return offers
@@ -443,9 +457,18 @@ class StarPetsAdapter(Adapter):
                 rows.setdefault(key, dict(row, _rank=rank / total, _type=kind))
         return rows, whole
 
+    def _rub_stale(self, prices):
+        """Рубли давно не обновлялись (площадка их не отдаёт) — показывать как примерные."""
+        entry = prices.get("rub", {})
+        ok_at = entry.get("ok_at", entry.get("at", 0))  # кэш прошлой версии хранил только at
+        return bool(entry.get("rows")) and time.time() - ok_at > 3 * (self.config.get("interval") or 300)
+
     def _offers(self, rows, prices):
         usd = prices.get("usd", {}).get("rows", {})
         rub = prices.get("rub", {}).get("rows", {})
+        rub_stale = self._rub_stale(prices)
+        # Есть ли товар в продаже — по более свежему из двух снимков.
+        usd_newer = prices.get("usd", {}).get("ok_at", 0) >= prices.get("rub", {}).get("ok_at", 0)
         # Курс самой площадки (медиана рубли/доллары) — только для товаров, у которых
         # рублёвой цены ещё нет; такие цены помечаются как примерные.
         ratios = sorted(_price(rub[k]) / _price(usd[k]) for k in usd
@@ -455,13 +478,17 @@ class StarPetsAdapter(Adapter):
         for key, row in rows.items():
             price = _price(usd.get(key))
             price_rub = _price(rub.get(key))
-            approx = False
-            if price_rub is None and price is not None and site_rate and key not in rub:
+            approx = rub_stale and price_rub is not None
+            if price_rub is None and price is not None and site_rate and (key not in rub or rub_stale):
                 price_rub, approx = round(price * site_rate, 2), True
-            offers.append(self._offer(row, price, price_rub, approx))
+            if usd_newer or approx or key not in rub:
+                available = price is not None
+            else:
+                available = _price(rub.get(key)) is not None
+            offers.append(self._offer(row, price, price_rub, approx, available))
         return offers
 
-    def _offer(self, row, price, price_rub=None, rub_approx=False):
+    def _offer(self, row, price, price_rub=None, rub_approx=False, available=None):
         kind = row.get("_type") or row.get("type") or "weapon"
         name = str(row.get("name") or "")
         if row.get("chroma") and not name.lower().startswith("chroma"):
@@ -488,16 +515,17 @@ class StarPetsAdapter(Adapter):
             "currency": "USD",
             "stock": None,
             "sales_week": None,
-            "available": price is not None or (price_rub is not None and not rub_approx),
+            "available": (price is not None or (price_rub is not None and not rub_approx))
+                         if available is None else available,
             "popularity": row.get("_rank"),
             "url": url,
             "id": product_id,
         }
 
-    def _add_sales(self, api, offers):
+    def _add_sales(self, api, offers, request=True):
         sales = self.cache.setdefault("sales", {})
         now = time.time()
-        if self.cache.get("info_off_until", 0) <= now:
+        if request and self.cache.get("info_off_until", 0) <= now:
             # По очереди: сначала ни разу не запрошенные, потом самые старые;
             # при равенстве — более дорогие.
             due = sorted(
@@ -680,6 +708,19 @@ class DreamPetsAdapter(Adapter):
             entry["name"] = name
         elif not entry.get("name") and link:
             entry["name"] = dreampets.slug_name(link)
+        if not key.startswith("name:") and entry.get("name"):
+            # Тот же товар мог прийти раньше без ссылки (по названию) — сливаем в одну запись.
+            twin = "name:" + parser.name_key(entry["name"])
+            if twin in products and twin != key:
+                old = products.pop(twin)
+                if old.get("at", 0) > entry.get("at", 0):  # новые данные ниже всё равно перезапишут
+                    for field in ("price", "lots", "at", "source"):
+                        if old.get(field) is not None:
+                            entry[field] = old[field]
+                for marks in (self.fresh, self.fresh_price):
+                    if twin in marks:
+                        marks.discard(twin)
+                        marks.add(key)
         got = False
         if data.get("price") is not None:
             entry["price"] = data["price"]
@@ -1326,7 +1367,8 @@ class MarketMonitor:
             previous = matched.get(key)
             if previous is None:
                 matched[key] = dict(offer)
-            elif offer.get("id") is not None and previous.get("id") is not None and offer["id"] != previous["id"]:
+            elif (offer.get("id") is not None and previous.get("id") is not None and offer["id"] != previous["id"]
+                  and (offer.get("year") is not None or previous.get("year") is not None)):
                 # Разные товары площадки с одним названием (Cane 2015 / 2018 / 2021):
                 # не смешивать, а выбрать подходящий этому предмету.
                 if _variant_rank(by_key[key], offer) < _variant_rank(by_key[key], previous):

@@ -915,3 +915,52 @@ fetch('/api/catalog?game=mm2').then((r) => r.json()).then((data) => {
             offers = {o["name"]: o["price"] for o in adapter.fetch()}
         self.assertEqual(offers["Harvester"], 328.98)
         self.assertIn("api", adapter.note)
+
+
+class StarPetsReviewV5Tests(unittest.TestCase):
+    def setUp(self):
+        FakeApi.calls = []
+        FakeApi.info_status = 200
+        FakeApi.rub_status = 200
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeApi)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.config = {"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "https://starpets.gg/mm2",
+                       "api": f"http://127.0.0.1:{self.httpd.server_address[1]}", "interval": 300}
+        patcher = unittest.mock.patch.object(markets, "_pause")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_block_on_rubles_keeps_dollar_prices(self):
+        FakeApi.rub_status = 429
+        cache = {}
+        adapter = markets.StarPetsAdapter(self.config, cache)
+        offers = {o["name"]: o for o in adapter.fetch()}  # не исключение: доллары сохранены
+        self.assertEqual(offers["Luger"]["price"], 1.02)
+        self.assertEqual([c for c in FakeApi.calls if c[0] == "GET"], [])  # продажи после блокировки не запрашивались
+        self.assertIn("рублях", adapter.note)
+
+    def test_old_rubles_are_marked_approximate(self):
+        cache = {}
+        markets.StarPetsAdapter(self.config, cache).fetch()
+        cache["prices"]["rub"]["ok_at"] -= 3600  # рубли не обновлялись час
+        FakeApi.rub_status = 400
+        adapter = markets.StarPetsAdapter(self.config, cache)
+        luger = {o["name"]: o for o in adapter.fetch()}["Luger"]
+        self.assertEqual(luger["price_rub"], 75.0)
+        self.assertTrue(luger["price_rub_approx"])
+        self.assertIn("рублях", adapter.note)
+
+
+class DreamPetsTwinTests(unittest.TestCase):
+    def test_product_found_by_name_and_by_link_is_one_entry(self):
+        adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dreampets.gg/mm2/"})
+        adapter.root = "https://dreampets.gg"
+        adapter.fresh, adapter.fresh_price, adapter.sources = set(), set(), {}
+        products = {}
+        adapter._upsert(products, {"name": "Harvester", "price": 900.0}, 1, "данные страницы")
+        adapter._upsert(products, {"name": "Harvester", "price": 328.98, "lots": 674}, 2, "страница рынка",
+                        f"/mm2/product/harvester/{U1}")
+        self.assertEqual(list(products), [U1])
+        self.assertEqual((products[U1]["price"], products[U1]["lots"]), (328.98, 674))
