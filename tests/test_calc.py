@@ -175,3 +175,107 @@ class OcrRowTests(unittest.TestCase):
         self.assertEqual({e["item"]["name"]: e["qty"] for e in found},
                          {"Harvester": 2, "Icebreaker": 1, "Seer": 1, "Flowerwood Gun": 1})
         self.assertEqual(unmatched, ["Inventory", "Trade"])
+
+
+class InventoryTileTests(unittest.TestCase):
+    """Плитки инвентаря со скриншота -> предметы (без настоящего распознавания)."""
+
+    def stock(self):
+        return items() + [
+            parser.make_item("Cowboy", "vintages", {"value": "40", "demand": "2", "rarity": "6"}),
+            parser.make_item("Cowboy", "rares", {"value": "3", "demand": "1", "rarity": "3"}),
+        ]
+
+    def test_banner_colour_to_rarity(self):
+        self.assertEqual(calc.banner_categories([230, 200, 0]), ("vintages",))
+        self.assertEqual(calc.banner_categories([220, 60, 180]), ("godlies",))
+        self.assertEqual(calc.banner_categories([40, 120, 230]), ("rares",))
+        self.assertEqual(calc.banner_categories([225, 225, 225]), ("commons",))
+        self.assertEqual(calc.banner_categories(None), ())
+
+    def test_same_item_on_two_screenshots_is_counted_once(self):
+        shot = [{"name": "Harvester", "qty": 3, "text": "Harvester", "score": 1.0},
+                {"name": "Seer", "qty": 1, "text": "Seer", "score": 1.0}]
+        other = [{"name": "Harvester", "qty": 3, "text": "Harvester", "score": 1.0},
+                 {"name": "Icebreaker", "qty": 2, "text": "Icebreaker", "score": 1.0}]
+        stock = items() + [parser.make_item("Seer", "godlies", {"value": "5", "demand": "1", "rarity": "1"})]
+        found, unmatched = calc.match_tiles([shot, other], stock)
+        self.assertEqual({e["item"]["name"]: e["qty"] for e in found}, {"Harvester": 3, "Seer": 1, "Icebreaker": 2})
+        self.assertEqual(unmatched, [])
+
+    def test_same_name_items_resolved_by_banner_or_left_to_user(self):
+        yellow = {"name": "Cowboy", "qty": 40, "text": "Cowboy", "score": 1.0, "bg": [230, 200, 0]}
+        grey = {"name": "Cowboy", "qty": 2, "text": "Cowboy", "score": 1.0, "bg": [60, 60, 60]}
+        found, _ = calc.match_tiles([[yellow]], self.stock())
+        self.assertEqual((found[0]["item"]["category"], found[0]["qty"], found[0]["ambiguous"]), ("vintages", 40, False))
+        self.assertEqual([a["category"] for a in found[0]["alternatives"]], ["rares"])
+        found, _ = calc.match_tiles([[grey]], self.stock())
+        self.assertTrue(found[0]["ambiguous"])  # цвет не подсказал — выберет пользователь
+
+
+class InventoryEndpointTests(CalcEndpointTests):
+    def test_screenshot_of_inventory(self):
+        from unittest import mock
+        from tests.test_tileocr import grid
+        words = grid({(0, 0): ("Harvester", "x3"), (0, 1): ("Icebreaker", None), (0, 2): ("Harvester", "x 3")})
+        with mock.patch.object(ocr, "recognize_words", return_value={"width": 800, "height": 600, "words": words}):
+            status, payload = self.post({"images": [base64.b64encode(b"png").decode()]})
+        self.assertEqual(status, 200)
+        self.assertEqual({i["name"]: i["qty"] for i in payload["items"]}, {"Harvester": 6, "Icebreaker": 1})
+        self.assertEqual(payload["tiles"], 3)
+
+
+@unittest.skipUnless(ocr.available(), "распознавание есть только в Windows")
+class WindowsInventoryOcrTests(unittest.TestCase):
+    """Настоящее распознавание Windows на скриншотах инвентаря MM2."""
+
+    def names(self):
+        return json.loads((Path(__file__).parent / "fixtures" / "mm2_names.json").read_text(encoding="utf-8"))
+
+    def test_real_tile_cowboy_x40(self):
+        from supreme import tileocr
+        raw = (Path(__file__).parent / "fixtures" / "mm2_cowboy_x40.png").read_bytes()
+        data = ocr.recognize_words(raw)
+        tiles = tileocr.recognize(data, self.names())
+        print("\nOCR words:", [(w["text"], w["pass"]) for w in data["words"]][:40], "\ntiles:", tiles)
+        cowboy = [t for t in tiles if t["name"] == "Cowboy"]
+        self.assertTrue(cowboy, tiles)
+        self.assertEqual(cowboy[0]["qty"], 40)
+
+    def test_drawn_inventory_grid(self):
+        import subprocess
+        from supreme import tileocr
+        tiles_spec = [("Harvester", "x3", "#E6C800"), ("Icebreaker", "", "#D63CB4"), ("Seer", "x40", "#2E78E6"),
+                      ("Corrupt", "x2", "#DC1E1E"), ("Fang", "", "#32C850"), ("Luger", "x12", "#C8C8C8")]
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "inv.png"
+            draws = []
+            for index, (name, badge, colour) in enumerate(tiles_spec):
+                x, y = 20 + (index % 3) * 139, 20 + (index // 3) * 185
+                draws.append(
+                    f"$g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml('#393939'))), {x}, {y}, 130, 170);"
+                    f"$g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml('{colour}'))), {x}, {y + 140}, 130, 30);"
+                    f"$p = New-Object System.Drawing.Drawing2D.GraphicsPath; $sf = New-Object System.Drawing.StringFormat; $sf.Alignment = 'Center';"
+                    f"$p.AddString('{name}', $ff, 1, 17, (New-Object System.Drawing.RectangleF {x}, {y + 144}, 130, 26), $sf);"
+                    f"$g.DrawPath($pen, $p); $g.FillPath([System.Drawing.Brushes]::White, $p);"
+                    + (f"$g.DrawString('{badge}', $fb, [System.Drawing.Brushes]::White, {x + 92}, {y + 8});" if badge else "")
+                )
+            script = (
+                "Add-Type -AssemblyName System.Drawing;"
+                "$b = New-Object System.Drawing.Bitmap 460, 420; $g = [System.Drawing.Graphics]::FromImage($b);"
+                "$g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAlias';"
+                "$g.Clear([System.Drawing.ColorTranslator]::FromHtml('#1E1E1E'));"
+                "$ff = New-Object System.Drawing.FontFamily 'Arial'; $fb = New-Object System.Drawing.Font('Arial', 11);"
+                "$pen = New-Object System.Drawing.Pen ([System.Drawing.ColorTranslator]::FromHtml('#3C3200')), 3;"
+                + "".join(draws)
+                + f"$b.Save('{png}', [System.Drawing.Imaging.ImageFormat]::Png)"
+            )
+            subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True, timeout=60)
+            data = ocr.recognize_words(png.read_bytes())
+        tiles = tileocr.recognize(data, self.names())
+        print("\nOCR words:", [(w["text"], w["pass"]) for w in data["words"]][:80], "\ntiles:",
+              [(t["name"], t["qty"], t["text"]) for t in tiles])
+        got = {t["name"]: t["qty"] for t in tiles if t["name"]}
+        expected = {"Harvester": 3, "Icebreaker": 1, "Seer": 40, "Corrupt": 2, "Fang": 1, "Luger": 12}
+        matched = {name for name, qty in expected.items() if got.get(name) == qty}
+        self.assertGreaterEqual(len(matched), 5, f"распознано {got}")

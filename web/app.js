@@ -1178,7 +1178,7 @@ function renderMarketsTab() {
 const calc = { images: [], items: [] };
 
 const MAX_SHOTS = 8;
-const MAX_SHOT_SIDE = 2400;  // больше для распознавания не нужно, а запрос становится огромным
+const MAX_SHOT_SIDE = 3200;  // больше для распознавания не нужно; меньше — размываются тонкие цифры «x40»
 const MAX_SHOT_BYTES = 6 * 1024 * 1024;
 const MAX_CALC_BYTES = 60 * 1024 * 1024;
 
@@ -1191,7 +1191,8 @@ function readDataUrl(file) {
   });
 }
 
-// Большой скриншот (4K, несжатый PNG) уменьшается до MAX_SHOT_SIDE по длинной стороне.
+// Скриншот всегда перекодируется в PNG (Windows не читает WebP/AVIF), а большой (4K)
+// уменьшается до MAX_SHOT_SIDE по длинной стороне.
 async function prepareShot(file) {
   if (typeof createImageBitmap !== "function") return readDataUrl(file);
   let bitmap;
@@ -1201,7 +1202,7 @@ async function prepareShot(file) {
     return readDataUrl(file);
   }
   const scale = Math.min(1, MAX_SHOT_SIDE / Math.max(bitmap.width, bitmap.height));
-  if (scale === 1 && file.size <= MAX_SHOT_BYTES) {
+  if (scale === 1 && file.size <= MAX_SHOT_BYTES && file.type === "image/png") {
     bitmap.close();
     return readDataUrl(file);
   }
@@ -1281,6 +1282,8 @@ async function runCalc() {
     calc.items = response.items.map((item) => ({ ...item }));
     calc.fees = response.fees || {};
     const notes = [];
+    if (response.tiles) notes.push(`плиток инвентаря на скриншотах: ${response.tiles}`);
+    if (response.unknown_tiles) notes.push(`не узнано плиток: ${response.unknown_tiles} — допишите их строкой`);
     if (response.ocr_lines) notes.push(`распознано строк на скриншотах: ${response.ocr_lines}`);
     if (response.ocr_errors && response.ocr_errors.length) notes.push(response.ocr_errors.join("; "));
     $("calcStatus").textContent = `Найдено предметов: ${calc.items.length}${notes.length ? ` (${notes.join("; ")})` : ""}`;
@@ -1318,6 +1321,27 @@ function renderCalc() {
     const nameCell = el("td", "item-cell");
     nameCell.append(itemArt(item, "tiny"), el("span", "", item.name));
     if (item.score < 1) nameCell.append(el("span", "badge", `похоже на «${item.seen[0]}»`));
+    if (item.alternatives && item.alternatives.length) {
+      // Несколько предметов с этим названием (нож и ружьё Cowboy): какой именно — выбирает пользователь.
+      const pick = el("select", "variant");
+      pick.setAttribute("aria-label", `Какой именно: ${item.name}`);
+      for (const [index, choice] of [item, ...item.alternatives].entries()) {
+        const option = el("option", "", `${choice.name} — ${categoryTitle(choice.category)}`);
+        option.value = String(index);
+        pick.append(option);
+      }
+      pick.addEventListener("change", () => {
+        const options = [item, ...item.alternatives];
+        const chosen = options[Number(pick.value)];
+        const rest = options.filter((choice) => choice !== chosen);
+        Object.assign(item, { name: chosen.name, category: chosen.category, image: chosen.image,
+          value: chosen.value, prices: chosen.prices, alternatives: rest, ambiguous: false });
+        renderCalc();
+      });
+      nameCell.append(pick);
+      if (item.ambiguous) nameCell.append(el("span", "badge warn-badge", "проверьте вариант"));
+    }
+    if (item.qty_uncertain) nameCell.append(el("span", "badge warn-badge", "проверьте количество"));
     const qtyCell = el("td", "num");
     const qty = el("input");
     qty.type = "number";

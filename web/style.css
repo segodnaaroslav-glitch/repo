@@ -547,3 +547,5 @@ input.qty { width: 72px; text-align: right; }
 }
 .thumb.loading { background: var(--panel-3); animation: pulse 1.2s ease-in-out infinite; }
 .price-cell { white-space: nowrap; font-size: 12px; }
+select.variant { max-width: 220px; font-size: 12px; padding: 2px 4px; }
+.warn-badge { background: color-mix(in srgb, var(--mid) 25%, transparent); color: var(--text); }

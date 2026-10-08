@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import base64
 import binascii
 
-from . import autosync, calc, liquidity, markets, ocr, parser, paths, store
+from . import autosync, calc, liquidity, markets, ocr, parser, paths, store, tileocr
 
 WEB_DIR = paths.resource_dir() / "web"
 STATIC_FILES = {
@@ -192,22 +192,15 @@ class Handler(BaseHTTPRequestHandler):
         images = body.get("images") if isinstance(body.get("images"), list) else []
         if len(images) > MAX_IMAGES:
             return self._error(400, f"Не больше {MAX_IMAGES} скриншотов за раз")
-        ocr_lines, ocr_errors = [], []
+        decoded, ocr_errors = [], []
         for index, image in enumerate(images, 1):
             if not isinstance(image, str):
                 continue
             try:
-                raw = base64.b64decode(image.split(",", 1)[-1], validate=False)
+                decoded.append((index, base64.b64decode(image.split(",", 1)[-1], validate=False)))
             except (binascii.Error, ValueError):
                 ocr_errors.append(f"скриншот {index}: не картинка")
-                continue
-            try:
-                ocr_lines.extend(ocr.recognize(raw))
-            except ocr.OcrError as error:
-                ocr_errors.append(f"скриншот {index}: {error}")
-            except Exception as error:  # одна картинка не должна ломать весь расчёт
-                ocr_errors.append(f"скриншот {index}: не удалось распознать ({error})")
-        if not text.strip() and not ocr_lines:
+        if not text.strip() and not decoded:
             message = "; ".join(ocr_errors) or "Вставьте список предметов или добавьте скриншот"
             return self._error(400, message)
         try:
@@ -220,35 +213,79 @@ class Handler(BaseHTTPRequestHandler):
                 self.monitor.annotate(items)
             except Exception:  # без цен площадок, но с найденными предметами
                 pass
+        # Скриншоты: сначала как инвентарь MM2 (плитки: название на полосе + «xN»),
+        # иначе — как обычный текст (список, чат).
+        matcher = tileocr.NameMatcher([i["name"] for i in items if not i.get("secret")]) if decoded else None
+        shots, ocr_lines, unknown_tiles = [], [], 0
+        for index, raw in decoded:
+            try:
+                words = ocr.recognize_words(raw)
+                tiles = tileocr.recognize(words, None, matcher)
+            except ocr.OcrError as error:
+                ocr_errors.append(f"скриншот {index}: {error}")
+                continue
+            except Exception as error:  # одна картинка не должна ломать весь расчёт
+                ocr_errors.append(f"скриншот {index}: не удалось распознать ({error})")
+                continue
+            if any(tile["name"] for tile in tiles):
+                shots.append(tiles)
+                unknown_tiles += sum(1 for tile in tiles if not tile["name"])
+            else:
+                ocr_lines.extend(ocr.lines_from_words(words))
+        if not text.strip() and not shots and not ocr_lines:
+            return self._error(400, "; ".join(ocr_errors) or "На скриншотах не найдено ни одного предмета")
         found, unmatched = calc.match_text(text + "\n" + "\n".join(ocr_lines), items)
+        tile_found, tile_unmatched = calc.match_tiles(shots, items)
+        merged = {markets.item_id(entry["item"]): entry for entry in found}
+        for entry in tile_found:
+            key = markets.item_id(entry["item"])
+            if key in merged:
+                merged[key]["qty"] += entry["qty"]
+                merged[key]["seen"] += entry["seen"]
+                for field in ("alternatives", "ambiguous", "qty_uncertain"):
+                    merged[key].setdefault(field, entry[field])
+            else:
+                merged[key] = entry
         result = []
-        for entry in found:
+        for entry in merged.values():
             item = entry["item"]
-            market = item.get("market") or {}
-            result.append({
-                "name": item["name"],
-                "category": item["category"],
-                "image": item.get("image") or item.get("image_market"),
-                "value": item.get("value"),
+            row = self._calc_item(item)
+            row.update({
                 "qty": entry["qty"],
                 "score": round(entry["score"], 2),
                 "seen": entry["seen"],
-                "prices": {
-                    market_id: {"price": info.get("price"), "currency": info.get("currency"),
-                                "price_rub": info.get("price_rub"),
-                                "price_rub_approx": bool(info.get("price_rub_approx")),
-                                "fee": info.get("fee", 0), "stock": info.get("stock")}
-                    for market_id, info in market.items()
-                },
+                "ambiguous": bool(entry.get("ambiguous")),
+                "qty_uncertain": bool(entry.get("qty_uncertain")),
+                "alternatives": [self._calc_item(other) for other in entry.get("alternatives") or []],
             })
+            result.append(row)
         return self._json(200, {
             "items": result,
-            "unmatched": unmatched[:50],
+            "unmatched": (unmatched + tile_unmatched)[:50],
             "ocr_lines": len(ocr_lines),
+            "tiles": sum(len(tiles) for tiles in shots),
+            "unknown_tiles": unknown_tiles,
             "ocr_errors": ocr_errors,
             "rate": self.rate.status() if self.rate else None,
             "fees": {m["id"]: m.get("fee", 0) for m in (self.monitor.configs() if self.monitor else [])},
         })
+
+    @staticmethod
+    def _calc_item(item):
+        market = item.get("market") or {}
+        return {
+            "name": item["name"],
+            "category": item["category"],
+            "image": item.get("image") or item.get("image_market"),
+            "value": item.get("value"),
+            "prices": {
+                market_id: {"price": info.get("price"), "currency": info.get("currency"),
+                            "price_rub": info.get("price_rub"),
+                            "price_rub_approx": bool(info.get("price_rub_approx")),
+                            "fee": info.get("fee", 0), "stock": info.get("stock")}
+                for market_id, info in market.items()
+            },
+        }
 
     def _status(self):
         status = self.job.status()

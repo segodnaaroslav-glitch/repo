@@ -188,3 +188,99 @@ def _scan_line(line, find):
     # Обрывки без букв (значки, цифры) не показываются как «не узнал».
     rest = [r for r in rest if len(re.sub(r"[^A-Za-zА-Яа-яЁё]", "", r)) >= 3]
     return hits, rest
+
+
+# --- плитки инвентаря со скриншотов --------------------------------------------------
+
+# Цвет полосы с названием = редкость предмета. Используется, только чтобы выбрать между
+# предметами с одинаковым названием (Cowboy — ружьё и нож); остальное решает пользователь.
+_BANNER_HUES = (
+    (40, 70, ("vintages",)),          # жёлтый
+    (275, 335, ("godlies",)),         # розовый, фиолетовый
+    (335, 361, ("legendaries",)),     # красный
+    (0, 15, ("legendaries",)),
+    (185, 255, ("rares",)),           # синий
+    (85, 165, ("uncommons",)),        # зелёный
+)
+
+
+def banner_categories(bg):
+    """Цвет полосы [r, g, b] -> категории, которым он подходит (пусто — не знаем)."""
+    if not bg or len(bg) != 3:
+        return ()
+    r, g, b = (max(0, min(255, int(c))) / 255.0 for c in bg)
+    high, low = max(r, g, b), min(r, g, b)
+    if high - low < 0.12:
+        return ("commons",) if high > 0.55 else ()
+    if high == r:
+        hue = (60 * ((g - b) / (high - low))) % 360
+    elif high == g:
+        hue = 60 * ((b - r) / (high - low)) + 120
+    else:
+        hue = 60 * ((r - g) / (high - low)) + 240
+    for start, end, categories in _BANNER_HUES:
+        if start <= hue < end:
+            return categories
+    return ()
+
+
+def merge_shots(shots):
+    """Плитки с нескольких скриншотов одного инвентаря -> {название: [плитки]}.
+
+    Одинаковые предметы в MM2 лежат одной стопкой, поэтому один и тот же предмет на двух
+    скриншотах (пересекающихся или одинаковых) — это одна плитка: берётся наибольшее
+    количество, а не сумма. Две плитки с одним названием на одном скриншоте (нож и ружьё
+    Cowboy) остаются двумя.
+    """
+    merged = {}
+    for tiles in shots:
+        here = {}
+        for tile in tiles:
+            if tile.get("name"):
+                here.setdefault(tile["name"], []).append(tile)
+        for name, group in here.items():
+            group.sort(key=lambda t: -int(t.get("qty") or 1))
+            have = merged.setdefault(name, [])
+            for index, tile in enumerate(group):
+                if index >= len(have):
+                    have.append(tile)
+                elif int(tile.get("qty") or 1) > int(have[index].get("qty") or 1):
+                    have[index] = tile
+    return merged
+
+
+def match_tiles(shots, items):
+    """Плитки со скриншотов -> найденные предметы (как у match_text) и неузнанные названия.
+
+    У записи есть "alternatives" — другие предметы с тем же названием, и "ambiguous", если
+    выбрать по цвету полосы не удалось (пусть выберет пользователь).
+    """
+    usable = [i for i in items if not i.get("secret") and not parser.is_placeholder(i)]
+    by_key = {}
+    for item in usable:
+        by_key.setdefault(parser.name_key(item["name"]), []).append(item)
+    found, unmatched = {}, []
+    for name, tiles in merge_shots(shots).items():
+        candidates = by_key.get(parser.name_key(name)) or []
+        if not candidates:
+            unmatched.append(name)
+            continue
+        for tile in tiles:
+            item, sure = candidates[0], len(candidates) == 1
+            if not sure:
+                fits = [c for c in candidates if c["category"] in banner_categories(tile.get("bg"))]
+                if len(fits) == 1:
+                    item, sure = fits[0], True
+            key = markets.item_id(item)
+            qty = max(1, int(tile.get("qty") or 1))
+            entry = found.setdefault(key, {
+                "item": item, "qty": 0, "score": float(tile.get("score") or 1.0), "seen": [],
+                "alternatives": [c for c in candidates if c is not item], "ambiguous": False,
+                "qty_uncertain": False, "from_screenshot": True,
+            })
+            entry["qty"] += qty
+            entry["score"] = min(entry["score"], float(tile.get("score") or 1.0))
+            entry["seen"].append(f"{tile.get('text') or name} ×{qty}" if qty > 1 else (tile.get("text") or name))
+            entry["ambiguous"] = entry["ambiguous"] or not sure
+            entry["qty_uncertain"] = entry["qty_uncertain"] or bool(tile.get("qty_uncertain"))
+    return list(found.values()), unmatched
