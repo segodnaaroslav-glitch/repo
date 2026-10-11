@@ -321,11 +321,12 @@ try {
     }
 
     # ---- Regions mode: re-read small areas (quantity badges "x3" that the full pass missed).
-    # Windows OCR skips a lone short word such as "x3" in an empty picture. So in every area
-    # the bright neutral pixels (the badge text is white) are found, cropped tightly, enlarged
-    # to ~44 px glyphs and drawn four times side by side like a line of words ("x3 x3 x3 x3");
-    # areas are stacked on one sheet with blank rows between them. Words carry the index of
-    # their area; "areas" tells where bright text was found (null = nothing like a badge).
+    # Windows OCR skips a short "x3" that stands alone, but reads it on a line that starts with
+    # an ordinary word (checked on CI: "Qty x3 x3 x3 x3" is read, bare copies are not). So in
+    # every area the bright neutral pixels (the badge text is white) are cropped tightly,
+    # enlarged and drawn after a prefix word, several copies in a row; areas are stacked on
+    # one sheet with blank rows between them. Words carry the index of their area (the prefix
+    # word itself is dropped); "areas" tells where bright text was found (null = no badge).
     function Get-BadgeInk([int[]]$a) {
         if ($a[2] -le 0 -or $a[3] -le 0) { return $null }
         $rect = New-Object System.Drawing.Rectangle ($a[0], $a[1], $a[2], $a[3])
@@ -432,7 +433,7 @@ try {
                 if ($font) { $font.Dispose() }
                 foreach ($piece in $pieces) { $piece.Dispose() }
             }
-            return , @($sheet, $rows)
+            return , @($sheet, $rows, ($margin + $prefixW))
         }
 
         function Read-Sheet([System.Drawing.Bitmap]$sheet) {
@@ -440,42 +441,32 @@ try {
             try { return Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
         }
 
-        if ($DumpDir -and $todo.Count -gt 0) {
-            # experiment: which sheet layout does this OCR read at all?
-            $variants = @(
-                @('tight', 44, '', 4, 0.6), @('tight', 30, '', 4, 0.6), @('tight', 22, '', 4, 0.6),
-                @('tight', 44, 'Qty', 4, 0.6), @('tight', 30, 'Qty', 2, 0.6), @('tight', 44, '', 4, 0.25),
-                @('area', 32, '', 2, 0.0), @('area', 24, '', 1, 0.0), @('tight', 44, 'Amount', 1, 0.6))
-            foreach ($kind in @('white', 'grayinv')) {
-                foreach ($v in $variants) {
-                    $name = '{0}/{1}{2}/{3}/x{4}/s{5}' -f $kind, $v[0], $v[1], $v[2], $v[3], $v[4]
-                    try {
-                        $built = New-RegionSheet $todo $kind $v[0] $v[1] $v[2] $v[3] $v[4]
-                        try { $res = Read-Sheet $built[0] } finally { $built[0].Dispose() }
-                        $script:Debug.Add(('{0}: {1}' -f $name, (($res.Lines | ForEach-Object { $_.Text }) -join ' | ')))
-                    } catch { $script:Debug.Add(('{0} failed: {1}' -f $name, $_.Exception.Message)) }
-                }
-            }
-        }
-
+        # independent layouts: each is a separate vote (name, pass, crop, glyph px, prefix, copies, space)
+        $layouts = @(
+            @('qty', 'white', 'tight', 44, 'Qty', 4, 0.6),
+            @('amount', 'white', 'tight', 44, 'Amount', 1, 0.6),
+            @('qtyhi', 'whitehi', 'tight', 44, 'Qty', 4, 0.6),
+            @('bare', 'white', 'tight', 30, '', 4, 0.6))
         $found = New-Object System.Collections.Generic.List[object]
         $infos = New-Object System.Collections.Generic.List[string]
-        foreach ($kind in @('white', 'grayinv', 'whitehi')) {
+        foreach ($lay in $layouts) {
             $t0 = [Diagnostics.Stopwatch]::StartNew()
             $err = ''
-            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / 170))
+            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / (4 * $lay[3])))
             for ($start = 0; $start -lt $todo.Count; $start += $perSheet) {
                 $idx = @($todo[$start..([Math]::Min($todo.Count, $start + $perSheet) - 1)])
                 try {
-                    $built = New-RegionSheet $idx $kind 'tight' 44 '' 4 0.6
-                    $sheet = $built[0]; $rows = $built[1]
+                    $built = New-RegionSheet $idx $lay[1] $lay[2] $lay[3] $lay[4] $lay[5] $lay[6]
+                    $sheet = $built[0]; $rows = $built[1]; $textLeft = $built[2] - 0.3 * $lay[3]
                     try {
-                        if ($DumpDir) { try { $sheet.Save((Join-Path $DumpDir ('regions-{0}-{1}.png' -f $kind, $start)), [System.Drawing.Imaging.ImageFormat]::Png) } catch { } }
+                        if ($DumpDir) { try { $sheet.Save((Join-Path $DumpDir ('regions-{0}-{1}.png' -f $lay[0], $start)), [System.Drawing.Imaging.ImageFormat]::Png) } catch { } }
                         $res = Read-Sheet $sheet
                     } finally { $sheet.Dispose() }
+                    if ($DumpDir) { $script:Debug.Add(('{0}:{1}: {2}' -f $lay[0], $start, (($res.Lines | ForEach-Object { $_.Text }) -join ' | '))) }
                     $li = 0
                     foreach ($line in $res.Lines) {
                         foreach ($word in $line.Words) {
+                            if ($lay[4] -and ($word.BoundingRect.X + $word.BoundingRect.Width) -le $textLeft) { continue }  # the prefix word
                             $cy = $word.BoundingRect.Y + $word.BoundingRect.Height / 2
                             $region = -1
                             for ($ri = 0; $ri -lt $rows.Count; $ri++) {
@@ -486,14 +477,14 @@ try {
                             $found.Add([pscustomobject]@{
                                     Text = $word.Text; X = [int]$word.BoundingRect.X; Y = [int]$word.BoundingRect.Y
                                     W = [int]$word.BoundingRect.Width; H = [int]$word.BoundingRect.Height
-                                    Pass = $kind; Line = ('{0}:r{1}:{2}' -f $kind, $start, $li); Region = $region
+                                    Pass = $lay[0]; Line = ('{0}:r{1}:{2}' -f $lay[0], $start, $li); Region = $region
                                 })
                         }
                         $li++
                     }
                 } catch { $err = $_.Exception.Message }
             }
-            $infos.Add(('{{"name":{0},"ms":{1},"error":{2}}}' -f (ConvertTo-JsonString $kind), [int]$t0.Elapsed.TotalMilliseconds, (ConvertTo-JsonString $err)))
+            $infos.Add(('{{"name":{0},"ms":{1},"error":{2}}}' -f (ConvertTo-JsonString $lay[0]), [int]$t0.Elapsed.TotalMilliseconds, (ConvertTo-JsonString $err)))
         }
         $src.Dispose()
         $sbOut = New-Object System.Text.StringBuilder

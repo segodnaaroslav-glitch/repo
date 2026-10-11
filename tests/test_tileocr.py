@@ -300,7 +300,8 @@ class RegionBadgeTests(unittest.TestCase):
         areas = [{"region": 0, "ink": [112, 40, 24, 15]},   # «x3» на месте значка, но не прочитан
                  {"region": 1, "ink": [251, 40, 24, 15]},   # «x» потерялся: «3 3 3 3»
                  {"region": 2, "ink": [360, 75, 60, 40]}]    # что-то крупное ниже — кусок картинки
-        words = [{"text": "3 3 3 3", "region": 1, "pass": "white", "line": "a", "x": 0},
+        words = [{"text": "Qty", "region": 1, "pass": "qty", "line": "a", "x": -50},
+                 {"text": "3 3 3 3", "region": 1, "pass": "qty", "line": "a", "x": 0},
                  {"text": "7 7 7 7", "region": 2, "pass": "white", "line": "b", "x": 0}]
         self.assertEqual(tileocr.apply_region_badges(tiles, regions, words, areas), 1)
         self.assertEqual([(t["qty"], bool(t.get("qty_uncertain"))) for t in tiles], [(1, True), (3, False), (1, False)])

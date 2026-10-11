@@ -552,11 +552,12 @@ def parse_output(stdout_bytes):
 # --- повторное чтение значков «xN» ------------------------------------------------------
 # Короткие значки ("x2", "x3") распознавание часто пропускает. Для плиток без значка
 # правый верхний угол читается ещё раз отдельно (ocr.recognize_regions): светлый текст
-# вырезается вплотную, крупно, четырьмя копиями в ряд; количество засчитывается, только
-# если копии сходятся. Если светлый текст похож на значок, но не прочитан, — количество
+# вырезается вплотную, крупно, после обычного слова («Qty x3 x3 x3 x3» — так распознавание
+# Windows его видит); количество засчитывается, только если копии сходятся. Если светлый текст похож на значок, но не прочитан, — количество
 # помечается «проверьте».
 _REGION_X_RE = re.compile(r"[xX*]\s*([0-9OoDQIl|!iSsZzBg]{1,4})(?![0-9])")
 _REGION_DIGITS_RE = re.compile(r"(?<![0-9A-Za-z])(\d{1,4})(?![0-9A-Za-z])")
+_REGION_PREFIXES = {"qty", "amount"}  # слова, которые ocr.py пишет перед значком для распознавания
 
 
 def badge_regions(tiles):
@@ -597,7 +598,8 @@ def apply_region_badges(tiles, regions, words, areas=None):
         digits_ok = areas is None or _looks_like_badge(inks.get(number), tile.get("box"))
         votes = Counter()
         for line_words in by_region.get(number, {}).values():
-            text = fold_text(" ".join(str(w.get("text", "")) for w in sorted(line_words, key=lambda w: w.get("x", 0))))
+            text = fold_text(" ".join(str(w.get("text", "")) for w in sorted(line_words, key=lambda w: w.get("x", 0))
+                                      if fold_text(w.get("text", "")).lower() not in _REGION_PREFIXES))
             hits = [raw.translate(_TO_DIGIT) for raw in _REGION_X_RE.findall(text)]
             hits = [h for h in hits if h.isdigit()]
             weight = 1.0
