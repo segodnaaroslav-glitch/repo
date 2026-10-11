@@ -292,6 +292,27 @@ class RegionBadgeTests(unittest.TestCase):
         self.assertEqual(tileocr.apply_region_badges(tiles, regions, words), 1)
         self.assertEqual([t["qty"] for t in tiles], [3, 40, 1, 1])
 
+    def test_visible_but_unread_badge_asks_to_check(self):
+        tiles = [{"name": "Harvester", "qty": 1, "qty_from_badge": False, "box": [20, 30, 130, 170]},
+                 {"name": "Fang", "qty": 1, "qty_from_badge": False, "box": [159, 30, 130, 170]},
+                 {"name": "Seer", "qty": 1, "qty_from_badge": False, "box": [298, 30, 130, 170]}]
+        regions = tileocr.badge_regions(tiles)
+        areas = [{"region": 0, "ink": [112, 40, 24, 15]},   # «x3» на месте значка, но не прочитан
+                 {"region": 1, "ink": [251, 40, 24, 15]},   # «x» потерялся: «3 3 3 3»
+                 {"region": 2, "ink": [360, 75, 60, 40]}]    # что-то крупное ниже — кусок картинки
+        words = [{"text": "3 3 3 3", "region": 1, "pass": "white", "line": "a", "x": 0},
+                 {"text": "7 7 7 7", "region": 2, "pass": "white", "line": "b", "x": 0}]
+        self.assertEqual(tileocr.apply_region_badges(tiles, regions, words, areas), 1)
+        self.assertEqual([(t["qty"], bool(t.get("qty_uncertain"))) for t in tiles], [(1, True), (3, False), (1, False)])
+
+    def test_garbage_digits_from_a_picture_are_not_a_count(self):
+        tiles = [{"name": "Harvester", "qty": 1, "qty_from_badge": False, "box": [20, 30, 130, 170]}]
+        regions = tileocr.badge_regions(tiles)
+        words = [{"text": "Il7 4", "region": 0, "pass": "white", "line": "a", "x": 0},
+                 {"text": "7", "region": 0, "pass": "grayinv", "line": "b", "x": 0}]
+        self.assertEqual(tileocr.apply_region_badges(tiles, regions, words), 0)
+        self.assertEqual(tiles[0]["qty"], 1)
+
 
 class ReadInventoryTests(unittest.TestCase):
     def test_second_pass_fills_short_badges(self):

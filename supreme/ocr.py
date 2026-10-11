@@ -321,9 +321,39 @@ try {
     }
 
     # ---- Regions mode: re-read small areas (quantity badges "x3" that the full pass missed).
-    # Every area is enlarged so its height is ~100 px, cleaned (white text -> black on white),
-    # drawn three times in a row (a longer line is read more reliably than a lone "x3") and all
-    # areas are stacked on one sheet. Words carry the index of their area.
+    # Windows OCR skips a lone short word such as "x3" in an empty picture. So in every area
+    # the bright neutral pixels (the badge text is white) are found, cropped tightly, enlarged
+    # to ~44 px glyphs and drawn four times side by side like a line of words ("x3 x3 x3 x3");
+    # areas are stacked on one sheet with blank rows between them. Words carry the index of
+    # their area; "areas" tells where bright text was found (null = nothing like a badge).
+    function Get-BadgeInk([int[]]$a) {
+        if ($a[2] -le 0 -or $a[3] -le 0) { return $null }
+        $rect = New-Object System.Drawing.Rectangle ($a[0], $a[1], $a[2], $a[3])
+        $data = $src.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        try {
+            $stride = $data.Stride
+            $bytes = New-Object byte[] ($stride * $a[3])
+            [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+        } finally { $src.UnlockBits($data) }
+        $minX = $a[2]; $minY = $a[3]; $maxX = -1; $maxY = -1; $count = 0
+        for ($y = 0; $y -lt $a[3]; $y++) {
+            $i = $y * $stride
+            for ($x = 0; $x -lt $a[2]; $x++) {
+                $b = $bytes[$i]; $g = $bytes[$i + 1]; $r = $bytes[$i + 2]
+                $i += 4
+                if ($r -lt 170 -or $g -lt 170 -or $b -lt 170) { continue }
+                $hi = $r; if ($g -gt $hi) { $hi = $g }; if ($b -gt $hi) { $hi = $b }
+                $lo = $r; if ($g -lt $lo) { $lo = $g }; if ($b -lt $lo) { $lo = $b }
+                if (($hi - $lo) -gt 40) { continue }
+                $count++
+                if ($x -lt $minX) { $minX = $x }; if ($x -gt $maxX) { $maxX = $x }
+                if ($y -lt $minY) { $minY = $y }; if ($y -gt $maxY) { $maxY = $y }
+            }
+        }
+        if ($maxX -lt 0 -or $count -lt 4) { return $null }
+        return , [int[]]@(($a[0] + $minX), ($a[1] + $minY), ($maxX - $minX + 1), ($maxY - $minY + 1), $count)
+    }
+
     if ($Regions) {
         $areas = New-Object System.Collections.Generic.List[int[]]
         foreach ($part in $Regions.Split(';')) {
@@ -334,48 +364,55 @@ try {
             if (($x1 - $x0) -ge 4 -and ($y1 - $y0) -ge 4) { $areas.Add([int[]]@($x0, $y0, ($x1 - $x0), ($y1 - $y0), $areas.Count)) }
             else { $areas.Add([int[]]@(0, 0, 0, 0, $areas.Count)) }
         }
-        $rowH = 100; $gap = 60; $margin = 40; $copies = 3
+        $glyph = 44; $copies = 4; $margin = 40
+        $inks = New-Object System.Collections.Generic.List[object]
+        foreach ($a in $areas) { $inks.Add((Get-BadgeInk $a)) }
         $found = New-Object System.Collections.Generic.List[object]
         $infos = New-Object System.Collections.Generic.List[string]
         foreach ($kind in @('white', 'grayinv', 'whitehi')) {
             $t0 = [Diagnostics.Stopwatch]::StartNew()
             $err = ''
-            # rows in chunks so a sheet stays under the OCR size limit
-            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / ($rowH + $gap)))
-            for ($start = 0; $start -lt $areas.Count; $start += $perSheet) {
-                $chunk = New-Object System.Collections.Generic.List[int[]]
-                for ($ci = $start; $ci -lt [Math]::Min($areas.Count, $start + $perSheet); $ci++) { $chunk.Add($areas[$ci]) }
-                $pieces = @()
-                $sheetW = 2 * $margin
-                foreach ($a in $chunk) {
-                    if ($a[2] -le 0) { $pieces += , $null; continue }
-                    $s = $rowH / [double]$a[3]
-                    $scaled = New-ScaledCrop $src @($a[0], $a[1], $a[2], $a[3]) $s
+            # one row per area that has bright text; rows in chunks under the OCR size limit
+            $todo = New-Object System.Collections.Generic.List[int]
+            for ($ai = 0; $ai -lt $areas.Count; $ai++) { if ($null -ne $inks[$ai]) { $todo.Add($ai) } }
+            $rowStep = [int](2 * $glyph * 1.9)
+            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / $rowStep))
+            for ($start = 0; $start -lt $todo.Count; $start += $perSheet) {
+                $pieces = New-Object System.Collections.Generic.List[object]
+                $sheetW = 2 * $margin; $sheetH = 2 * $margin
+                for ($ci = $start; $ci -lt [Math]::Min($todo.Count, $start + $perSheet); $ci++) {
+                    $ink = $inks[$todo[$ci]]
+                    $s = [Math]::Min(8.0, [Math]::Max(1.0, $glyph / [double][Math]::Max(1, $ink[3])))
+                    $pad = [Math]::Max(2, [int][Math]::Round(0.35 * $ink[3]))
+                    $cx0 = [Math]::Max(0, $ink[0] - $pad); $cy0 = [Math]::Max(0, $ink[1] - $pad)
+                    $cx1 = [Math]::Min($ImgW, $ink[0] + $ink[2] + $pad); $cy1 = [Math]::Min($ImgH, $ink[1] + $ink[3] + $pad)
+                    $scaled = New-ScaledCrop $src @($cx0, $cy0, ($cx1 - $cx0), ($cy1 - $cy0)) $s
                     try { $piece = New-PassBitmap $scaled $kind } finally { $scaled.Dispose() }
-                    $pieces += , $piece
-                    $sheetW = [Math]::Max($sheetW, 2 * $margin + $copies * $piece.Width + ($copies - 1) * $gap)
+                    $pieces.Add($piece)
+                    $space = [int](0.6 * $glyph)
+                    $sheetW = [Math]::Max($sheetW, 2 * $margin + $copies * $piece.Width + ($copies - 1) * $space)
                 }
                 $sheetW = [Math]::Min($sheetW, $limit)
-                $sheetH = 2 * $margin + $chunk.Count * ($rowH + $gap)
+                $rows = @()
+                $top = $margin
+                foreach ($piece in $pieces) { $rows += , @($top, ($top + $piece.Height)); $top += $piece.Height + [Math]::Max($piece.Height, [int](1.6 * $glyph)) }
+                $sheetH = [Math]::Min($limit, $top + $margin)
                 $sheet = New-Object System.Drawing.Bitmap ($sheetW, $sheetH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
                 $gs = [System.Drawing.Graphics]::FromImage($sheet)
-                $rows = @()
                 try {
                     $gs.Clear([System.Drawing.Color]::White)
-                    for ($i = 0; $i -lt $chunk.Count; $i++) {
-                        $top = $margin + $i * ($rowH + $gap)
-                        $rows += , @($top, ($top + $rowH), $chunk[$i][4])
+                    for ($i = 0; $i -lt $pieces.Count; $i++) {
                         $piece = $pieces[$i]
-                        if ($null -eq $piece) { continue }
+                        $space = [int](0.6 * $glyph)
                         for ($k = 0; $k -lt $copies; $k++) {
-                            $left = $margin + $k * ($piece.Width + $gap)
+                            $left = $margin + $k * ($piece.Width + $space)
                             if ($left + $piece.Width -gt $sheetW) { break }
-                            $gs.DrawImage($piece, $left, $top, $piece.Width, $piece.Height)
+                            $gs.DrawImage($piece, $left, $rows[$i][0], $piece.Width, $piece.Height)
                         }
                     }
                 } finally {
                     $gs.Dispose()
-                    foreach ($piece in $pieces) { if ($null -ne $piece) { $piece.Dispose() } }
+                    foreach ($piece in $pieces) { $piece.Dispose() }
                 }
                 if ($DumpDir) {  # for diagnostics: the sheets exactly as OCR sees them
                     try { $sheet.Save((Join-Path $DumpDir ('regions-{0}-{1}.png' -f $kind, $start)), [System.Drawing.Imaging.ImageFormat]::Png) } catch { }
@@ -388,12 +425,15 @@ try {
                         foreach ($word in $line.Words) {
                             $cy = $word.BoundingRect.Y + $word.BoundingRect.Height / 2
                             $region = -1
-                            foreach ($row in $rows) { if ($cy -ge ($row[0] - $gap / 2) -and $cy -lt ($row[1] + $gap / 2)) { $region = $row[2] } }
+                            for ($ri = 0; $ri -lt $rows.Count; $ri++) {
+                                $gap = ($rows[$ri][1] - $rows[$ri][0]) / 2
+                                if ($cy -ge ($rows[$ri][0] - $gap) -and $cy -lt ($rows[$ri][1] + $gap)) { $region = $todo[$start + $ri] }
+                            }
                             if ($region -lt 0) { continue }
                             $found.Add([pscustomobject]@{
                                     Text = $word.Text; X = [int]$word.BoundingRect.X; Y = [int]$word.BoundingRect.Y
-                                    W = [int]$word.BoundingRect.Width; H = [int]$word.BoundingRect.Height; Cut = 0
-                                    Pass = $kind; Line = ('{0}:r{1}:{2}' -f $kind, $start, $li); Bg = @(0, 0, 0); Region = $region
+                                    W = [int]$word.BoundingRect.Width; H = [int]$word.BoundingRect.Height
+                                    Pass = $kind; Line = ('{0}:r{1}:{2}' -f $kind, $start, $li); Region = $region
                                 })
                         }
                         $li++
@@ -406,6 +446,13 @@ try {
         $sbOut = New-Object System.Text.StringBuilder
         [void]$sbOut.Append(('{{"ok":true,"mode":"regions","width":{0},"height":{1},"regions":{2},"passes":[' -f $ImgW, $ImgH, $areas.Count))
         [void]$sbOut.Append(($infos -join ','))
+        [void]$sbOut.Append('],"areas":[')
+        for ($ai = 0; $ai -lt $areas.Count; $ai++) {
+            if ($ai -gt 0) { [void]$sbOut.Append(',') }
+            $ink = $inks[$ai]
+            if ($null -eq $ink) { [void]$sbOut.Append(('{{"region":{0},"ink":null}}' -f $ai)) }
+            else { [void]$sbOut.Append(('{{"region":{0},"ink":[{1},{2},{3},{4}],"pixels":{5}}}' -f $ai, $ink[0], $ink[1], $ink[2], $ink[3], $ink[4])) }
+        }
         [void]$sbOut.Append('],"words":[')
         $first = $true
         foreach ($p in $found) {
@@ -598,7 +645,7 @@ def read_inventory(image_bytes, matcher=None, known_names=None, run=subprocess.r
     if regions:
         try:
             again = recognize_regions(image_bytes, [area for _, area in regions], run=run)
-            tileocr.apply_region_badges(tiles, regions, again.get("words"))
+            tileocr.apply_region_badges(tiles, regions, again.get("words"), again.get("areas"))
         except OcrError:
             pass
     return words, tiles

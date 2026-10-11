@@ -551,8 +551,10 @@ def parse_output(stdout_bytes):
 
 # --- повторное чтение значков «xN» ------------------------------------------------------
 # Короткие значки ("x2", "x3") распознавание часто пропускает. Для плиток без значка
-# правый верхний угол читается ещё раз отдельно (ocr.recognize_regions): крупно, тремя
-# копиями в ряд; количество засчитывается, только если копии сходятся.
+# правый верхний угол читается ещё раз отдельно (ocr.recognize_regions): светлый текст
+# вырезается вплотную, крупно, четырьмя копиями в ряд; количество засчитывается, только
+# если копии сходятся. Если светлый текст похож на значок, но не прочитан, — количество
+# помечается «проверьте».
 _REGION_X_RE = re.compile(r"[xX*]\s*([0-9OoDQIl|!iSsZzBg]{1,4})(?![0-9])")
 _REGION_DIGITS_RE = re.compile(r"(?<![0-9A-Za-z])(\d{1,4})(?![0-9A-Za-z])")
 
@@ -570,34 +572,47 @@ def badge_regions(tiles):
     return regions
 
 
-def apply_region_badges(tiles, regions, words):
+def _looks_like_badge(ink, box):
+    """Светлый текст [x, y, w, h] в углу плитки [x0, y0, W, H] — по размеру и месту как «xN»."""
+    if not ink or not box or len(ink) < 4:
+        return False
+    x, y, w, h = ink[:4]
+    x0, y0, width = box[0], box[1], float(box[2])
+    return (0.05 * width <= h <= 0.25 * width and 0.8 * h <= w <= 0.6 * width
+            and (x0 + width) - (x + w) <= 0.3 * width and y - y0 <= 0.4 * width)
+
+
+def apply_region_badges(tiles, regions, words, areas=None):
     """Голоса из повторного чтения -> количество у плиток (на месте). Возвращает, сколько найдено."""
     by_region = {}
     for word in words or []:
         if isinstance(word.get("region"), int):
             key = (word["region"], word.get("pass", ""), word.get("line", ""))
             by_region.setdefault(word["region"], {}).setdefault(key, []).append(word)
+    inks = {a.get("region"): a.get("ink") for a in areas or [] if isinstance(a, dict)}
     found = 0
     for number, (tile_index, _) in enumerate(regions):
+        tile = tiles[tile_index]
+        # одни цифры без «x» принимаются, только если светлый текст стоит там, где значок
+        digits_ok = areas is None or _looks_like_badge(inks.get(number), tile.get("box"))
         votes = Counter()
         for line_words in by_region.get(number, {}).values():
             text = fold_text(" ".join(str(w.get("text", "")) for w in sorted(line_words, key=lambda w: w.get("x", 0))))
             hits = [raw.translate(_TO_DIGIT) for raw in _REGION_X_RE.findall(text)]
             hits = [h for h in hits if h.isdigit()]
             weight = 1.0
-            if not hits:  # без «x» — только цифры (слабее: это может быть кусок картинки)
+            if not hits and digits_ok and re.fullmatch(r"[\d\s]+", text or "-"):
+                # «x» потерялся, остались одни цифры ("3 3 3 3") — голос слабее
                 hits, weight = _REGION_DIGITS_RE.findall(text), 0.5
             for hit in hits:
                 value = int(hit)
                 if 2 <= value <= 9999:
                     votes[value] += weight
-        if not votes:
-            continue
-        value, weight = votes.most_common(1)[0]
-        runner_up = votes.most_common(2)[1][1] if len(votes) > 1 else 0
-        if weight >= 1.5 and weight > runner_up:
-            tile = tiles[tile_index]
-            tile["qty"] = value
+        best = votes.most_common(2)
+        if best and best[0][1] >= 2 and (len(best) == 1 or best[0][1] > best[1][1]):
+            tile["qty"] = best[0][0]
             tile["qty_from_badge"] = True
             found += 1
+        elif _looks_like_badge(inks.get(number), tile.get("box")):
+            tile["qty_uncertain"] = True  # значок виден, но не прочитан — пусть проверит пользователь
     return found
