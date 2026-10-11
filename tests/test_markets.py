@@ -947,10 +947,102 @@ class StarPetsReviewV5Tests(unittest.TestCase):
         cache["prices"]["rub"]["ok_at"] -= 3600  # рубли не обновлялись час
         FakeApi.rub_status = 400
         adapter = markets.StarPetsAdapter(self.config, cache)
-        luger = {o["name"]: o for o in adapter.fetch()}["Luger"]
-        self.assertEqual(luger["price_rub"], 75.0)
-        self.assertTrue(luger["price_rub_approx"])
+        offers = {o["name"]: o for o in adapter.fetch()}
+        chroma, luger = offers["Chroma Luger"], offers["Luger"]
+        self.assertEqual((chroma["price_rub"], chroma["price_rub_approx"]), (150.5, True))  # сходится с курсом площадки
+        # Старые рубли расходятся с курсом площадки больше чем на 2% — посчитаны по нему (75.25 ₽/$).
+        self.assertEqual((luger["price_rub"], luger["price_rub_approx"]), (76.75, True))
         self.assertIn("рублях", adapter.note)
+
+
+class StarPetsPairTests(unittest.TestCase):
+    """Доллары и рубли StarPets — из разных опросов: свежий снимок решает, продаётся ли товар."""
+
+    class Api(FakeApi):
+        catalog = {}  # id -> (название, доллары, рубли)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.calls.append(("POST", self.path, body))
+            rows = []
+            if body["filter"]["types"][0]["type"] == "weapon" and body["page"] == 1:
+                rows = [{"id": key, "name": name, "type": "weapon", "subtype": "gun", "chroma": False,
+                         "price": rub if body["currency"] == "rub" else usd}
+                        for key, (name, usd, rub) in self.catalog.items()]
+            self._send(200, {"status": True, "items": rows, "count": len(rows)})
+
+    def setUp(self):
+        FakeApi.calls = []
+        FakeApi.info_status = 200
+        # Курс площадки 80 ₽/$; у Harvester свой (750 ₽ при $8.83 — на 6% выше).
+        self.Api.catalog = {key: (f"Gun {key}", key * 10.0, key * 800.0) for key in range(1, 5)}
+        self.Api.catalog[5] = ("Harvester", 8.83, 750.0)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.Api)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.config = {"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "https://starpets.gg/mm2",
+                       "api": f"http://127.0.0.1:{self.httpd.server_address[1]}", "interval": 300}
+        patcher = unittest.mock.patch.object(markets, "_pause")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cache = {}
+
+    def poll(self, currency):
+        offers = markets.StarPetsAdapter(self.config, self.cache).fetch()
+        if currency:
+            self.assertEqual({c[2]["currency"] for c in FakeApi.calls if c[0] == "POST"}, {currency})
+        FakeApi.calls = []
+        return {o["name"]: o for o in offers}
+
+    def harvester(self, offers):
+        offer = offers["Harvester"]
+        return offer["price"], offer["price_rub"], offer["price_rub_approx"], offer["available"]
+
+    def test_unchanged_prices_stay_exact(self):
+        self.assertEqual(self.harvester(self.poll(None)), (8.83, 750.0, False, True))
+        # Свой курс товара не путается с устаревшей ценой: доллары с прошлого раза те же.
+        self.assertEqual(self.harvester(self.poll("usd")), (8.83, 750.0, False, True))
+        self.assertEqual(self.harvester(self.poll("rub")), (8.83, 750.0, False, True))
+        self.assertEqual(self.harvester(self.poll("usd")), (8.83, 750.0, False, True))
+
+    def test_cheapest_lot_bought_after_ruble_sweep(self):
+        self.poll(None)
+        self.poll("usd")
+        self.poll("rub")
+        self.Api.catalog[5] = ("Harvester", 10.5, 750.0)  # самый дешёвый лот купили после чтения рублей
+        offers = self.poll("usd")
+        # 750 ₽ — цена проданного лота: рубли по курсу площадки, с пометкой «≈».
+        self.assertEqual(self.harvester(offers), (10.5, 840.0, True, True))
+        self.assertEqual((offers["Gun 1"]["price_rub"], offers["Gun 1"]["price_rub_approx"]), (800.0, False))
+
+    def test_sold_out_in_newer_sweep(self):
+        self.poll(None)
+        self.poll("usd")
+        self.poll("rub")
+        self.Api.catalog[5] = ("Harvester", None, 750.0)
+        self.assertEqual(self.harvester(self.poll("usd")), (None, None, False, False))  # не «в продаже за 750 ₽»
+        self.Api.catalog[5] = ("Harvester", None, None)
+        self.assertEqual(self.harvester(self.poll("rub")), (None, None, False, False))
+
+    def test_newer_rubles_replace_stale_dollars(self):
+        self.poll(None)
+        self.poll("usd")
+        self.Api.catalog[5] = ("Harvester", 15.0, 1200.0)  # подорожал после чтения долларов
+        offers = self.poll("rub")
+        self.assertEqual(self.harvester(offers), (None, 1200.0, False, True))  # старые $8.83 не показываются
+        offers = self.poll("usd")
+        self.assertEqual(self.harvester(offers), (15.0, 1200.0, False, True))
+
+    def test_older_sweep_decides_only_without_newer_row(self):
+        adapter = markets.StarPetsAdapter(self.config, {})
+        row = {"id": 7, "name": "Fang", "type": "weapon"}
+        prices = {"usd": {"ok_at": 200.0, "rows": {}}, "rub": {"ok_at": 100.0, "rows": {"7": 120.0}}}
+        fang = adapter._offers({"7": row}, prices)[0]
+        self.assertEqual((fang["price"], fang["price_rub"], fang["available"]), (None, 120.0, True))
+        prices["usd"]["rows"]["7"] = None  # свежий снимок: не продаётся
+        fang = adapter._offers({"7": row}, prices)[0]
+        self.assertEqual((fang["price"], fang["price_rub"], fang["available"]), (None, None, False))
 
 
 class DreamPetsTwinTests(unittest.TestCase):

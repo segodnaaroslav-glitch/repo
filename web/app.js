@@ -39,6 +39,7 @@ const state = {
   offline: null,         // текст ошибки, если программа не отвечает
   userUpdate: false,     // обновление запущено кнопкой (о результате сообщить всплывающим окном)
   lastError: null,       // последняя показанная ошибка автообновления
+  shownRate: null,       // курс доллара, по которому нарисованы цены
 };
 
 const $ = (id) => document.getElementById(id);
@@ -182,17 +183,54 @@ function moneyNode(money, className) {
   return box;
 }
 
+// Лоты есть, а цены площадка не показала: предмет продаётся, но почём — неизвестно.
+function priceUnknown(info) {
+  return Boolean(info) && infoMoney(info) === null && typeof info.stock === "number" && info.stock > 0;
+}
+
+// Продаётся ли предмет на площадке: есть цена в долларах или в рублях (или хотя бы лоты).
+function onSale(info) {
+  return infoMoney(info) !== null || priceUnknown(info);
+}
+
+// Цена площадки или почему её нет.
+function infoNode(info, className) {
+  const money = infoMoney(info);
+  if (money) return moneyNode(money, className);
+  return el("span", "muted", priceUnknown(info) ? "цена неизвестна" : "нет в продаже");
+}
+
 function addMoney(total, money) {
   for (const currency of ["usd", "rub"]) {
+    const other = currency === "usd" ? "rub" : "usd";
     if (money[currency] === null) {
       total.incomplete = true;
       total[`missing_${currency}`] = true;
+      // Цена только в другой валюте: без курса её не сложить, копится отдельно.
+      if (money[other] !== null) total[`only_${other}`] = (total[`only_${other}`] || 0) + money[other];
     } else {
       total[currency] += money[currency];
     }
   }
+  total.count = (total.count || 0) + 1;
   total.usdApprox = total.usdApprox || money.usdApprox;
   total.rubApprox = total.rubApprox || money.rubApprox;
+}
+
+// Итог калькулятора. Валюта, в которой цены есть не у всех предметов, не показывается
+// (сумма была бы неполной). Если неполны обе (нет курса, а цены у одних только в
+// долларах, у других только в рублях) — «$X + Y ₽»: обе части точные, вместе — всё.
+function totalNode(total) {
+  if (!total.count) return el("span", "muted", "—");
+  if (moneyText(total, "usd") || moneyText(total, "rub")) return moneyNode(total);
+  const first = total.primary === "rub" ? "rub" : "usd";
+  const second = first === "rub" ? "usd" : "rub";
+  const part = (currency, value) =>
+    moneyText({ [currency]: value, usdApprox: total.usdApprox, rubApprox: total.rubApprox }, currency);
+  const box = el("span", "price");
+  box.append(el("b", "", `${part(first, total[first])} + ${part(second, total[`only_${second}`] || 0)}`));
+  box.title = `Нет курса доллара: у части предметов цена только в ${second === "rub" ? "рублях" : "долларах"} — она прибавлена отдельно`;
+  return box;
 }
 
 function marketInfo(item, id) {
@@ -288,10 +326,35 @@ function sortValue(item, key) {
     case "dreampets": {
       const money = infoMoney(marketInfo(item, key));
       if (!money) return null;
-      return money.usd !== null ? money.usd : money.rub / 100;
+      // Без курса Rapira цена только в рублях переводится в доллары курсом самой площадки.
+      return money.usd !== null ? money.usd : money.rub / (siteRate(key) || 100);
     }
     default: return item.secret ? null : item.value;  // секретные — в конец
   }
+}
+
+// Рублей за доллар у площадки — медиана по товарам с обеими её точными ценами (StarPets).
+const siteRates = new WeakMap();  // state.data -> {площадка: курс или null}
+
+function siteRate(id) {
+  let rates = siteRates.get(state.data);
+  if (!rates) {
+    rates = {};
+    siteRates.set(state.data, rates);
+  }
+  if (!(id in rates)) {
+    const ratios = [];
+    for (const item of state.data.items) {
+      const info = marketInfo(item, id);
+      if (!info || info.currency === "RUB" || info.price_rub_approx) continue;
+      const usd = finite(info.price);
+      const rub = finite(info.price_rub);
+      if (usd !== null && rub !== null && usd >= 1) ratios.push(rub / usd);  // у дешёвых — шум округления
+    }
+    ratios.sort((x, y) => x - y);
+    rates[id] = ratios.length ? ratios[Math.floor(ratios.length / 2)] : null;
+  }
+  return rates[id];
 }
 
 function compareItems(a, b) {
@@ -639,7 +702,7 @@ function itemCard(item) {
     const info = marketInfo(item, id);
     const row = el("div", `mp ${id}`);
     row.append(el("span", "mp-name", marketTitle(id)));
-    row.append(info ? moneyNode(infoMoney(info)) : el("span", "muted", "нет в продаже"));
+    row.append(infoNode(info));
     if (info && id === "dreampets" && info.stock !== null && info.stock !== undefined) {
       row.append(el("span", "muted", ` · ${info.stock} лот.`));
     }
@@ -753,7 +816,7 @@ function renderTable(rows) {
     const prices = MARKET_ORDER.map((id) => {
       const info = marketInfo(item, id);
       const td = el("td", "num price-cell");
-      td.append(info ? moneyNode(infoMoney(info)) : el("span", "muted", "—"));
+      td.append(info ? infoNode(info) : el("span", "muted", "—"));
       return td;
     });
     tr.append(
@@ -834,10 +897,10 @@ function marketTile(item, id) {
     return tile;
   }
   const priceRow = el("div", "tile-price");
-  priceRow.append(moneyNode(infoMoney(info)));
+  priceRow.append(infoNode(info));
   tile.append(priceRow);
   const fee = typeof info.fee === "number" ? info.fee : feeOf(id);
-  if (info.price !== null && info.price !== undefined) {
+  if (infoMoney(info)) {  // цена в долларах или в рублях
     const payout = el("div", "tile-payout");
     payout.append(el("span", "muted", `Вы получите (−${Math.round(fee * 100)}%)`));
     payout.append(moneyNode(infoMoney(info, 1 - fee), "payout"));
@@ -1075,7 +1138,7 @@ function mkSortValue(item, key) {
 
 function payoutCell(info, id) {
   const td = el("td", "num");
-  if (!info || info.price === null || info.price === undefined) {
+  if (!infoMoney(info)) {  // ни долларовой, ни рублёвой цены
     td.append(el("span", "muted", "—"));
     return td;
   }
@@ -1104,10 +1167,7 @@ function renderMarketsTab() {
   const query = state.mkSearch.trim().toLowerCase();
   let rows = itemsIn(state.mkCategory).filter((item) => !item.secret && matchesSearch(item, query));
   if (state.mkOnlyListed) {
-    rows = rows.filter((item) => MARKET_ORDER.some((id) => {
-      const info = marketInfo(item, id);
-      return info && info.price !== null && info.price !== undefined;
-    }));
+    rows = rows.filter((item) => MARKET_ORDER.some((id) => onSale(marketInfo(item, id))));
   }
   const [key, dir] = state.mkSort.split(":");
   rows.sort((a, b) => {
@@ -1131,9 +1191,9 @@ function renderMarketsTab() {
     nameCell.append(art, el("span", "", item.name));
     const supreme = item.value === null || item.value === undefined ? (item.value_text || "—") : fmtNum(item.value);
     const spPrice = el("td", "num");
-    spPrice.append(sp ? moneyNode(infoMoney(sp)) : el("span", "muted", "—"));
+    spPrice.append(sp ? infoNode(sp) : el("span", "muted", "—"));
     const dpPrice = el("td", "num");
-    dpPrice.append(dp ? moneyNode(infoMoney(dp)) : el("span", "muted", "—"));
+    dpPrice.append(dp ? infoNode(dp) : el("span", "muted", "—"));
     tr.append(
       nameCell,
       el("td", "num muted", supreme),
@@ -1355,12 +1415,7 @@ function renderCalc() {
     for (const id of MARKET_ORDER) {
       const info = item.prices[id];
       const unit = el("td", "num");
-      const unitMoney = infoMoney(info);
-      if (unitMoney) {
-        unit.append(moneyNode(unitMoney));
-      } else {
-        unit.append(el("span", "muted", "нет в продаже"));
-      }
+      unit.append(infoNode(info));
       sums[id] = el("td", "num");
       cells.push(unit, sums[id]);
     }
@@ -1395,6 +1450,7 @@ function renderCalc() {
     return tr;
   }));
   $("calcWrap").classList.toggle("hidden", !calc.items.length);
+  calc.rate = usdRub();  // по какому курсу пересчитаны строки
   renderCalcTotals();
 }
 
@@ -1408,22 +1464,26 @@ function renderCalcTotals() {
   }
   const totals = {};
   const missing = {};
+  const unknown = {};
   for (const id of MARKET_ORDER) {
     totals[id] = { usd: 0, rub: 0, usdApprox: false, rubApprox: false, incomplete: false,
       primary: id === "dreampets" ? "rub" : "usd" };
     missing[id] = 0;
+    unknown[id] = 0;
     for (const item of calc.items) {
       const money = calcMoney(item, id);
-      if (money === null) missing[id] += item.qty;
-      else addMoney(totals[id], money);
+      if (money !== null) addMoney(totals[id], money);
+      else if (priceUnknown(item.prices[id])) unknown[id] += item.qty;  // продаётся, но цена не прочитана
+      else missing[id] += item.qty;
     }
   }
   for (const id of MARKET_ORDER) {
     const card = el("div", `total ${id}`);
     card.append(el("span", "muted", `${marketTitle(id)} — вы получите (−${Math.round(calcFee(id) * 100)}%)`));
     const sum = el("div", "total-sum");
-    sum.append(moneyNode(totals[id]));
+    sum.append(totalNode(totals[id]));
     card.append(sum);
+    if (unknown[id]) card.append(el("span", "muted small", `цена неизвестна (не в сумме): ${unknown[id]} шт.`));
     if (missing[id]) card.append(el("span", "muted small", `не продаётся там: ${missing[id]} шт.`));
     box.append(card);
   }
@@ -1433,11 +1493,18 @@ function renderCalcTotals() {
   const star = totals.starpets;
   const dream = totals.dreampets;
   if ((star.rub || dream.rub) && !star.missing_rub && !dream.missing_rub) {
-    // Сравнение в рублях: у StarPets — его собственные рублёвые цены, у DreamPets — рубли.
+    // Сравнение в рублях (курс не нужен): у StarPets — его собственные рублёвые цены, у DreamPets — рубли.
     const best = star.rub > dream.rub ? "starpets" : "dreampets";
+    const other = best === "starpets" ? "dreampets" : "starpets";
     const diff = Math.abs(star.rub - dream.rub);
     const approx = star.rubApprox || dream.rubApprox ? "≈" : "";
-    box.append(el("p", "hint", `Выгоднее продать на ${marketTitle(best)} — больше на ${approx}${fmtRub(diff)}.`));
+    if (unknown[other]) {
+      // Без неизвестных цен меньшая сумма может оказаться и больше.
+      box.append(el("p", "hint", `Какая площадка выгоднее, не понять: на ${marketTitle(other)} у ${unknown[other]} шт. цена неизвестна.`));
+    } else {
+      const atLeast = unknown[best] ? "как минимум " : "";
+      box.append(el("p", "hint", `Выгоднее продать на ${marketTitle(best)} — больше ${atLeast}на ${approx}${fmtRub(diff)}.`));
+    }
   }
 }
 
@@ -1552,6 +1619,12 @@ async function poll() {
     renderSync();
     renderRate();
     renderMarketCards();
+    if (usdRub() !== state.shownRate) renderRatePrices();
+    if (calc.items.length && calc.rate !== usdRub()) {
+      // Пока вводится количество, строки не перерисовываются (поле пропало бы из-под курсора) — только итог.
+      if ($("calcBody").contains(document.activeElement)) renderCalcTotals();
+      else renderCalc();
+    }
   } catch (error) {
     state.offline = error.message;
     renderSync();
@@ -1561,7 +1634,17 @@ async function poll() {
 
 // --- общее --------------------------------------------------------------------
 
+// Курс пришёл или поменялся: пересчитать цены, показанные по прежнему курсу (или без него).
+function renderRatePrices() {
+  state.shownRate = usdRub();
+  renderValues();
+  renderMarketsTab();
+  renderLiquidity();
+  renderDrawer();
+}
+
 function renderAll() {
+  state.shownRate = usdRub();
   renderHeader();
   renderMarketsTab();
   renderErrors();
