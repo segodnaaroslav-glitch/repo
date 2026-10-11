@@ -364,86 +364,123 @@ try {
             if (($x1 - $x0) -ge 4 -and ($y1 - $y0) -ge 4) { $areas.Add([int[]]@($x0, $y0, ($x1 - $x0), ($y1 - $y0), $areas.Count)) }
             else { $areas.Add([int[]]@(0, 0, 0, 0, $areas.Count)) }
         }
-        $glyph = 44; $copies = 4; $margin = 40
+        $margin = 40
         $script:Debug = New-Object System.Collections.Generic.List[string]
-        if ($DumpDir) {
-            # control: plain text drawn by GDI+ must be readable, otherwise the OCR call itself is broken
-            $ctl = New-Object System.Drawing.Bitmap (700, 200, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-            $gc = [System.Drawing.Graphics]::FromImage($ctl)
-            try {
-                $gc.Clear([System.Drawing.Color]::White)
-                $gc.DrawString('x3 x3 x3 x3 Harvester', (New-Object System.Drawing.Font('Arial', 28)), [System.Drawing.Brushes]::Black, 20, 60)
-            } finally { $gc.Dispose() }
-            try {
-                $sb = ConvertTo-SoftwareBitmap $ctl
-                try { $res = Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
-                $script:Debug.Add('control: ' + (($res.Lines | ForEach-Object { $_.Text }) -join ' | '))
-            } catch { $script:Debug.Add('control failed: ' + $_.Exception.Message) } finally { $ctl.Dispose() }
-        }
         $inks = New-Object System.Collections.Generic.List[object]
         foreach ($a in $areas) { $inks.Add((Get-BadgeInk $a)) }
+        $todo = New-Object System.Collections.Generic.List[int]
+        for ($ai = 0; $ai -lt $areas.Count; $ai++) { if ($null -ne $inks[$ai]) { $todo.Add($ai) } }
+
+        # One sheet: a row per area (indexes $idx), each row = optional prefix word + $copies
+        # copies of the piece. mode 'tight' = bright text cropped tightly and scaled to $glyphH;
+        # 'area' = the whole area scaled by $glyphH / 16. Returns @(bitmap, rows) or $null.
+        function New-RegionSheet($idx, [string]$kind, [string]$mode, [double]$glyphH, [string]$prefix, [int]$copies, [double]$spaceK) {
+            $pieces = New-Object System.Collections.Generic.List[object]
+            foreach ($ai in $idx) {
+                if ($mode -eq 'tight') {
+                    $ink = $inks[$ai]
+                    $s = [Math]::Min(8.0, [Math]::Max(1.0, $glyphH / [double][Math]::Max(1, $ink[3])))
+                    $pad = [Math]::Max(2, [int][Math]::Round(0.35 * $ink[3]))
+                    $cx0 = [Math]::Max(0, $ink[0] - $pad); $cy0 = [Math]::Max(0, $ink[1] - $pad)
+                    $cx1 = [Math]::Min($ImgW, $ink[0] + $ink[2] + $pad); $cy1 = [Math]::Min($ImgH, $ink[1] + $ink[3] + $pad)
+                    $crop = @($cx0, $cy0, ($cx1 - $cx0), ($cy1 - $cy0))
+                } else {
+                    $a = $areas[$ai]; $s = $glyphH / 16.0; $crop = @($a[0], $a[1], $a[2], $a[3])
+                }
+                $scaled = New-ScaledCrop $src $crop $s
+                try { $pieces.Add((New-PassBitmap $scaled $kind)) } finally { $scaled.Dispose() }
+            }
+            if ($pieces.Count -eq 0) { return $null }
+            $space = [int]($spaceK * $glyphH)
+            $font = $null; $prefixW = 0
+            if ($prefix) {
+                $font = New-Object System.Drawing.Font('Arial', [float]($glyphH / 0.72), [System.Drawing.GraphicsUnit]::Pixel)
+                $probe = New-Object System.Drawing.Bitmap (8, 8)
+                $gp = [System.Drawing.Graphics]::FromImage($probe)
+                try { $prefixW = [int][Math]::Ceiling($gp.MeasureString($prefix, $font).Width) + [int](0.6 * $glyphH) } finally { $gp.Dispose(); $probe.Dispose() }
+            }
+            $sheetW = 2 * $margin; $top = $margin
+            $rows = @()
+            foreach ($piece in $pieces) {
+                $sheetW = [Math]::Max($sheetW, 2 * $margin + $prefixW + $copies * $piece.Width + ($copies - 1) * $space)
+                $rows += , @($top, ($top + $piece.Height))
+                $top += $piece.Height + [Math]::Max($piece.Height, [int](1.6 * $glyphH))
+            }
+            $sheetW = [Math]::Min($sheetW, $limit)
+            $sheetH = [Math]::Min($limit, $top + $margin)
+            $sheet = New-Object System.Drawing.Bitmap ($sheetW, $sheetH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $gs = [System.Drawing.Graphics]::FromImage($sheet)
+            try {
+                $gs.Clear([System.Drawing.Color]::White)
+                $gs.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+                for ($i = 0; $i -lt $pieces.Count; $i++) {
+                    $piece = $pieces[$i]
+                    $left = $margin
+                    if ($font) {
+                        $ty = $rows[$i][0] + ($piece.Height - $font.GetHeight()) / 2
+                        $gs.DrawString($prefix, $font, [System.Drawing.Brushes]::Black, [float]$left, [float]$ty)
+                        $left += $prefixW
+                    }
+                    for ($k = 0; $k -lt $copies; $k++) {
+                        if ($left + $piece.Width -gt $sheetW) { break }
+                        $gs.DrawImage($piece, $left, $rows[$i][0], $piece.Width, $piece.Height)
+                        $left += $piece.Width + $space
+                    }
+                }
+            } finally {
+                $gs.Dispose()
+                if ($font) { $font.Dispose() }
+                foreach ($piece in $pieces) { $piece.Dispose() }
+            }
+            return , @($sheet, $rows)
+        }
+
+        function Read-Sheet([System.Drawing.Bitmap]$sheet) {
+            $sb = ConvertTo-SoftwareBitmap $sheet
+            try { return Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
+        }
+
+        if ($DumpDir -and $todo.Count -gt 0) {
+            # experiment: which sheet layout does this OCR read at all?
+            $variants = @(
+                @('tight', 44, '', 4, 0.6), @('tight', 30, '', 4, 0.6), @('tight', 22, '', 4, 0.6),
+                @('tight', 44, 'Qty', 4, 0.6), @('tight', 30, 'Qty', 2, 0.6), @('tight', 44, '', 4, 0.25),
+                @('area', 32, '', 2, 0.0), @('area', 24, '', 1, 0.0), @('tight', 44, 'Amount', 1, 0.6))
+            foreach ($kind in @('white', 'grayinv')) {
+                foreach ($v in $variants) {
+                    $name = '{0}/{1}{2}/{3}/x{4}/s{5}' -f $kind, $v[0], $v[1], $v[2], $v[3], $v[4]
+                    try {
+                        $built = New-RegionSheet $todo $kind $v[0] $v[1] $v[2] $v[3] $v[4]
+                        try { $res = Read-Sheet $built[0] } finally { $built[0].Dispose() }
+                        $script:Debug.Add(('{0}: {1}' -f $name, (($res.Lines | ForEach-Object { $_.Text }) -join ' | ')))
+                    } catch { $script:Debug.Add(('{0} failed: {1}' -f $name, $_.Exception.Message)) }
+                }
+            }
+        }
+
         $found = New-Object System.Collections.Generic.List[object]
         $infos = New-Object System.Collections.Generic.List[string]
         foreach ($kind in @('white', 'grayinv', 'whitehi')) {
             $t0 = [Diagnostics.Stopwatch]::StartNew()
             $err = ''
-            # one row per area that has bright text; rows in chunks under the OCR size limit
-            $todo = New-Object System.Collections.Generic.List[int]
-            for ($ai = 0; $ai -lt $areas.Count; $ai++) { if ($null -ne $inks[$ai]) { $todo.Add($ai) } }
-            $rowStep = [int](2 * $glyph * 1.9)
-            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / $rowStep))
+            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / 170))
             for ($start = 0; $start -lt $todo.Count; $start += $perSheet) {
-                $pieces = New-Object System.Collections.Generic.List[object]
-                $sheetW = 2 * $margin; $sheetH = 2 * $margin
-                for ($ci = $start; $ci -lt [Math]::Min($todo.Count, $start + $perSheet); $ci++) {
-                    $ink = $inks[$todo[$ci]]
-                    $s = [Math]::Min(8.0, [Math]::Max(1.0, $glyph / [double][Math]::Max(1, $ink[3])))
-                    $pad = [Math]::Max(2, [int][Math]::Round(0.35 * $ink[3]))
-                    $cx0 = [Math]::Max(0, $ink[0] - $pad); $cy0 = [Math]::Max(0, $ink[1] - $pad)
-                    $cx1 = [Math]::Min($ImgW, $ink[0] + $ink[2] + $pad); $cy1 = [Math]::Min($ImgH, $ink[1] + $ink[3] + $pad)
-                    $scaled = New-ScaledCrop $src @($cx0, $cy0, ($cx1 - $cx0), ($cy1 - $cy0)) $s
-                    try { $piece = New-PassBitmap $scaled $kind } finally { $scaled.Dispose() }
-                    $pieces.Add($piece)
-                    $space = [int](0.6 * $glyph)
-                    $sheetW = [Math]::Max($sheetW, 2 * $margin + $copies * $piece.Width + ($copies - 1) * $space)
-                }
-                $sheetW = [Math]::Min($sheetW, $limit)
-                $rows = @()
-                $top = $margin
-                foreach ($piece in $pieces) { $rows += , @($top, ($top + $piece.Height)); $top += $piece.Height + [Math]::Max($piece.Height, [int](1.6 * $glyph)) }
-                $sheetH = [Math]::Min($limit, $top + $margin)
-                $sheet = New-Object System.Drawing.Bitmap ($sheetW, $sheetH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-                $gs = [System.Drawing.Graphics]::FromImage($sheet)
+                $idx = @($todo[$start..([Math]::Min($todo.Count, $start + $perSheet) - 1)])
                 try {
-                    $gs.Clear([System.Drawing.Color]::White)
-                    for ($i = 0; $i -lt $pieces.Count; $i++) {
-                        $piece = $pieces[$i]
-                        $space = [int](0.6 * $glyph)
-                        for ($k = 0; $k -lt $copies; $k++) {
-                            $left = $margin + $k * ($piece.Width + $space)
-                            if ($left + $piece.Width -gt $sheetW) { break }
-                            $gs.DrawImage($piece, $left, $rows[$i][0], $piece.Width, $piece.Height)
-                        }
-                    }
-                } finally {
-                    $gs.Dispose()
-                    foreach ($piece in $pieces) { $piece.Dispose() }
-                }
-                if ($DumpDir) {  # for diagnostics: the sheets exactly as OCR sees them
-                    try { $sheet.Save((Join-Path $DumpDir ('regions-{0}-{1}.png' -f $kind, $start)), [System.Drawing.Imaging.ImageFormat]::Png) } catch { }
-                }
-                try {
-                    $sb = ConvertTo-SoftwareBitmap $sheet
-                    try { $res = Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
+                    $built = New-RegionSheet $idx $kind 'tight' 44 '' 4 0.6
+                    $sheet = $built[0]; $rows = $built[1]
+                    try {
+                        if ($DumpDir) { try { $sheet.Save((Join-Path $DumpDir ('regions-{0}-{1}.png' -f $kind, $start)), [System.Drawing.Imaging.ImageFormat]::Png) } catch { } }
+                        $res = Read-Sheet $sheet
+                    } finally { $sheet.Dispose() }
                     $li = 0
-                    if ($DumpDir) { $script:Debug.Add(('{0}:{1} rows={2} lines={3} text={4}' -f $kind, $start, (($rows | ForEach-Object { $_ -join '-' }) -join ','), @($res.Lines).Count, (($res.Lines | ForEach-Object { $_.Text + ' @' + $_.Words[0].BoundingRect.Y }) -join ' | '))) }
                     foreach ($line in $res.Lines) {
                         foreach ($word in $line.Words) {
                             $cy = $word.BoundingRect.Y + $word.BoundingRect.Height / 2
                             $region = -1
                             for ($ri = 0; $ri -lt $rows.Count; $ri++) {
                                 $gap = ($rows[$ri][1] - $rows[$ri][0]) / 2
-                                if ($cy -ge ($rows[$ri][0] - $gap) -and $cy -lt ($rows[$ri][1] + $gap)) { $region = $todo[$start + $ri] }
+                                if ($cy -ge ($rows[$ri][0] - $gap) -and $cy -lt ($rows[$ri][1] + $gap)) { $region = $idx[$ri] }
                             }
                             if ($region -lt 0) { continue }
                             $found.Add([pscustomobject]@{
@@ -454,7 +491,7 @@ try {
                         }
                         $li++
                     }
-                } catch { $err = $_.Exception.Message } finally { $sheet.Dispose() }
+                } catch { $err = $_.Exception.Message }
             }
             $infos.Add(('{{"name":{0},"ms":{1},"error":{2}}}' -f (ConvertTo-JsonString $kind), [int]$t0.Elapsed.TotalMilliseconds, (ConvertTo-JsonString $err)))
         }
