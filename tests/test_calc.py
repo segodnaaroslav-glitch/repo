@@ -280,7 +280,7 @@ class WindowsInventoryOcrTests(unittest.TestCase):
                 regions = tileocr.badge_regions(tileocr.recognize(data, self.names()))
                 try:
                     again = ocr.recognize_regions(raw, [area for _, area in regions], dump_dir=dump)
-                    print("\nregions:", regions, "\nregion passes:", again.get("passes"), "\nareas:", again.get("areas"),
+                    print("\nregions:", regions, "\nregion passes:", again.get("passes"), "\nareas:", again.get("areas"), "\ndebug:", again.get("debug"),
                           "\nregion words:", [(w["text"], w["region"], w["pass"]) for w in again.get("words", [])])
                 except ocr.OcrError as error:
                     print("\nregions:", regions, "\nregion pass failed:", error)

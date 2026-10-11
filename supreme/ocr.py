@@ -365,6 +365,21 @@ try {
             else { $areas.Add([int[]]@(0, 0, 0, 0, $areas.Count)) }
         }
         $glyph = 44; $copies = 4; $margin = 40
+        $script:Debug = New-Object System.Collections.Generic.List[string]
+        if ($DumpDir) {
+            # control: plain text drawn by GDI+ must be readable, otherwise the OCR call itself is broken
+            $ctl = New-Object System.Drawing.Bitmap (700, 200, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $gc = [System.Drawing.Graphics]::FromImage($ctl)
+            try {
+                $gc.Clear([System.Drawing.Color]::White)
+                $gc.DrawString('x3 x3 x3 x3 Harvester', (New-Object System.Drawing.Font('Arial', 28)), [System.Drawing.Brushes]::Black, 20, 60)
+            } finally { $gc.Dispose() }
+            try {
+                $sb = ConvertTo-SoftwareBitmap $ctl
+                try { $res = Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
+                $script:Debug.Add('control: ' + (($res.Lines | ForEach-Object { $_.Text }) -join ' | '))
+            } catch { $script:Debug.Add('control failed: ' + $_.Exception.Message) } finally { $ctl.Dispose() }
+        }
         $inks = New-Object System.Collections.Generic.List[object]
         foreach ($a in $areas) { $inks.Add((Get-BadgeInk $a)) }
         $found = New-Object System.Collections.Generic.List[object]
@@ -421,6 +436,7 @@ try {
                     $sb = ConvertTo-SoftwareBitmap $sheet
                     try { $res = Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
                     $li = 0
+                    if ($DumpDir) { $script:Debug.Add(('{0}:{1} rows={2} lines={3} text={4}' -f $kind, $start, (($rows | ForEach-Object { $_ -join '-' }) -join ','), @($res.Lines).Count, (($res.Lines | ForEach-Object { $_.Text + ' @' + $_.Words[0].BoundingRect.Y }) -join ' | '))) }
                     foreach ($line in $res.Lines) {
                         foreach ($word in $line.Words) {
                             $cy = $word.BoundingRect.Y + $word.BoundingRect.Height / 2
@@ -446,6 +462,8 @@ try {
         $sbOut = New-Object System.Text.StringBuilder
         [void]$sbOut.Append(('{{"ok":true,"mode":"regions","width":{0},"height":{1},"regions":{2},"passes":[' -f $ImgW, $ImgH, $areas.Count))
         [void]$sbOut.Append(($infos -join ','))
+        [void]$sbOut.Append('],"debug":[')
+        [void]$sbOut.Append((($script:Debug | ForEach-Object { ConvertTo-JsonString $_ }) -join ','))
         [void]$sbOut.Append('],"areas":[')
         for ($ai = 0; $ai -lt $areas.Count; $ai++) {
             if ($ai -gt 0) { [void]$sbOut.Append(',') }
