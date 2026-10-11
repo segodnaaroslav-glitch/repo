@@ -547,3 +547,57 @@ def parse_output(stdout_bytes):
     if at < 0:
         raise ValueError("no OCR result in output")
     return json.loads(text[at + len(MARKER):].strip().splitlines()[0])
+
+
+# --- повторное чтение значков «xN» ------------------------------------------------------
+# Короткие значки ("x2", "x3") распознавание часто пропускает. Для плиток без значка
+# правый верхний угол читается ещё раз отдельно (ocr.recognize_regions): крупно, тремя
+# копиями в ряд; количество засчитывается, только если копии сходятся.
+_REGION_X_RE = re.compile(r"[xX*]\s*([0-9OoDQIl|!iSsZzBg]{1,4})(?![0-9])")
+_REGION_DIGITS_RE = re.compile(r"(?<![0-9A-Za-z])(\d{1,4})(?![0-9A-Za-z])")
+
+
+def badge_regions(tiles):
+    """[(номер плитки, [x, y, w, h])] — где искать значок у плиток, где его не нашли."""
+    regions = []
+    for index, tile in enumerate(tiles):
+        box = tile.get("box")
+        if not tile.get("name") or tile.get("qty_from_badge") or not box or tile.get("qty_uncertain"):
+            continue
+        x0, y0, width = box[0], box[1], box[2]
+        regions.append((index, [int(x0 + 0.45 * width), int(y0 - 0.02 * width),
+                                int(0.6 * width), int(0.36 * width)]))
+    return regions
+
+
+def apply_region_badges(tiles, regions, words):
+    """Голоса из повторного чтения -> количество у плиток (на месте). Возвращает, сколько найдено."""
+    by_region = {}
+    for word in words or []:
+        if isinstance(word.get("region"), int):
+            key = (word["region"], word.get("pass", ""), word.get("line", ""))
+            by_region.setdefault(word["region"], {}).setdefault(key, []).append(word)
+    found = 0
+    for number, (tile_index, _) in enumerate(regions):
+        votes = Counter()
+        for line_words in by_region.get(number, {}).values():
+            text = fold_text(" ".join(str(w.get("text", "")) for w in sorted(line_words, key=lambda w: w.get("x", 0))))
+            hits = [raw.translate(_TO_DIGIT) for raw in _REGION_X_RE.findall(text)]
+            hits = [h for h in hits if h.isdigit()]
+            weight = 1.0
+            if not hits:  # без «x» — только цифры (слабее: это может быть кусок картинки)
+                hits, weight = _REGION_DIGITS_RE.findall(text), 0.5
+            for hit in hits:
+                value = int(hit)
+                if 2 <= value <= 9999:
+                    votes[value] += weight
+        if not votes:
+            continue
+        value, weight = votes.most_common(1)[0]
+        runner_up = votes.most_common(2)[1][1] if len(votes) > 1 else 0
+        if weight >= 1.5 and weight > runner_up:
+            tile = tiles[tile_index]
+            tile["qty"] = value
+            tile["qty_from_badge"] = True
+            found += 1
+    return found

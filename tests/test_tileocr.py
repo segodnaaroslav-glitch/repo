@@ -269,3 +269,61 @@ class OutputParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
+
+
+class RegionBadgeTests(unittest.TestCase):
+    def test_short_badges_read_again(self):
+        tiles = [{"name": "Harvester", "qty": 1, "qty_from_badge": False, "box": [20, 30, 130, 170]},
+                 {"name": "Seer", "qty": 40, "qty_from_badge": True, "box": [159, 30, 130, 170]},
+                 {"name": "Fang", "qty": 1, "qty_from_badge": False, "box": [298, 30, 130, 170]},
+                 {"name": "Corrupt", "qty": 1, "qty_from_badge": False, "box": [437, 30, 130, 170]}]
+        regions = tileocr.badge_regions(tiles)
+        self.assertEqual([index for index, _ in regions], [0, 2, 3])
+        x, y, w, h = regions[0][1]
+        self.assertTrue(x > 20 + 50 and x + w >= 150 and y <= 30 and y + h >= 30 + 30)
+        words = [
+            {"text": "x3", "region": 0, "pass": "white", "line": "a", "x": 0},
+            {"text": "x3", "region": 0, "pass": "white", "line": "a", "x": 50},
+            {"text": "x3 x3", "region": 0, "pass": "grayinv", "line": "b", "x": 0},
+            {"text": "l", "region": 1, "pass": "white", "line": "c", "x": 0},  # кусок картинки — не значок
+            {"text": "x2", "region": 2, "pass": "white", "line": "d", "x": 0},
+            {"text": "x7", "region": 2, "pass": "grayinv", "line": "e", "x": 0},  # копии не сошлись
+        ]
+        self.assertEqual(tileocr.apply_region_badges(tiles, regions, words), 1)
+        self.assertEqual([t["qty"] for t in tiles], [3, 40, 1, 1])
+
+
+class ReadInventoryTests(unittest.TestCase):
+    def test_second_pass_fills_short_badges(self):
+        import subprocess
+        from supreme import ocr
+        first = grid({(0, 0): ("Harvester", None), (0, 1): ("Seer", "x40")})
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            if "-Regions" in command:
+                spec = command[command.index("-Regions") + 1]
+                self.assertEqual(spec.count(";"), 0)  # только Harvester: у Seer значок уже есть
+                words = [{"text": "x3", "region": 0, "pass": p, "line": p, "x": 0} for p in ("white", "grayinv")]
+                body = {"ok": True, "mode": "regions", "words": words}
+            else:
+                body = {"ok": True, "width": 400, "height": 300, "words": first}
+            return subprocess.CompletedProcess(command, 0, (tileocr.MARKER + json.dumps(body)).encode(), b"")
+
+        words, tiles = ocr.read_inventory(b"png", known_names=NAMES, run=run)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sorted(result_pairs(tiles)), [("Harvester", 3), ("Seer", 40)])
+
+    def test_failed_second_pass_keeps_first_result(self):
+        import subprocess
+        from supreme import ocr
+
+        def run(command, **kwargs):
+            if "-Regions" in command:
+                return subprocess.CompletedProcess(command, 1, b"", b"boom")
+            body = {"ok": True, "words": grid({(0, 0): ("Harvester", None)})}
+            return subprocess.CompletedProcess(command, 0, (tileocr.MARKER + json.dumps(body)).encode(), b"")
+
+        _, tiles = ocr.read_inventory(b"png", known_names=NAMES, run=run)
+        self.assertEqual(result_pairs(tiles), [("Harvester", 1)])

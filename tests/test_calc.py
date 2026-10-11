@@ -271,11 +271,11 @@ class WindowsInventoryOcrTests(unittest.TestCase):
                 + f"$b.Save('{png}', [System.Drawing.Imaging.ImageFormat]::Png)"
             )
             subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True, timeout=60)
-            data = ocr.recognize_words(png.read_bytes())
-        tiles = tileocr.recognize(data, self.names())
+            data, tiles = ocr.read_inventory(png.read_bytes(), known_names=self.names())
         print("\nOCR words:", [(w["text"], w["pass"]) for w in data["words"]][:80], "\ntiles:",
-              [(t["name"], t["qty"], t["text"]) for t in tiles])
+              [(t["name"], t["qty"], t.get("qty_from_badge"), t["text"]) for t in tiles])
         got = {t["name"]: t["qty"] for t in tiles if t["name"]}
         expected = {"Harvester": 3, "Icebreaker": 1, "Seer": 40, "Corrupt": 2, "Fang": 1, "Luger": 12}
         matched = {name for name, qty in expected.items() if got.get(name) == qty}
         self.assertGreaterEqual(len(matched), 5, f"распознано {got}")
+        self.assertEqual({got.get("Harvester"), got.get("Corrupt")}, {3, 2}, f"значки x3/x2: {got}")

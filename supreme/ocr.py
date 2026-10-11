@@ -35,7 +35,8 @@ _TILE_SCRIPT = r"""param(
     [double]$TargetHeight = 40,
     [int]$MaxSide = 4000,
     [int]$Overlap = 320,
-    [string]$Lang = 'en-US'
+    [string]$Lang = 'en-US',
+    [string]$Regions = ''
 )
 # MM2 inventory OCR: Windows.Media.Ocr + System.Drawing preprocessing, no installs.
 # Prints one line: @@MM2OCR@@{json}. The JSON is pure ASCII (non-ASCII is \uXXXX-escaped),
@@ -318,6 +319,103 @@ try {
         return $best
     }
 
+    # ---- Regions mode: re-read small areas (quantity badges "x3" that the full pass missed).
+    # Every area is enlarged so its height is ~100 px, cleaned (white text -> black on white),
+    # drawn three times in a row (a longer line is read more reliably than a lone "x3") and all
+    # areas are stacked on one sheet. Words carry the index of their area.
+    if ($Regions) {
+        $areas = New-Object System.Collections.Generic.List[int[]]
+        foreach ($part in $Regions.Split(';')) {
+            $v = @($part.Split(',') | ForEach-Object { [int]$_ })
+            if ($v.Count -ne 4) { continue }
+            $x0 = [Math]::Max(0, $v[0]); $y0 = [Math]::Max(0, $v[1])
+            $x1 = [Math]::Min($ImgW, $v[0] + $v[2]); $y1 = [Math]::Min($ImgH, $v[1] + $v[3])
+            if (($x1 - $x0) -ge 4 -and ($y1 - $y0) -ge 4) { $areas.Add([int[]]@($x0, $y0, ($x1 - $x0), ($y1 - $y0), $areas.Count)) }
+            else { $areas.Add([int[]]@(0, 0, 0, 0, $areas.Count)) }
+        }
+        $rowH = 100; $gap = 60; $margin = 40; $copies = 3
+        $found = New-Object System.Collections.Generic.List[object]
+        $infos = New-Object System.Collections.Generic.List[string]
+        foreach ($kind in @('white', 'grayinv', 'whitehi')) {
+            $t0 = [Diagnostics.Stopwatch]::StartNew()
+            $err = ''
+            # rows in chunks so a sheet stays under the OCR size limit
+            $perSheet = [Math]::Max(1, [int][Math]::Floor(($limit - 2 * $margin) / ($rowH + $gap)))
+            for ($start = 0; $start -lt $areas.Count; $start += $perSheet) {
+                $chunk = New-Object System.Collections.Generic.List[int[]]
+                for ($ci = $start; $ci -lt [Math]::Min($areas.Count, $start + $perSheet); $ci++) { $chunk.Add($areas[$ci]) }
+                $pieces = @()
+                $sheetW = 2 * $margin
+                foreach ($a in $chunk) {
+                    if ($a[2] -le 0) { $pieces += , $null; continue }
+                    $s = $rowH / [double]$a[3]
+                    $scaled = New-ScaledCrop $src @($a[0], $a[1], $a[2], $a[3]) $s
+                    try { $piece = New-PassBitmap $scaled $kind } finally { $scaled.Dispose() }
+                    $pieces += , $piece
+                    $sheetW = [Math]::Max($sheetW, 2 * $margin + $copies * $piece.Width + ($copies - 1) * $gap)
+                }
+                $sheetW = [Math]::Min($sheetW, $limit)
+                $sheetH = 2 * $margin + $chunk.Count * ($rowH + $gap)
+                $sheet = New-Object System.Drawing.Bitmap ($sheetW, $sheetH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+                $gs = [System.Drawing.Graphics]::FromImage($sheet)
+                $rows = @()
+                try {
+                    $gs.Clear([System.Drawing.Color]::White)
+                    for ($i = 0; $i -lt $chunk.Count; $i++) {
+                        $top = $margin + $i * ($rowH + $gap)
+                        $rows += , @($top, ($top + $rowH), $chunk[$i][4])
+                        $piece = $pieces[$i]
+                        if ($null -eq $piece) { continue }
+                        for ($k = 0; $k -lt $copies; $k++) {
+                            $left = $margin + $k * ($piece.Width + $gap)
+                            if ($left + $piece.Width -gt $sheetW) { break }
+                            $gs.DrawImage($piece, $left, $top, $piece.Width, $piece.Height)
+                        }
+                    }
+                } finally {
+                    $gs.Dispose()
+                    foreach ($piece in $pieces) { if ($null -ne $piece) { $piece.Dispose() } }
+                }
+                try {
+                    $sb = ConvertTo-SoftwareBitmap $sheet
+                    try { $res = Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
+                    $li = 0
+                    foreach ($line in $res.Lines) {
+                        foreach ($word in $line.Words) {
+                            $cy = $word.BoundingRect.Y + $word.BoundingRect.Height / 2
+                            $region = -1
+                            foreach ($row in $rows) { if ($cy -ge ($row[0] - $gap / 2) -and $cy -lt ($row[1] + $gap / 2)) { $region = $row[2] } }
+                            if ($region -lt 0) { continue }
+                            $found.Add([pscustomobject]@{
+                                    Text = $word.Text; X = [int]$word.BoundingRect.X; Y = [int]$word.BoundingRect.Y
+                                    W = [int]$word.BoundingRect.Width; H = [int]$word.BoundingRect.Height; Cut = 0
+                                    Pass = $kind; Line = ('{0}:r{1}:{2}' -f $kind, $start, $li); Bg = @(0, 0, 0); Region = $region
+                                })
+                        }
+                        $li++
+                    }
+                } catch { $err = $_.Exception.Message } finally { $sheet.Dispose() }
+            }
+            $infos.Add(('{{"name":{0},"ms":{1},"error":{2}}}' -f (ConvertTo-JsonString $kind), [int]$t0.Elapsed.TotalMilliseconds, (ConvertTo-JsonString $err)))
+        }
+        $src.Dispose()
+        $sbOut = New-Object System.Text.StringBuilder
+        [void]$sbOut.Append(('{{"ok":true,"mode":"regions","width":{0},"height":{1},"regions":{2},"passes":[' -f $ImgW, $ImgH, $areas.Count))
+        [void]$sbOut.Append(($infos -join ','))
+        [void]$sbOut.Append('],"words":[')
+        $first = $true
+        foreach ($p in $found) {
+            if (-not $first) { [void]$sbOut.Append(',') }
+            [void]$sbOut.Append(('{{"text":{0},"region":{1},"pass":{2},"line":{3},"x":{4},"y":{5},"w":{6},"h":{7}}}' -f
+                    (ConvertTo-JsonString $p.Text), $p.Region, (ConvertTo-JsonString $p.Pass), (ConvertTo-JsonString $p.Line),
+                    $p.X, $p.Y, $p.W, $p.H))
+            $first = $false
+        }
+        [void]$sbOut.Append(']}')
+        Write-Result $sbOut.ToString()
+        exit 0
+    }
+
     $script:Words = New-Object System.Collections.Generic.List[object]
     $script:PassInfo = New-Object System.Collections.Generic.List[string]
 
@@ -421,7 +519,13 @@ try {
 """
 
 
-def recognize_words(image_bytes, suffix=".png", passes=PASSES, scale=0.0, run=subprocess.run):
+def recognize_regions(image_bytes, regions, suffix=".png", run=subprocess.run):
+    """Повторно прочитать небольшие области (значки «xN»): {"words": [{"text", "region", "pass", "line"}]}."""
+    spec = ";".join(",".join(str(int(v)) for v in region) for region in regions)
+    return recognize_words(image_bytes, suffix=suffix, extra=["-Regions", spec], run=run)
+
+
+def recognize_words(image_bytes, suffix=".png", passes=PASSES, scale=0.0, run=subprocess.run, extra=None):
     """Скриншот -> {"width","height","scale","passes":[...],"words":[{"text","x","y","w","h",
     "pass","line","cut","bg"}]}. OcrError — с понятным пользователю сообщением."""
     if run is subprocess.run and not available():
@@ -444,6 +548,7 @@ def recognize_words(image_bytes, suffix=".png", passes=PASSES, scale=0.0, run=su
                    "-File", script, "-Path", image, "-Passes", passes]
         if scale:
             command += ["-Scale", "%.3f" % scale]
+        command += list(extra or [])
         try:
             result = run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -475,6 +580,22 @@ def recognize_words(image_bytes, suffix=".png", passes=PASSES, scale=0.0, run=su
             os.rmdir(workdir)
         except OSError:
             pass
+
+
+def read_inventory(image_bytes, matcher=None, known_names=None, run=subprocess.run):
+    """Скриншот инвентаря MM2 -> (слова, плитки). Плитки с названием, но без значка
+    «xN», читаются второй раз: угол плитки отдельно и крупно — короткие «x2» и «x3»
+    распознаванию Windows на целой картинке часто не даются."""
+    words = recognize_words(image_bytes, run=run)
+    tiles = tileocr.recognize(words, known_names, matcher)
+    regions = tileocr.badge_regions(tiles)
+    if regions:
+        try:
+            again = recognize_regions(image_bytes, [area for _, area in regions], run=run)
+            tileocr.apply_region_badges(tiles, regions, again.get("words"))
+        except OcrError:
+            pass
+    return words, tiles
 
 
 def lines_from_words(data):

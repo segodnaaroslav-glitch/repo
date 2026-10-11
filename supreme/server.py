@@ -219,8 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         shots, ocr_lines, unknown_tiles = [], [], 0
         for index, raw in decoded:
             try:
-                words = ocr.recognize_words(raw)
-                tiles = tileocr.recognize(words, None, matcher)
+                words, tiles = ocr.read_inventory(raw, matcher)
             except ocr.OcrError as error:
                 ocr_errors.append(f"скриншот {index}: {error}")
                 continue
