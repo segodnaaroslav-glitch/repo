@@ -271,7 +271,19 @@ class WindowsInventoryOcrTests(unittest.TestCase):
                 + f"$b.Save('{png}', [System.Drawing.Imaging.ImageFormat]::Png)"
             )
             subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], check=True, timeout=60)
-            data, tiles = ocr.read_inventory(png.read_bytes(), known_names=self.names())
+            raw = png.read_bytes()
+            data, tiles = ocr.read_inventory(raw, known_names=self.names())
+            dump = os.environ.get("MM2_OCR_DUMP")
+            if dump:  # CI: листы второго прохода и сама картинка — в артефакты сборки
+                os.makedirs(dump, exist_ok=True)
+                (Path(dump) / "inventory.png").write_bytes(raw)
+                regions = tileocr.badge_regions(tileocr.recognize(data, self.names()))
+                try:
+                    again = ocr.recognize_regions(raw, [area for _, area in regions], dump_dir=dump)
+                    print("\nregions:", regions, "\nregion passes:", again.get("passes"),
+                          "\nregion words:", [(w["text"], w["region"], w["pass"]) for w in again.get("words", [])])
+                except ocr.OcrError as error:
+                    print("\nregions:", regions, "\nregion pass failed:", error)
         print("\nOCR words:", [(w["text"], w["pass"]) for w in data["words"]][:80], "\ntiles:",
               [(t["name"], t["qty"], t.get("qty_from_badge"), t["text"]) for t in tiles])
         got = {t["name"]: t["qty"] for t in tiles if t["name"]}

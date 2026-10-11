@@ -36,7 +36,8 @@ _TILE_SCRIPT = r"""param(
     [int]$MaxSide = 4000,
     [int]$Overlap = 320,
     [string]$Lang = 'en-US',
-    [string]$Regions = ''
+    [string]$Regions = '',
+    [string]$DumpDir = ''
 )
 # MM2 inventory OCR: Windows.Media.Ocr + System.Drawing preprocessing, no installs.
 # Prints one line: @@MM2OCR@@{json}. The JSON is pure ASCII (non-ASCII is \uXXXX-escaped),
@@ -376,6 +377,9 @@ try {
                     $gs.Dispose()
                     foreach ($piece in $pieces) { if ($null -ne $piece) { $piece.Dispose() } }
                 }
+                if ($DumpDir) {  # for diagnostics: the sheets exactly as OCR sees them
+                    try { $sheet.Save((Join-Path $DumpDir ('regions-{0}-{1}.png' -f $kind, $start)), [System.Drawing.Imaging.ImageFormat]::Png) } catch { }
+                }
                 try {
                     $sb = ConvertTo-SoftwareBitmap $sheet
                     try { $res = Await ($script:Engine.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult]) } finally { $sb.Dispose() }
@@ -519,10 +523,12 @@ try {
 """
 
 
-def recognize_regions(image_bytes, regions, suffix=".png", run=subprocess.run):
-    """Повторно прочитать небольшие области (значки «xN»): {"words": [{"text", "region", "pass", "line"}]}."""
+def recognize_regions(image_bytes, regions, suffix=".png", run=subprocess.run, dump_dir=None):
+    """Повторно прочитать небольшие области (значки «xN»): {"words": [{"text", "region", "pass", "line"}]}.
+    dump_dir — сохранить туда листы, которые читало распознавание (для проверки)."""
     spec = ";".join(",".join(str(int(v)) for v in region) for region in regions)
-    return recognize_words(image_bytes, suffix=suffix, extra=["-Regions", spec], run=run)
+    extra = ["-Regions", spec] + (["-DumpDir", str(dump_dir)] if dump_dir else [])
+    return recognize_words(image_bytes, suffix=suffix, extra=extra, run=run)
 
 
 def recognize_words(image_bytes, suffix=".png", passes=PASSES, scale=0.0, run=subprocess.run, extra=None):
