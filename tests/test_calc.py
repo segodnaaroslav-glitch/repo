@@ -284,6 +284,8 @@ class WindowsInventoryOcrTests(unittest.TestCase):
                           "\nregion words:", [(w["text"], w["region"], w["pass"]) for w in again.get("words", [])])
                 except ocr.OcrError as error:
                     print("\nregions:", regions, "\nregion pass failed:", error)
+                for sheet in sorted(Path(dump).glob("*.png")):  # журнал сборки — единственный способ их увидеть
+                    print("\nDUMP", sheet.name, base64.b64encode(sheet.read_bytes()).decode("ascii"))
         print("\nOCR words:", [(w["text"], w["pass"]) for w in data["words"]][:80], "\ntiles:",
               [(t["name"], t["qty"], t.get("qty_from_badge"), t["text"]) for t in tiles])
         got = {t["name"]: t["qty"] for t in tiles if t["name"]}
