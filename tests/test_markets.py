@@ -611,7 +611,9 @@ class DreamPetsMarketCardsTests(unittest.TestCase):
         self.assertEqual((offers["Eternal III"]["price"], offers["Eternal III"]["stock"]), (23.71, 114))
         self.assertEqual((offers["Harvester"]["price"], offers["Harvester"]["stock"]), (328.98, 1234))
         self.assertIn("страница рынка: 2", adapter.note)
-        self.assertNotIn("Candy", offers)  # без цены и без страницы товара (404) — пока нет данных
+        # Без цены в списке, а страница товара — 404: снят с продажи (не «цена неизвестна»).
+        self.assertEqual((offers["Candy"]["price"], offers["Candy"]["stock"], offers["Candy"]["available"]),
+                         (None, 0, False))
         self.assertTrue(any("/product/candy/" in str(call) for call in request.call_args_list))
 
     def test_name_from_link(self):
