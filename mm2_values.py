@@ -69,6 +69,8 @@ def cmd_run(args):
         pass
     finally:
         httpd.server_close()
+        if monitor:
+            monitor.stop()  # и сразу закрыть скрытый Edge/Chrome, если он открыт для DreamPets
 
 
 def program_command():
