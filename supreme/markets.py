@@ -362,7 +362,13 @@ class StarPetsAdapter(Adapter):
     items/all — самая низкая цена каждого товара (price=null — нет в продаже) в
     валюте запроса. Цены в рублях StarPets задаёт сам (это не доллары по курсу),
     поэтому каталог читается и в долларах, и в рублях — по очереди, чтобы не
-    превысить лимит запросов (~50, иначе блокировка). products/{id}/info —
+    превысить лимит запросов (~50, иначе блокировка). Продаётся ли товар, решает
+    более свежий из двух снимков, а цена из старого остаётся, только если не
+    устарела: иначе рубли считаются по курсу самого товара (рубли/доллары его
+    последней проверенной пары, а пока её нет — по курсу площадки, «≈»), а
+    доллары до следующего опроса не показываются (окно пересчитает их по курсу
+    Rapira, «≈»).
+    products/{id}/info —
     продажи за неделю (numberOfSalesPerWeek), по нескольку предметов за опрос.
     Один товар StarPets — один вариант (год, тип, хрома): разные товары с одним
     названием не смешиваются.
@@ -386,6 +392,7 @@ class StarPetsAdapter(Adapter):
             due = [min(self.CURRENCIES, key=lambda c: prices[c]["at"])]
         rows_by_id, complete, notes = {}, True, []
         blocked_seen = False
+        swept = []  # валюты, прочитанные в этом опросе
         for currency in due:
             try:
                 rows, whole = self._sweep(api, currency)
@@ -400,8 +407,13 @@ class StarPetsAdapter(Adapter):
                 notes.append(f"цены в рублях сейчас не получены ({error})")
                 continue
             now = time.time()
+            # prev — прошлый снимок этой валюты: по нему видно, менялась ли цена,
+            # пока читалась другая валюта.
+            old = prices.get(currency, {})
             prices[currency] = {"at": now, "ok_at": now,
-                                "rows": {key: row.get("price") for key, row in rows.items()}}
+                                "rows": {key: row.get("price") for key, row in rows.items()},
+                                "prev": old.get("rows") or {}, "prev_at": self._read_at(old)}
+            swept.append(currency)
             complete = complete and whole
             for key, row in rows.items():
                 rows_by_id.setdefault(key, row)
@@ -412,7 +424,7 @@ class StarPetsAdapter(Adapter):
         else:
             self.cache["rows"] = {key: {k: row.get(k) for k in self._ROW_FIELDS} for key, row in rows_by_id.items()}
         self.complete = complete
-        offers = self._offers(rows_by_id, prices)
+        offers = self._offers(rows_by_id, prices, swept)
         if self._rub_stale(prices) and not notes:
             notes.append("цены в рублях StarPets сейчас не получены — показаны последние известные (≈)")
         try:
@@ -463,29 +475,69 @@ class StarPetsAdapter(Adapter):
         ok_at = entry.get("ok_at", entry.get("at", 0))  # кэш прошлой версии хранил только at
         return bool(entry.get("rows")) and time.time() - ok_at > 3 * (self.config.get("interval") or 300)
 
-    def _offers(self, rows, prices):
-        usd = prices.get("usd", {}).get("rows", {})
-        rub = prices.get("rub", {}).get("rows", {})
+    SLACK = 0.02  # рубли и доллары товара расходятся с его курсом сильнее — цена старого снимка устарела
+
+    @staticmethod
+    def _read_at(entry):
+        """Когда получены цены этой валюты (кэш прошлой версии хранил только at)."""
+        return entry.get("ok_at", entry.get("at", 0) if entry.get("rows") else 0)
+
+    def _offers(self, rows, prices, swept=()):
+        usd, rub = prices.get("usd", {}), prices.get("rub", {})
+        usd_rows, rub_rows = usd.get("rows", {}), rub.get("rows", {})
         rub_stale = self._rub_stale(prices)
-        # Есть ли товар в продаже — по более свежему из двух снимков.
-        usd_newer = prices.get("usd", {}).get("ok_at", 0) >= prices.get("rub", {}).get("ok_at", 0)
-        # Курс самой площадки (медиана рубли/доллары) — только для товаров, у которых
-        # рублёвой цены ещё нет; такие цены помечаются как примерные.
-        ratios = sorted(_price(rub[k]) / _price(usd[k]) for k in usd
-                        if _price(usd.get(k)) and _price(rub.get(k)) and _price(usd[k]) >= 1)
+        # Курс самой площадки (медиана рубли/доллары) — для товаров, чей собственный курс
+        # ещё не известен.
+        ratios = sorted(_price(rub_rows[k]) / _price(usd_rows[k]) for k in usd_rows
+                        if _price(usd_rows.get(k)) and _price(rub_rows.get(k)) and _price(usd_rows[k]) >= 1)
         site_rate = ratios[len(ratios) // 2] if ratios else None
+        # Собственный курс товара — рубли/доллары последней проверенной пары цен: у многих он
+        # заметно отличается от медианы. По нему проверяется цена из старого снимка и считаются
+        # рубли, которых нет или которые устарели (такие — «≈»).
+        pairs, checked = self.cache.get("pairs") or {}, {}
+        # За опрос читается одна валюта, поэтому снимки разного возраста. Более свежий решает,
+        # продаётся ли товар; цена другой валюты из старого — только если она не устарела.
+        usd_newer = self._read_at(usd) >= self._read_at(rub)
+        new, old = (usd, rub) if usd_newer else (rub, usd)
+        new_rows, old_rows = new.get("rows", {}), old.get("rows", {})
+        together = "usd" in swept and "rub" in swept  # обе валюты прочитаны только что, подряд
+        # Прошлые снимки обеих валют (свежей — сделанный до старого): если обе цены с них
+        # не менялись, пара верна. Одна сменилась — лот мог смениться между снимками.
+        prev = (new.get("prev") or {}) if new.get("prev_at", float("inf")) <= self._read_at(old) else {}
+        old_prev = old.get("prev") or {}
         offers = []
         for key, row in rows.items():
-            price = _price(usd.get(key))
-            price_rub = _price(rub.get(key))
-            approx = rub_stale and price_rub is not None
-            if price_rub is None and price is not None and site_rate and (key not in rub or rub_stale):
-                price_rub, approx = round(price * site_rate, 2), True
-            if usd_newer or approx or key not in rub:
-                available = price is not None
+            fresh, older = _price(new_rows.get(key)), _price(old_rows.get(key))
+            own = pairs.get(key)
+            rate = own or site_rate
+            sure = verified = together
+            if key in new_rows:
+                available = fresh is not None
+                if fresh is None:
+                    older = None  # снят с продажи — старая цена другой валюты не в счёт
+                elif older is not None and not together:
+                    sure = verified = (key in prev and _price(prev[key]) == fresh
+                                       and key in old_prev and _price(old_prev[key]) == older)
+                    if not sure and rate:
+                        expected = fresh * rate if usd_newer else fresh / rate
+                        verified = abs(older - expected) <= self.SLACK * expected
+                        if not verified:
+                            older = None  # цена сменилась после старого снимка
             else:
-                available = _price(rub.get(key)) is not None
+                available = older is not None  # свежий снимок товара не видел — решает старый
+            price, price_rub = (fresh, older) if usd_newer else (older, fresh)
+            # Курс товара меняют только надёжные пары (иначе расхождения по 2% накапливались бы);
+            # прошедшая проверку пара задаёт его, только если курса ещё нет.
+            if price and price_rub and (sure or (verified and not own)):
+                checked[key] = price_rub / price
+            elif own:
+                checked[key] = own
+            approx = rub_stale and price_rub is not None
+            rate = checked.get(key) or site_rate
+            if price_rub is None and price is not None and rate:
+                price_rub, approx = round(price * rate, 2), True
             offers.append(self._offer(row, price, price_rub, approx, available))
+        self.cache["pairs"] = checked
         return offers
 
     def _offer(self, row, price, price_rub=None, rub_approx=False, available=None):
