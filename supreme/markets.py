@@ -1181,45 +1181,79 @@ class DreamPetsAdapter(Adapter):
 
     # --- скрытый браузер ---
 
+    BROWSER_PAGE_LIMIT = 30  # страниц товаров за проход браузера: по одной, с паузой
+    BROWSER_PAUSE = 1.0
+    BROWSER_TIME = 60  # секунд на них — браузер закрывается как можно раньше
+    _STATIC_RE = re.compile(r"\.(js|css|png|jpe?g|webp|gif|svg|ico|woff2?|ttf)(\?|$)", re.I)
+
     def _browser_pass(self, base, products, now, read_pages):
+        pages = {}
         with cdp.Browser() as browser:
-            browser.open(base, settle=4)
-            result = browser.evaluate(cdp.JS_COLLECT_CARDS % (json.dumps(self._CARD_SELECTOR), 30), timeout=150) or {}
-            cards = result.get("cards") or []
-            for card in cards:
-                data = dreampets.parse_card_text(card.get("text"))
-                link = dreampets.PRODUCT_PATH_RE.search(card.get("href") or "")
-                if link:
+            try:
+                browser.open(base, settle=1)
+                # Постраничный рынок: прошлый проход остановился на странице "browser_next" — после
+                # первой страницы продолжаем с неё, так за несколько проходов читаются все страницы.
+                result = browser.collect_cards(self._CARD_SELECTOR, resume=self.cache.get("browser_next"))
+                self.cache["browser_next"] = result.get("next")
+                cards = result["cards"]
+                for card in cards:
+                    link = dreampets.PRODUCT_PATH_RE.search(card.get("href") or "")
+                    if not link:
+                        continue
+                    data = dreampets.parse_card_text(card.get("text"))
+                    if card.get("inner") and any(value is None for value in data.values()):
+                        # "<i>3</i> лотов": число и слово — разные надписи; их склеивает innerText.
+                        extra = dreampets.parse_card_text(card["inner"])
+                        data = {field: extra.get(field) if value is None else value for field, value in data.items()}
                     self._upsert(products, data, now, "браузер", link.group(1))
-            self._step("browser", base, f"карточек: {len(cards)}, заголовок: {result.get('title')}")
-            # Запросы, которые сделала сама страница: если в ответе товары с ценами —
-            # запоминаем адрес и дальше читаем его напрямую.
-            api = [u for u in (result.get("api") or []) if not re.search(r"\.(js|css|png|jpe?g|webp|svg|woff2?)(\?|$)", u)]
-            responses = browser.evaluate(cdp.JS_FETCH_MANY % json.dumps(api[:20]), timeout=120) or {} if api else {}
-            useful = []
-            for url, (status, text) in responses.items():
-                try:
-                    data = json.loads(text)
-                except ValueError:
-                    continue
-                if self._absorb_json(data, products, now, "данные площадки") >= 10:
-                    useful.append(url)
-            self.report["api_seen"] = api[:50]
-            if useful:
-                self.cache["api_urls"] = useful[:5]
-            if read_pages:
-                # Обычные запросы не пускают — страницы товаров через браузер (с его cookies).
-                due = [e["url"] for k, e in sorted(products.items(), key=lambda kv: kv[1].get("page_at", 0))
-                       if e.get("url") and k not in self.fresh][:self.BROWSER_PAGES]
-                pages = browser.evaluate(cdp.JS_FETCH_MANY % json.dumps(due), timeout=240) or {} if due else {}
-                for url, (status, text) in pages.items():
-                    key = self._key(url)
-                    if status == 200:
-                        parsed = dreampets.parse_product_page(text)
-                        if parsed["price"] is not None or parsed["lots"] is not None:
-                            self._upsert(products, parsed, time.time(), "браузер", key=key)
-                    if key in products:
-                        products[key]["page_at"] = time.time()
+                self._step("browser", base, f"карточек: {len(cards)}, страниц: {result.get('pages')}, "
+                                            f"заголовок: {result.get('title')}")
+                # Запросы, которые сделала сама страница: если в ответе товары с ценами —
+                # запоминаем адрес и дальше читаем его напрямую.
+                api = [u for u in result.get("api") or [] if not self._STATIC_RE.search(u.split("#")[0])]
+                own = re.match(r"https?://[^/]+", base).group(0)
+                api.sort(key=lambda u: not u.startswith(own))  # сначала адреса самой площадки
+                # 403 одного адреса (например, «кто я» для гостя) — не запрет площадки: идём дальше.
+                responses, stop = (browser.fetch_many(api[:20], pause=0.3, deadline=40, stop_on=(429, 503))
+                                   if api else ({}, None))
+                if stop:
+                    self._step("browser-api", f"прочитано {len(responses)} из {len(api[:20])}", stop)
+                useful = []
+                for url, (status, text) in responses.items():
+                    if status != 200:
+                        continue
+                    try:
+                        data = json.loads(text)
+                    except ValueError:
+                        continue
+                    if self._absorb_json(data, products, now, "данные площадки") >= 10:
+                        useful.append(url)
+                self.report["api_seen"] = api[:50]
+                if useful:
+                    self.cache["api_urls"] = useful[:5]
+                if read_pages:
+                    # Обычные запросы не пускают — страницы товаров через браузер (с его cookies):
+                    # по одной, с паузой и до первого отказа площадки (403/429/503).
+                    due = [e["url"] for k, e in sorted(products.items(), key=lambda kv: kv[1].get("page_at", 0))
+                           if e.get("url") and k not in self.fresh][:min(self.BROWSER_PAGES, self.BROWSER_PAGE_LIMIT)]
+                    if due:
+                        pages, stop = browser.fetch_many(due, pause=self.BROWSER_PAUSE, deadline=self.BROWSER_TIME)
+                        self._step("browser-pages", f"{len(due)} в очереди",
+                                   f"прочитано {len(pages)}" + (f", остановка: {stop}" if stop else ""))
+            finally:
+                for note in browser.notes:
+                    self._step("browser", "заметка", note)
+        # Браузер уже закрыт — разбираем страницы товаров.
+        for url, (status, text) in pages.items():
+            key = self._key(url)
+            if status == 200:
+                parsed = dreampets.parse_product_page(text)
+                if parsed["price"] is not None or parsed["lots"] is not None:
+                    self._upsert(products, parsed, time.time(), "браузер", key=key)
+            if key in products and status not in (403, 429, 503):
+                # В конец очереди — и при ошибке (500, нет ответа): иначе такая страница вечно
+                # стояла бы первой. Только отказ площадки, остановивший чтение, — не в счёт.
+                products[key]["page_at"] = time.time()
 
     # --- результат ---
 
@@ -1554,6 +1588,7 @@ class MarketMonitor:
     def stop(self):
         self._stop.set()
         self._wake.set()
+        cdp.close_all()  # скрытый Edge/Chrome прохода DreamPets — сразу, не дожидаясь конца опроса
 
     def poll_now(self):
         with self._lock:

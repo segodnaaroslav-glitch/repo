@@ -919,6 +919,98 @@ fetch('/api/catalog?game=mm2').then((r) => r.json()).then((data) => {
         self.assertEqual(offers["Harvester"], 328.98)
         self.assertIn("api", adapter.note)
 
+    def _patch(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (unittest.mock.patch.object(markets, "_pause"),
+                      unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=_test_browser()),
+                      unittest.mock.patch.object(markets.store, "DATA_FILE", Path(tmp.name) / "values.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    # Карточка из двух ссылок (картинка, название), цена и лоты — вне ссылок, число лотов
+    # отдельно от слова, рядом — другое число (место в списке).
+    TWO_LINKS = """<html><head><title>DreamPets</title></head><body><div id="app"></div><script>
+const items = %s;
+const app = document.getElementById('app');
+setTimeout(() => {
+  for (const p of items) {
+    const href = '/mm2/product/' + p.slug + '/' + p.id;
+    app.insertAdjacentHTML('beforeend', '<div class="card"><a href="' + href + '"><img alt=""></a><a href="' + href
+      + '"><p>' + p.title + '</p></a><i>' + p.rank + '</i><b>от ' + p.price + ' ₽</b><i>' + p.lots + '</i> лотов</div>');
+  }
+}, 300);
+</script></body></html>"""
+
+    def test_cards_with_image_and_title_links(self):
+        import uuid
+        items = [{"id": U1, "slug": "harvester", "title": "Harvester", "rank": 114, "price": "230,71", "lots": 3}]
+        items += [{"id": str(uuid.UUID(int=i)), "slug": f"item-{i}", "title": f"Item {i}", "rank": i, "price": 10 + i,
+                   "lots": i} for i in range(1, 6)]
+        httpd, base = serve_bytes({"/mm2/": self.TWO_LINKS % json.dumps(items)})
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self._patch()
+        adapter = markets.DreamPetsAdapter({"id": "dreampets", "title": "DreamPets", "kind": "dreampets",
+                                            "url": base + "/mm2/"}, {})
+        offers = {o["name"]: (o["price"], o["stock"]) for o in adapter.fetch()}
+        self.assertEqual(offers["Harvester"], (230.71, 3))  # не 114230.71 и не пусто
+        self.assertEqual(offers["Item 4"], (14, 4))
+        self.assertEqual(len(offers), 6)
+
+    def test_blocked_site_pages_one_by_one_until_refused(self):
+        """Площадка не пускает программу: страницы товаров — через браузер, по одной, до первого 429."""
+        ids = [str(__import__("uuid").UUID(int=i)) for i in range(1, 4)]
+        product = ('<html><head><title>Item {n} — купить в ММ2</title><meta name="description" '
+                   'content="Купить Item {n} от 1{n}1 ₽, {n}5 лотов."></head><body></body></html>')
+        log = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                browser = bool(self.headers.get("Sec-Fetch-Mode"))  # программа без браузера его не шлёт
+                log.append((self.path, browser))
+                status, body = 404, ""
+                if not browser:
+                    status, body = 403, "Just a moment..."
+                elif self.path == "/mm2/":
+                    status, body = 200, "".join(f'<div><a href="/mm2/product/item-{n}/{ids[n - 1]}"><p>Item {n}</p></a>'
+                                                f'<b>от {n}00 ₽</b></div>' for n in (1, 2, 3))
+                elif self.path == f"/mm2/product/item-2/{ids[1]}":
+                    status = 429
+                elif self.path.startswith("/mm2/product/item-"):
+                    status, body = 200, product.format(n=self.path.split("item-")[1][0])
+                data = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        self._patch()
+        cache = {}
+        adapter = markets.DreamPetsAdapter({"id": "dreampets", "title": "DreamPets", "kind": "dreampets",
+                                            "url": base + "/mm2/"}, cache)
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "BROWSER_PAUSE", 0.1):
+            try:
+                adapter.fetch()
+            except markets.fetcher.FetchError:
+                pass  # площадка не пускает — может быть и ошибкой опроса; важно, что прочитано
+        pages = [path for path, browser in log if browser and "/product/" in path]
+        self.assertEqual(pages, [f"/mm2/product/item-1/{ids[0]}", f"/mm2/product/item-2/{ids[1]}"])
+        products = cache["products"]
+        self.assertEqual(products[ids[0]]["lots"], 15)
+        self.assertGreater(products[ids[0]].get("page_at", 0), 0)
+        self.assertFalse(products[ids[1]].get("page_at"))  # 429 — не «прочитана», в следующий раз снова
+        self.assertFalse(products[ids[2]].get("page_at"))
+
 
 class StarPetsReviewV5Tests(unittest.TestCase):
     def setUp(self):
