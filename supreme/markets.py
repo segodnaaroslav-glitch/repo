@@ -1175,37 +1175,9 @@ class DreamPetsAdapter(Adapter):
                 else:
                     entry["at"] = entry.get("at") or time.time()  # не прочитана, но очередь до неё дошла
                 continue
-            entry.pop("missing", None)
-            entry.pop("missing_since", None)
-            (self.cache.get("gone") or {}).pop(key, None)  # повторная проверка снятого товара: страница есть
-            parsed = dreampets.parse_product_page(page_html, entry["url"])
             read_ok += 1
-            if parsed["price"] is None and parsed["lots"] is None:
-                entry["at"] = entry.get("at") or time.time()  # прочитана: на этой странице цены нет
-                continue
-            if parsed.get("source") == "phrase":
-                # Только надпись «Нет в наличии» без чисел: так выглядит и пустая заготовка
-                # страницы, которую дорисовывает скрипт. Для проверки «страницы бесполезны»
-                # это не данные, а цену со списка, API или браузера она не стирает — только
-                # данные, прочитанные раньше с самой страницы.
-                if entry.get("source") not in (None, self.PAGES) or (entry.get("price") is None
-                                                                      and entry.get("lots") is None):
-                    entry["at"] = entry.get("at") or time.time()
-                    continue
-            else:
+            if self._apply_page(products, key, page_html) == "useful":
                 useful += 1
-            # Заголовок страницы называет безымянный товар, но известный не переименовывает
-            # (только пишет то же название лучше) — см. _keeps_name.
-            data = {"lots": parsed["lots"], "name": parsed["name"]}
-            if key in self.fresh_price:
-                # Цена и наличие — со свежей карточки списка; со страницы — только число лотов.
-                if parsed["lots"]:
-                    self.fresh.add(key)
-                else:
-                    data["lots"] = None
-            else:
-                data["price"] = parsed["price"]  # None — цены на странице нет, прежняя остаётся (0 лотов — нет)
-            self._upsert(products, data, time.time(), self.PAGES, key=key)
         self._step("pages", f"{len(due)} в очереди", f"прочитано {read_ok}, с ценой или лотами {useful}, "
                    f"ошибок {len(failures)}" + (f": {failures[-1]}" if failures else ""))
         if read_ok >= self.USELESS_PAGES and not useful:
@@ -1213,6 +1185,43 @@ class DreamPetsAdapter(Adapter):
             self.cache["pages_useless_until"] = time.time() + 6 * 3600
         if blocked:
             raise blocked
+
+    def _apply_page(self, products, key, page_html):
+        """Страница товара (ответ 200) -> данные записи; одно правило для обычного чтения и
+        для скрытого браузера. Возвращает "useful" (цена или лоты), "phrase" (только надпись
+        «Нет в наличии») или "empty" (ни цены, ни лотов)."""
+        entry = products[key]
+        entry.pop("missing", None)
+        entry.pop("missing_since", None)
+        (self.cache.get("gone") or {}).pop(key, None)  # повторная проверка снятого товара: страница есть
+        parsed = dreampets.parse_product_page(page_html, entry.get("url"))
+        if parsed["price"] is None and parsed["lots"] is None:
+            entry["at"] = entry.get("at") or time.time()  # прочитана: на этой странице цены нет
+            return "empty"
+        result = "useful"
+        if parsed.get("source") == "phrase":
+            # Только надпись «Нет в наличии» без чисел: так выглядит и пустая заготовка
+            # страницы, которую дорисовывает скрипт. Для проверки «страницы бесполезны»
+            # это не данные, а цену со списка, API или браузера она не стирает — только
+            # данные, прочитанные раньше с самой страницы.
+            result = "phrase"
+            if entry.get("source") not in (None, self.PAGES) or (entry.get("price") is None
+                                                                  and entry.get("lots") is None):
+                entry["at"] = entry.get("at") or time.time()
+                return result
+        # Заголовок страницы называет безымянный товар, но известный не переименовывает
+        # (только пишет то же название лучше) — см. _keeps_name.
+        data = {"lots": parsed["lots"], "name": parsed["name"]}
+        if key in self.fresh_price:
+            # Цена и наличие — со свежей карточки списка; со страницы — только число лотов.
+            if parsed["lots"]:
+                self.fresh.add(key)
+            else:
+                data["lots"] = None
+        else:
+            data["price"] = parsed["price"]  # None — цены на странице нет, прежняя остаётся (0 лотов — нет)
+        self._upsert(products, data, time.time(), self.PAGES, key=key)
+        return result
 
     def _not_found(self, products, key):
         """Страницы товара нет (404): не продаётся. Число лотов при этом неизвестно (None,
@@ -1298,10 +1307,12 @@ class DreamPetsAdapter(Adapter):
         # Браузер уже закрыт — разбираем страницы товаров.
         for url, (status, text) in pages.items():
             key = self._key(url)
+            if key not in products:
+                continue
             if status == 200:
-                parsed = dreampets.parse_product_page(text)
-                if parsed["price"] is not None or parsed["lots"] is not None:
-                    self._upsert(products, parsed, time.time(), "браузер", key=key)
+                self._apply_page(products, key, text)  # так же, как обычное чтение страниц
+            elif status in (404, 410) and key not in self.fresh_price:
+                self._not_found(products, key)
             if key in products and status not in (403, 429, 503):
                 # В конец очереди — и при ошибке (500, нет ответа): иначе такая страница вечно
                 # стояла бы первой. Только отказ площадки, остановивший чтение, — не в счёт.

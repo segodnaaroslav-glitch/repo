@@ -1219,3 +1219,47 @@ class DreamPetsTwinTests(unittest.TestCase):
                         f"/mm2/product/harvester/{U1}")
         self.assertEqual(list(products), [U1])
         self.assertEqual((products[U1]["price"], products[U1]["lots"]), (328.98, 674))
+
+
+class DreamPetsBrowserPagesTests(unittest.TestCase):
+    """Страницы товаров из скрытого браузера разбираются так же, как обычные."""
+
+    def run_pass(self, products, pages):
+        class FakeBrowser:
+            notes = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def open(self, url, **kwargs):
+                pass
+
+            def collect_cards(self, selector, **kwargs):
+                return {"cards": [], "api": [], "title": "DreamPets", "pages": 1}
+
+            def fetch_many(self, urls, **kwargs):
+                return {url: pages[url] for url in urls if url in pages}, None
+
+        adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dp.test/mm2/"})
+        with unittest.mock.patch.object(markets.cdp, "Browser", FakeBrowser):
+            adapter._browser_pass("https://dp.test/mm2/", products, 1000.0, read_pages=True)
+        return adapter
+
+    def test_sold_out_404_and_title_follow_the_page_rules(self):
+        url = "https://dp.test/mm2/product/%s/" + U1
+        sold = url % "harvester"
+        gone = "https://dp.test/mm2/product/seer/" + U2
+        products = {
+            U1: {"name": "Harvester", "url": sold, "price": 300.0, "lots": 5, "source": "страницы товаров", "at": 1},
+            U2: {"name": "Seer", "url": gone, "price": 20.0, "lots": 3, "at": 1},
+        }
+        page = ("<html><head><title>Купить Godseye в ММ2 | DreamPets</title></head><body><main><h1>Godseye</h1>"
+                "<p>0 лотов</p></main></body></html>")
+        self.run_pass(products, {sold: (200, page), gone: (404, "")})
+        self.assertEqual((products[U1]["name"], products[U1]["price"], products[U1]["lots"]), ("Harvester", None, 0))
+        # страницы нет — не продаётся; число лотов неизвестно (не «все куплены»)
+        self.assertEqual((products[U2]["price"], products[U2]["lots"], products[U2]["missing"]), (None, None, 1))
+        self.assertTrue(products[U1]["page_at"] and products[U2]["page_at"])
