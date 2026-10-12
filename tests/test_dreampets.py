@@ -779,14 +779,17 @@ class ReviewMissingTests(DreamPetsCase):
                     for _ in range(40):
                         self.wfile.write(b" ")
                         self.wfile.flush()
-                        time.sleep(0.2)
+                        if done.wait(0.2):  # тест закончился — не тянуть ответ дальше (Windows не рвёт запись сразу)
+                            return
                 except OSError:
                     pass
 
+        done = threading.Event()
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
+        self.addCleanup(done.set)
         config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets",
                   "url": f"http://127.0.0.1:{httpd.server_address[1]}/mm2/"}
         started = time.time()

@@ -103,12 +103,20 @@ class StatusBlockTests(unittest.TestCase):
         return f"http://127.0.0.1:{httpd.server_address[1]}/"
 
     def test_block_statuses_raise_blocked_at_once(self):
+        real_sleep, me, waits = fetcher.time.sleep, threading.current_thread(), []
+
+        def sleep(seconds):  # считаются только паузы этого теста, не потоков других тестов
+            if threading.current_thread() is me:
+                waits.append(seconds)
+            else:
+                real_sleep(seconds)
+
         for status in (403, 429, 503):
             url = self.serve(status, "<html>Access denied</html>")
-            with mock.patch.object(fetcher.time, "sleep") as sleep:
+            with mock.patch.object(fetcher.time, "sleep", sleep):
                 with self.assertRaises(fetcher.BlockedError):
                     fetcher.fetch_plain(url)
-            sleep.assert_not_called()
+        self.assertEqual(waits, [])
 
     def test_page_with_protection_script_but_content_is_not_blocked(self):
         page = '<script src="/_Incapsula_Resource?x"></script><div>Alpha</div><div>Value - 10</div>'
