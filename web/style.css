@@ -549,3 +549,33 @@ input.qty { width: 72px; text-align: right; }
 .price-cell { white-space: nowrap; font-size: 12px; }
 select.variant { max-width: 220px; font-size: 12px; padding: 2px 4px; }
 .warn-badge { background: color-mix(in srgb, var(--mid) 25%, transparent); color: var(--text); }
+
+/* Калькулятор: плитки со скриншотов, узнанные по картинке (pictiles.js). */
+.pic-status { margin-top: -4px; }
+.pic-note { display: inline-flex; align-items: center; gap: 2px; }
+.tile-thumb { height: 64px; width: auto; flex: none; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-3); }
+.tile-thumb.small { height: 34px; border-radius: 5px; }
+.pic-badge {
+  background: color-mix(in srgb, var(--accent-2) 20%, transparent);
+  border-color: color-mix(in srgb, var(--accent-2) 45%, transparent);
+  color: var(--text);
+}
+.pic-tiles { display: grid; gap: 8px; margin: 6px 0 12px; }
+.pic-tiles > .hint { margin: 0; }
+.pic-tile {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.pic-tile-info { display: grid; gap: 4px; min-width: 0; }
+.pic-tile-info .badge { margin-left: 8px; }
+.pic-tile-controls { display: flex; flex-wrap: wrap; gap: 6px; }
+select.pic-choice { max-width: 340px; font-size: 13px; padding: 4px 6px; }
+input.pic-other { width: 260px; font-size: 13px; padding: 4px 8px; }
+@media (max-width: 760px) {
+  select.pic-choice, input.pic-other { width: 100%; max-width: 100%; }
+}

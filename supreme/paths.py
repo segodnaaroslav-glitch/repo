@@ -38,8 +38,8 @@ def _user_data_dir():
 
 # Файлы программы в папке с ценами (переносятся из папки data прошлых версий).
 # values.json переносится последним: его появление в новой папке значит, что перенос закончен.
-_OWNED_FILES = ("markets-state.json", "markets.json", "rate.json")
-_OWNED_DIRS = ("debug",)
+_OWNED_FILES = ("markets-state.json", "markets.json", "rate.json", "picfeat.json")
+_OWNED_DIRS = ("debug", "images")  # images — картинки предметов для сравнения плиток
 
 
 def _old_data_dir():

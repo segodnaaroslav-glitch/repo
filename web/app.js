@@ -1235,6 +1235,7 @@ function addCalcFiles(files) {
     });
   }
   renderCalcThumbs();
+  if (window.PicTiles && calc.images.length) PicTiles.prefetch();  // картинки предметов — заранее, в фоне
 }
 
 function renderCalcThumbs() {
@@ -1274,22 +1275,31 @@ async function runCalc() {
   }
   button.disabled = true;
   $("calcStatus").textContent = calc.images.length ? "Распознаю скриншоты…" : "Считаю…";
+  // Сравнение по картинкам (pictiles.js): плитки без названия, одинаковые названия.
+  const pictures = Boolean(window.PicTiles && calc.images.length);
+  if (window.PicTiles) PicTiles.reset();
+  const images = calc.images.slice();
   try {
     const response = await postJson("/api/calc", {
       text: $("calcText").value,
-      images: calc.images.map((image) => image.data),
+      images: images.map((image) => image.data),
+      pictures,
     });
     calc.items = response.items.map((item) => ({ ...item }));
     calc.fees = response.fees || {};
     const notes = [];
     if (response.tiles) notes.push(`плиток инвентаря на скриншотах: ${response.tiles}`);
-    if (response.unknown_tiles) notes.push(`не узнано плиток: ${response.unknown_tiles} — допишите их строкой`);
+    if (response.unknown_tiles) {
+      notes.push(pictures ? `плиток без названия: ${response.unknown_tiles} — сравниваю по картинкам`
+        : `не узнано плиток: ${response.unknown_tiles} — допишите их строкой`);
+    }
     if (response.ocr_lines) notes.push(`распознано строк на скриншотах: ${response.ocr_lines}`);
     if (response.ocr_errors && response.ocr_errors.length) notes.push(response.ocr_errors.join("; "));
     $("calcStatus").textContent = `Найдено предметов: ${calc.items.length}${notes.length ? ` (${notes.join("; ")})` : ""}`;
     $("calcUnmatched").textContent = response.unmatched && response.unmatched.length
       ? `Не узнал: ${response.unmatched.join(", ")}. Проверьте написание или добавьте строкой.` : "";
     renderCalc();
+    if (pictures) PicTiles.start(response, images);  // строки уже показаны, картинки уточнят их
   } catch (error) {
     $("calcStatus").textContent = `Ошибка: ${error.message}`;
   } finally {
@@ -1321,6 +1331,8 @@ function renderCalc() {
     const nameCell = el("td", "item-cell");
     nameCell.append(itemArt(item, "tiny"), el("span", "", item.name));
     if (item.score < 1) nameCell.append(el("span", "badge", `похоже на «${item.seen[0]}»`));
+    const picNote = window.PicTiles ? PicTiles.rowNote(item) : null;  // «по картинке» и плитка со скриншота
+    if (picNote) nameCell.append(picNote);
     if (item.alternatives && item.alternatives.length) {
       // Несколько предметов с этим названием (нож и ружьё Cowboy): какой именно — выбирает пользователь.
       const pick = el("select", "variant");
@@ -1331,10 +1343,14 @@ function renderCalc() {
         pick.append(option);
       }
       pick.addEventListener("change", () => {
-        const options = [item, ...item.alternatives];
+        // Копия строки, а не она сама: иначе после выбора строка оказалась бы своим же вариантом.
+        const current = { key: item.key, name: item.name, category: item.category, image: item.image,
+          value: item.value, prices: item.prices };
+        const options = [current, ...item.alternatives];
         const chosen = options[Number(pick.value)];
         const rest = options.filter((choice) => choice !== chosen);
-        Object.assign(item, { name: chosen.name, category: chosen.category, image: chosen.image,
+        if (window.PicTiles) PicTiles.onVariant(item, chosen);  // плитки строки — этот предмет
+        Object.assign(item, { key: chosen.key, name: chosen.name, category: chosen.category, image: chosen.image,
           value: chosen.value, prices: chosen.prices, alternatives: rest, ambiguous: false });
         renderCalc();
       });
@@ -1669,6 +1685,7 @@ function init() {
     $("calcText").value = "";
     $("calcStatus").textContent = "";
     $("calcUnmatched").textContent = "";
+    if (window.PicTiles) PicTiles.reset();
     renderCalcThumbs();
     renderCalc();
   });
