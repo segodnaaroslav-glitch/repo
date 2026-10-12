@@ -949,9 +949,10 @@ class StarPetsReviewV5Tests(unittest.TestCase):
         adapter = markets.StarPetsAdapter(self.config, cache)
         offers = {o["name"]: o for o in adapter.fetch()}
         chroma, luger = offers["Chroma Luger"], offers["Luger"]
-        self.assertEqual((chroma["price_rub"], chroma["price_rub_approx"]), (150.5, True))  # сходится с курсом площадки
-        # Старые рубли расходятся с курсом площадки больше чем на 2% — посчитаны по нему (75.25 ₽/$).
-        self.assertEqual((luger["price_rub"], luger["price_rub_approx"]), (76.75, True))
+        self.assertEqual((chroma["price_rub"], chroma["price_rub_approx"]), (150.5, True))
+        # Курс Luger (73.5 ₽/$) на 2% ниже курса площадки (75.25), но это его собственный курс:
+        # рубли остаются свои, а не пересчитываются; «≈» — только потому, что давно не обновлялись.
+        self.assertEqual((luger["price_rub"], luger["price_rub_approx"]), (75.0, True))
         self.assertIn("рублях", adapter.note)
 
 
@@ -964,6 +965,8 @@ class StarPetsPairTests(unittest.TestCase):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             self.calls.append(("POST", self.path, body))
+            if body["currency"] == "rub" and self.rub_status != 200:
+                return self._send(self.rub_status, {"status": False, "message": "Bad Request"})
             rows = []
             if body["filter"]["types"][0]["type"] == "weapon" and body["page"] == 1:
                 rows = [{"id": key, "name": name, "type": "weapon", "subtype": "gun", "chroma": False,
@@ -974,6 +977,7 @@ class StarPetsPairTests(unittest.TestCase):
     def setUp(self):
         FakeApi.calls = []
         FakeApi.info_status = 200
+        self.Api.rub_status = 200
         # Курс площадки 80 ₽/$; у Harvester свой (750 ₽ при $8.83 — на 6% выше).
         self.Api.catalog = {key: (f"Gun {key}", key * 10.0, key * 800.0) for key in range(1, 5)}
         self.Api.catalog[5] = ("Harvester", 8.83, 750.0)
@@ -1012,9 +1016,73 @@ class StarPetsPairTests(unittest.TestCase):
         self.poll("rub")
         self.Api.catalog[5] = ("Harvester", 10.5, 750.0)  # самый дешёвый лот купили после чтения рублей
         offers = self.poll("usd")
-        # 750 ₽ — цена проданного лота: рубли по курсу площадки, с пометкой «≈».
-        self.assertEqual(self.harvester(offers), (10.5, 840.0, True, True))
+        # 750 ₽ — цена проданного лота: рубли по курсу самого товара (84.94 ₽/$), с пометкой «≈».
+        self.assertEqual(self.harvester(offers), (10.5, 891.85, True, True))
         self.assertEqual((offers["Gun 1"]["price_rub"], offers["Gun 1"]["price_rub_approx"]), (800.0, False))
+
+    def test_small_rise_checked_by_items_own_ratio(self):
+        self.poll(None)
+        self.poll("usd")
+        self.poll("rub")
+        # Купили лот за $8.83 / 750 ₽, следующий — $9.50 / 806 ₽. По курсу площадки (80) старые
+        # 750 ₽ сошлись бы с $9.50 (760 ₽, в пределах 2%), но курс самого товара — 84.94.
+        self.Api.catalog[5] = ("Harvester", 9.5, 806.0)
+        self.assertEqual(self.harvester(self.poll("usd")), (9.5, 806.91, True, True))
+        self.assertEqual(self.harvester(self.poll("rub")), (9.5, 806.0, False, True))
+        # Пара прошла проверку в пределах 2%, но курс товара меняет только пара, чьи цены
+        # не менялись со своих прошлых снимков, — расхождения не накапливаются.
+        self.assertEqual(self.harvester(self.poll("usd")), (9.5, 806.0, False, True))
+        self.assertEqual(self.cache["pairs"]["5"], 750.0 / 8.83)
+        self.assertEqual(self.harvester(self.poll("rub")), (9.5, 806.0, False, True))
+        self.assertEqual(self.cache["pairs"]["5"], 806.0 / 9.5)
+
+    def test_failed_ruble_sweep_keeps_checked_rubles(self):
+        for currency in (None, "usd", "rub", "usd"):
+            self.assertEqual(self.harvester(self.poll(currency)), (8.83, 750.0, False, True))
+        self.Api.rub_status = 400
+        self.assertEqual(self.harvester(self.poll("rub")), (8.83, 750.0, False, True))
+        self.Api.rub_status = 200
+        # Порядок снимков после сбоя не известен, но цены сходятся с курсом товара — рубли не выдумываются.
+        self.assertEqual(self.harvester(self.poll("usd")), (8.83, 750.0, False, True))
+
+    def test_price_back_to_old_value(self):
+        self.poll(None)
+        self.poll("usd")
+        self.Api.catalog[5] = ("Harvester", 9.5, 806.0)  # лот за $8.83 купили
+        self.assertEqual(self.harvester(self.poll("rub")), (None, 806.0, False, True))
+        self.Api.catalog[5] = ("Harvester", 8.83, 750.0)  # выставили новый по старой цене
+        # Доллары те же, что до чтения рублей, но рубли с тех пор менялись: 806 ₽ — цена того лота.
+        self.assertEqual(self.harvester(self.poll("usd")), (8.83, 750.0, True, True))
+
+    def test_ruble_dip_bought_before_dollar_sweep(self):
+        self.poll(None)
+        self.poll("usd")
+        self.Api.catalog[5] = ("Harvester", 6.0, 510.0)  # выставили дешёвый лот
+        self.assertEqual(self.harvester(self.poll("rub")), (None, 510.0, False, True))
+        self.Api.catalog[5] = ("Harvester", 8.83, 750.0)  # его сразу купили
+        self.assertEqual(self.harvester(self.poll("usd")), (8.83, 750.0, True, True))  # не 510 ₽ как точная
+
+    def test_dollar_dip_bought_before_ruble_sweep(self):
+        self.poll(None)
+        self.poll("usd")
+        self.poll("rub")
+        self.Api.catalog[5] = ("Harvester", 6.0, 510.0)
+        self.assertEqual(self.harvester(self.poll("usd")), (6.0, 509.63, True, True))
+        self.Api.catalog[5] = ("Harvester", 8.83, 750.0)
+        self.assertEqual(self.harvester(self.poll("rub")), (None, 750.0, False, True))  # не $6.00 как точная
+        self.assertEqual(self.harvester(self.poll("usd")), (8.83, 750.0, False, True))
+
+    def test_new_items_ratio_learned_when_prices_settle(self):
+        self.poll(None)
+        self.poll("usd")
+        self.Api.catalog[5] = ("Harvester", 15.0, 1200.0)  # новый лот — по курсу площадки, не прежнему товара
+        self.assertEqual(self.harvester(self.poll("rub")), (None, 1200.0, False, True))
+        self.assertEqual(self.harvester(self.poll("usd")), (15.0, 1274.07, True, True))
+        self.assertEqual(self.harvester(self.poll("rub")), (None, 1200.0, False, True))
+        # Обе цены не менялись со своих прошлых снимков — пара верна, курс товара теперь 80.
+        self.assertEqual(self.harvester(self.poll("usd")), (15.0, 1200.0, False, True))
+        self.assertEqual(self.harvester(self.poll("rub")), (15.0, 1200.0, False, True))
+        self.assertEqual(self.cache["pairs"]["5"], 80.0)
 
     def test_sold_out_in_newer_sweep(self):
         self.poll(None)
@@ -1028,11 +1096,11 @@ class StarPetsPairTests(unittest.TestCase):
     def test_newer_rubles_replace_stale_dollars(self):
         self.poll(None)
         self.poll("usd")
-        self.Api.catalog[5] = ("Harvester", 15.0, 1200.0)  # подорожал после чтения долларов
+        self.Api.catalog[5] = ("Harvester", 15.0, 1274.0)  # подорожал после чтения долларов
         offers = self.poll("rub")
-        self.assertEqual(self.harvester(offers), (None, 1200.0, False, True))  # старые $8.83 не показываются
+        self.assertEqual(self.harvester(offers), (None, 1274.0, False, True))  # старые $8.83 не показываются
         offers = self.poll("usd")
-        self.assertEqual(self.harvester(offers), (15.0, 1200.0, False, True))
+        self.assertEqual(self.harvester(offers), (15.0, 1274.0, False, True))
 
     def test_older_sweep_decides_only_without_newer_row(self):
         adapter = markets.StarPetsAdapter(self.config, {})
