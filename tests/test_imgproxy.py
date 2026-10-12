@@ -15,10 +15,13 @@ from pathlib import Path
 from unittest import mock
 
 from supreme import imgproxy, markets, ocr, parser, paths, server, store, tileocr
+from tests import picgen
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
-WEBP = b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 24
-GIF = b"GIF89a" + b"\x00" * 20
+IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40 + IEND
+WEBP = b"RIFF\x20\x00\x00\x00WEBPVP8 " + b"\x00" * 24  # размер RIFF = длина файла − 8
+GIF = b"GIF89a" + b"\x00" * 20 + b";"
+BIG_PNG = b"\x89PNG\r\n\x1a\n" + b"\x01" * 5000 + IEND
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -29,7 +32,8 @@ class Upstream(BaseHTTPRequestHandler):
         "/ok.webp": (200, "image/webp", WEBP),
         "/raw.png": (200, "application/octet-stream", PNG),  # тип неизвестен, но байты — PNG
         "/html.png": (200, "image/png", b"<html><script>alert(1)</script></html>"),
-        "/text.webp": (200, "text/html", WEBP),
+        "/text.webp": (200, "text/plain", WEBP),
+        "/MM/110x110/Luger%20chroma.webp": (200, "image/webp", WEBP),  # у StarPets бывают пробелы в адресе
         "/svg.svg": (200, "image/svg+xml", b"<svg xmlns='http://www.w3.org/2000/svg'><script/></svg>"),
         "/big.webp": (200, "image/webp", WEBP + b"\x00" * (imgproxy.MAX_BYTES + 10)),
         "/busy.webp": (503, "text/plain", b"busy"),
@@ -46,6 +50,30 @@ class Upstream(BaseHTTPRequestHandler):
             self.send_header("Location", "https://evil.example/x.webp")
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if self.path in ("/short.png", "/cut-unsized.png", "/cut-chunked.png"):  # связь оборвалась посреди картинки
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            if self.path == "/short.png":
+                self.send_header("Content-Length", str(len(BIG_PNG)))
+            if self.path == "/cut-chunked.png":
+                self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            part = BIG_PNG[:1000]
+            self.wfile.write(b"%x\r\n" % len(BIG_PNG) + part if self.path == "/cut-chunked.png" else part)
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        if self.path in ("/forbidden.webp", "/legal.webp", "/challenge.webp"):  # сайт не пускает программу
+            status, ctype = {"/forbidden.webp": (403, "text/plain"), "/legal.webp": (451, "text/plain"),
+                             "/challenge.webp": (200, "text/html; charset=utf-8")}[self.path]
+            body = b"<html>Request unsuccessful. Incapsula incident ID: 1</html>"
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path == "/unsized.webp":  # без Content-Length: размер проверяется при чтении
             self.send_response(200)
@@ -125,6 +153,80 @@ class ImageCacheTests(unittest.TestCase):
         self.assertEqual(imgproxy.sniff(GIF), ("image/gif", ".gif"))
         self.assertIsNone(imgproxy.sniff(b"<svg"))
 
+    def test_addresses_with_spaces(self):
+        # Настоящие адреса StarPets: «.../110x110/Luger chroma.webp» — пробел кодируется, а не обрывает запрос.
+        self.assertEqual(self.cache.get(self.url("MM/110x110/Luger chroma.webp")), (WEBP, "image/webp"))
+        self.assertEqual(Upstream.calls, {"/MM/110x110/Luger%20chroma.webp": 1})
+        self.assertEqual(imgproxy.quote_url("https://cdn.starpets.gg/a b/%D0%9A ё.webp?x=1 2&y=/z"),
+                         "https://cdn.starpets.gg/a%20b/%D0%9A%20%D1%91.webp?x=1%202&y=/z")
+
+    def test_every_failure_gets_an_answer(self):
+        # Ошибки http.client — тоже ImageError (ответ браузеру), а не обрыв запроса без ответа.
+        for error, status, kind in ((http.client.InvalidURL("bad"), 502, "final"),
+                                    (http.client.IncompleteRead(b"x", 10), 503, "network"),
+                                    (http.client.LineTooLong("header"), 503, "network"),
+                                    (http.client.BadStatusLine("?"), 503, "network")):
+            opener = mock.Mock()
+            opener.open.side_effect = error
+            with self.assertRaises(imgproxy.ImageError) as caught:
+                imgproxy._download(self.url("x.webp"), opener=opener)
+            self.assertEqual((caught.exception.status, caught.exception.kind), (status, kind), error)
+
+    def test_cut_off_pictures_are_not_cached(self):
+        for name, kind in (("short.png", "network"), ("cut-chunked.png", "network"), ("cut-unsized.png", "busy")):
+            with self.assertRaises(imgproxy.ImageError) as caught:
+                self.cache.get(self.url(name))
+            self.assertEqual((caught.exception.status, caught.exception.kind), (503, kind), name)
+        self.assertEqual([p.name for p in self.folder.iterdir()], ["failed.json"])  # обрывки на диск не попали
+        self.assertEqual(list(json.loads((self.folder / "failed.json").read_text("utf-8"))), [self.url("cut-unsized.png")])
+        # обрывок, сохранённый раньше, не отдаётся — картинка скачивается заново
+        url = self.url("raw.png")
+        (self.folder / (imgproxy.ImageCache._name(url) + ".png")).write_bytes(BIG_PNG[:1000])
+        self.assertEqual(self.cache.get(url), (PNG, "image/png"))
+        self.assertEqual(Upstream.calls["/raw.png"], 1)
+
+    def test_complete_pictures(self):
+        avif = (16).to_bytes(4, "big") + b"ftypavif\x00\x00\x00\x00" + (12).to_bytes(4, "big") + b"mdatabcd"
+        for data, ext in ((picgen.png_bytes(4, 4, bytes(64)), ".png"), (WEBP, ".webp"), (GIF, ".gif"),
+                          (b"\xff\xd8\xff\xe0" + b"\x01" * 100 + b"\xff\xd9", ".jpg"), (avif, ".avif")):
+            self.assertEqual(imgproxy.sniff(data)[1], ext)
+            self.assertTrue(imgproxy.complete(data, ext), ext)
+            self.assertFalse(imgproxy.complete(data[:len(data) * 2 // 3], ext), ext)
+
+    def test_a_blocking_site_is_paused_as_a_whole(self):
+        # 403, 451, «страница защиты» вместо картинки: сайт не пускает программу.
+        for name in ("forbidden.webp", "legal.webp", "challenge.webp"):
+            with self.assertRaises(imgproxy.ImageError) as caught:
+                self.download(self.url(name))
+            self.assertEqual((caught.exception.status, caught.exception.kind), (429, "blocked"), name)
+        calls = []
+
+        def download(url):
+            calls.append(url)
+            if "supremevalues.com" in url:
+                raise imgproxy.ImageError(429, "не пускает", "blocked")
+            return PNG, ("image/png", ".png")
+
+        cache = imgproxy.ImageCache(self.folder, download=download, clock=self.clock)
+
+        def status(url):
+            try:
+                cache.get(url)
+            except imgproxy.ImageError as error:
+                return error.status
+            return 200
+
+        # тысяча картинок защищённого сайта — один запрос к нему, остальные ждут паузу
+        site = "https://supremevalues.com/mm2/items/"
+        self.assertEqual({status(f"{site}{number}.webp") for number in range(1000)}, {429})
+        self.assertEqual(status("https://www.supremevalues.com/x.webp"), 429)  # поддомен — тот же сайт
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(status(self.url("ok.webp")), 200)  # StarPets пускает
+        self.assertFalse((self.folder / "failed.json").exists())  # сами адреса не виноваты
+        self.clock.now += imgproxy.BLOCK_PAUSE + 1
+        self.assertEqual(status(site + "again.webp"), 429)
+        self.assertEqual(len([url for url in calls if "supremevalues" in url]), 2)
+
     def test_one_download_then_disk(self):
         url, out = self.url("ok.webp"), []
         threads = [threading.Thread(target=lambda: out.append(self.cache.get(url))) for _ in range(8)]
@@ -176,7 +278,8 @@ class ImageCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), imgproxy.OFFLINE_AFTER + 1)
 
     def test_cache_size_is_limited(self):
-        cache = imgproxy.ImageCache(self.folder, download=lambda url: (PNG + url.encode() * 20, ("image/png", ".png")))
+        cache = imgproxy.ImageCache(self.folder, download=lambda url: (PNG[:-12] + url.encode() * 20 + IEND,
+                                                                        ("image/png", ".png")))
         with mock.patch.object(imgproxy, "MAX_CACHE_BYTES", 3000):
             for number in range(40):
                 cache.get(self.url(f"{number:02d}.png"))
@@ -228,6 +331,29 @@ class FeatureStoreTests(unittest.TestCase):
         on_disk = json.loads(self.path.read_text("utf-8"))  # сохранено (переживёт перезапуск)
         self.assertEqual(on_disk["learned"]["rares:Cowboy"][-1], "L4AA")
         self.assertEqual(imgproxy.FeatureStore(self.path).snapshot_json(), self.store.snapshot_json())
+
+    def test_odd_requests_are_ignored(self):
+        for body in ({"learn": {"key": ["x"], "f": "AAAA"}}, {"learn": {"key": {"a": 1}, "f": "AAAA"}},
+                     {"banner": {"bucket": "10", "category": {"a": 1}}}, {"banner": {"bucket": ["10"], "category": "rares"}},
+                     {"learn": ["junk", None, 5]}, {"banner": "50"}, {"feats": ["x"]}, {"feats": {"vintages:Cowboy": "x"}}):
+            self.assertEqual(self.update(body), 0, body)
+        self.assertFalse(self.path.exists())
+
+    def test_many_learned_pictures_in_one_request(self):
+        writes, real = [], imgproxy._atomic_write
+        with mock.patch.object(imgproxy, "_atomic_write", side_effect=lambda path, data: (writes.append(path), real(path, data))):
+            saved = self.update({
+                "learn": [{"key": "rares:Cowboy", "f": f"L{n}AA"} for n in range(5)]
+                + [{"key": "vintages:Cowboy", "f": "VVVV"}, {"key": "godlies:Nope", "f": "AAAA"}],
+                "banner": [{"bucket": "50", "category": "vintages"}] * 3 + [{"bucket": "rainbow", "category": "nonsense"}],
+            })
+        self.assertEqual((saved, len(writes)), (9, 1))  # всё сохранено, файл переписан один раз
+        snap = self.snapshot()
+        self.assertEqual(snap["learned"], {"rares:Cowboy": ["L2AA", "L3AA", "L4AA"], "vintages:Cowboy": ["VVVV"]})
+        self.assertEqual(snap["banners"], {"50": {"vintages": 3}})
+        many = [{"key": "vintages:Cowboy", "f": f"W{n}AA"} for n in range(imgproxy.MAX_LEARN_POST + 5)]
+        self.assertEqual(self.update({"learn": many}), imgproxy.MAX_LEARN_POST)  # не больше записей за раз
+        self.assertEqual(self.snapshot()["learned"]["vintages:Cowboy"][-1], f"W{imgproxy.MAX_LEARN_POST - 1}AA")
 
     def test_other_version_or_broken_file(self):
         with self.assertRaises(ValueError):
@@ -353,6 +479,8 @@ class ItemImageEndpointTests(PicServerTests):
         status, headers, body = self.request("GET", "/api/itemimg?key=vintages%3ACowboy&src=site")
         self.assertEqual((status, body, headers["Content-Type"]), (200, PNG, "image/png"))
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        # адрес — ключ предмета: из кэша браузера после смены картинки пришла бы старая
+        self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertIn("sandbox", headers["Content-Security-Policy"])
         status, _, body = self.request("GET", "/api/itemimg?key=rares%3ACowboy&src=market")
         self.assertEqual((status, body), (200, PNG))
@@ -366,6 +494,21 @@ class ItemImageEndpointTests(PicServerTests):
         self.assertEqual(len(self.downloads), 2)
         # StarPets-картинка Harvester (у его своей адрес чужой) — можно
         self.assertEqual(self.request("GET", "/api/itemimg?key=ancients%3AHarvester&src=market")[0], 200)
+
+    def test_blocking_site_answers_at_once(self):
+        calls = []
+
+        def blocked(url):
+            calls.append(url)
+            raise imgproxy.ImageError(429, "не пускает", "blocked")
+
+        handler = self.httpd.RequestHandlerClass
+        handler.images = imgproxy.ImageCache(handler.images.folder, download=blocked)
+        for key in ("vintages%3ACowboy", "godlies%3ASeer"):
+            status, _, body = self.request("GET", f"/api/itemimg?key={key}&src=site")
+            self.assertEqual(status, 429, body)
+            self.assertIn("не пускает", json.loads(body)["error"])
+        self.assertEqual(len(calls), 1)
 
     def test_foreign_pages_and_hosts_refused(self):
         for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Host": "evil.example"}):
@@ -395,6 +538,11 @@ class ItemImageEndpointTests(PicServerTests):
         self.assertEqual(list(snap["feats"]), ["vintages:Cowboy"])
         self.assertEqual((snap["learned"], snap["banners"]), ({"rares:Cowboy": ["CCCC"]}, {"210": {"rares": 1}}))
         self.assertEqual(self.post("/api/picfeat", {"version": 0})[0], 409)
+        # странные поля — ответ, а не обрыв связи
+        for odd in ({"learn": {"key": ["x"], "f": "AAAA"}}, {"banner": {"bucket": "10", "category": {"a": 1}}}):
+            self.assertEqual(self.post("/api/picfeat", dict(odd, version=imgproxy.FEAT_VERSION)), (200, {"saved": 0}))
+        with mock.patch.object(self.httpd.RequestHandlerClass.features, "update", side_effect=TypeError("странно")):
+            self.assertEqual(self.post("/api/picfeat", {"version": imgproxy.FEAT_VERSION})[0], 400)
 
 
 class CalcPicturesTests(PicServerTests):
@@ -440,6 +588,31 @@ class CalcPicturesTests(PicServerTests):
         self.assertEqual(rows[cowboy["key"]]["tiles"], [{"id": "0:1", "qty": 1}])
         self.assertEqual(payload["unknown_tiles"], 1)
         self.assertTrue(payload["ocr_errors"])
+
+    def test_text_screenshots_report_their_rows(self):
+        # Скриншоты, прочитанные как текст, считаются каждый отдельно: «x2» в конце первого
+        # относится к нему, а не к первой строке второго; браузер знает, что нашлось на каждом.
+        def words(*lines):
+            return {"width": 800, "height": 600, "words": [
+                {"text": text, "x": 0, "y": 20 * number, "w": 60, "h": 15, "pass": "white", "line": number}
+                for number, text in enumerate(lines)]}
+
+        reads = iter([(words("Seerr", "Harvester", "x2"), [self.tile(None, [20, 30, 130, 170], 3, badge=[110, 40, 30, 16])]),
+                      (words("Seer"), [])])
+        with mock.patch.object(ocr, "read_inventory", side_effect=lambda raw, matcher: next(reads)):
+            status, payload = self.post("/api/calc", {"images": ["QUFB", "QUFC"], "pictures": True, "text": "Seer x5"})
+        self.assertEqual(status, 200)
+        first, second = payload["shots"]
+        self.assertEqual((first["mode"], first["text_items"], second["mode"]), ("text", 2, "text"))
+        self.assertEqual(first["text_rows"], [{"key": "godlies:Seer", "qty": 1, "score": 0.89, "seen": ["Seerr"]},
+                                              {"key": "ancients:Harvester", "qty": 2, "score": 1.0, "seen": ["Harvester"]}])
+        self.assertEqual(second["text_rows"], [{"key": "godlies:Seer", "qty": 1, "score": 1.0, "seen": ["Seer"]}])
+        self.assertEqual(len(first["tiles"]), 1)  # плитка без названия — браузеру
+        rows = {row["key"]: row for row in payload["items"]}
+        self.assertEqual({key: (row["qty"], row["score"]) for key, row in rows.items()},
+                         {"godlies:Seer": (7, 0.89), "ancients:Harvester": (2, 1.0)})
+        self.assertEqual(rows["godlies:Seer"]["seen"], ["Seer", "Seerr", "Seer"])
+        self.assertEqual(payload["ocr_lines"], 4)
 
     def test_screenshot_with_no_tiles_still_goes_to_the_browser(self):
         with mock.patch.object(ocr, "read_inventory", side_effect=ocr.OcrError("только в Windows")):

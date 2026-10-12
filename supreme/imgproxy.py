@@ -11,6 +11,7 @@ web/picmatch.js) хранятся в data/picfeat.json — тоже считаю
 """
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -27,7 +28,9 @@ MAX_BYTES = 2 * 1024 * 1024        # картинка предмета — де�
 MAX_CACHE_BYTES = 150 * 1024 * 1024
 TIMEOUT = 10
 FAIL_RETRY = 6 * 3600              # адрес, который ответил «нет такой картинки», не запрашивается 6 часов
-BUSY_RETRY = 10 * 60               # сайт перегружен (429, 5xx) — 10 минут
+BUSY_RETRY = 10 * 60               # сайт перегружен (5xx) — 10 минут
+BLOCK_PAUSE = 30 * 60              # сайт не пускает программу (403, 429, страница защиты) — весь сайт на 30 минут
+BLOCK_STATUSES = (401, 403, 429, 451)
 OFFLINE_AFTER = 4                  # столько обрывов связи подряд — сети нет:
 OFFLINE_PAUSE = 60                 # минуту картинки не запрашиваются (ответ сразу, без ожидания)
 PARALLEL = 4                       # одновременных загрузок с сайтов
@@ -48,7 +51,8 @@ _EXTENSIONS = (".webp", ".png", ".jpg", ".gif", ".avif")
 
 class ImageError(Exception):
     """kind: "final" — картинки нет (запомнить надолго), "busy" — сайт занят,
-    "network" — нет связи (не запоминать для адреса)."""
+    "network" — нет связи (не запоминать для адреса), "blocked" — сайт не пускает программу
+    (пауза для всего сайта: тысяча запросов подряд к защищённому сайту только продлит блокировку)."""
 
     def __init__(self, status, message, kind="final"):
         super().__init__(message)
@@ -66,6 +70,47 @@ def sniff(data):
     if data[4:12] in (b"ftypavif", b"ftypavis"):
         return "image/avif", ".avif"
     return None
+
+
+def complete(data, ext):
+    """Картинка пришла целиком? Обрыв связи посреди загрузки даёт начало файла с верными
+    первыми байтами: такой файл не открывается, и в кэше он остался бы навсегда."""
+    if ext == ".png":
+        return b"IEND" in data[-64:]
+    if ext == ".webp":
+        return len(data) >= 12 and int.from_bytes(data[4:8], "little") + 8 <= len(data)
+    if ext == ".jpg":
+        return b"\xff\xd9" in data[-64:]  # в сжатых данных JPEG пары FF D9 не бывает
+    if ext == ".gif":
+        return b";" in data[-32:]
+    if ext == ".avif":  # коробки ISO BMFF: размеры складываются ровно в длину файла
+        pos = 0
+        while pos < len(data):
+            size = int.from_bytes(data[pos:pos + 4], "big")
+            if size == 1:
+                size = int.from_bytes(data[pos + 8:pos + 16], "big")
+            elif size == 0:
+                return pos + 8 <= len(data)
+            if size < 8:
+                return False
+            pos += size
+        return pos == len(data)
+    return False
+
+
+def _site(url):
+    """Доверенный сайт адреса (supremevalues.com / starpets.gg) — пауза общая для его поддоменов."""
+    host = (urllib.parse.urlsplit(str(url)).hostname or "").lower().rstrip(".")
+    return next((site for site in ALLOWED_SITES if host == site or host.endswith("." + site)), host)
+
+
+def quote_url(url):
+    """Пробелы и не-ASCII в адресе — в %-коды: у StarPets бывают адреса вроде
+    «.../110x110/Luger chroma.webp», а с пробелом urllib запрос не отправит."""
+    parts = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(parts.path, safe="/%:@!$&'()*+,;=~")
+    query = urllib.parse.quote(parts.query, safe="/%:@!$&'()*+,;=~?")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
 
 
 def host_allowed(url):
@@ -92,27 +137,39 @@ class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
 def _download(url, opener=None):
     """Скачать картинку: (байты, (content-type, расширение)). ImageError — если это не картинка."""
     opener = opener or urllib.request.build_opener(_CheckedRedirects)
-    request = urllib.request.Request(url, headers=HEADERS)
     try:
+        request = urllib.request.Request(quote_url(url), headers=HEADERS)
         with opener.open(request, timeout=TIMEOUT) as response:
-            declared = response.headers.get("Content-Length")
-            if declared and declared.strip().isdigit() and int(declared) > MAX_BYTES:
+            declared = (response.headers.get("Content-Length") or "").strip()
+            declared = int(declared) if declared.isdigit() else None
+            if declared is not None and declared > MAX_BYTES:
                 raise ImageError(502, "картинка слишком большая")
             ctype = (response.headers.get_content_type() or "").lower()
+            if ctype in ("text/html", "application/xhtml+xml"):  # страница защиты сайта вместо картинки
+                raise ImageError(429, "сайт картинок не пускает программу (страница защиты)", "blocked")
             if not (ctype.startswith("image/") or ctype in ("application/octet-stream", "binary/octet-stream")):
                 raise ImageError(502, f"сайт вернул не картинку ({ctype})")
             body = response.read(MAX_BYTES + 1)
     except urllib.error.HTTPError as error:
-        busy = error.code == 429 or error.code >= 500
+        if error.code in BLOCK_STATUSES:
+            raise ImageError(429, f"сайт картинок не пускает программу (HTTP {error.code})", "blocked") from None
+        busy = error.code >= 500
         status = 404 if error.code in (404, 410) else 503 if busy else 502
         raise ImageError(status, f"сайт картинок ответил HTTP {error.code}", "busy" if busy else "final") from None
-    except (urllib.error.URLError, OSError, ValueError) as error:
+    except http.client.InvalidURL as error:
+        raise ImageError(502, f"неверный адрес картинки ({error})") from None
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
+        # HTTPException: оборванный ответ (IncompleteRead), испорченные заголовки — тоже обрыв связи
         raise ImageError(503, f"нет связи с сайтом картинок ({error})", "network") from None
     if len(body) > MAX_BYTES:
         raise ImageError(502, "картинка слишком большая")
+    if declared is not None and len(body) != declared:  # связь оборвалась: read() не жалуется, просто отдаёт меньше
+        raise ImageError(503, "картинка пришла не целиком (обрыв связи)", "network")
     kind = sniff(body)
     if kind is None:
         raise ImageError(502, "сайт вернул не картинку")
+    if not complete(body, kind[1]):
+        raise ImageError(503, "картинка пришла не целиком", "busy")
     return body, kind
 
 
@@ -144,6 +201,7 @@ class ImageCache:
         self._size = None
         self._network_errors = 0
         self._offline_until = 0.0
+        self._paused = {}  # сайт -> до какого времени не запрашивать (не пускает программу)
 
     @staticmethod
     def _name(url):
@@ -192,17 +250,20 @@ class ImageCache:
                 except OSError:
                     data = b""
                 kind = sniff(data)
-                if kind:
+                if kind and complete(data, kind[1]):
                     return data, kind[0]
             with self._lock:
                 failed = self._failures().get(url)
                 offline = self._clock() < self._offline_until
+                paused = self._clock() < self._paused.get(_site(url), 0.0)
             if failed:
                 at, kind = failed
                 if self._clock() - at < (BUSY_RETRY if kind == "busy" else FAIL_RETRY):
                     raise ImageError(404 if kind == "final" else 503, "картинка недавно не загрузилась", kind)
             if offline:
                 raise ImageError(503, "нет связи с сайтами картинок", "network")
+            if paused:
+                raise ImageError(429, "сайт картинок не пускает программу — попробую позже", "blocked")
             with self._slots:
                 try:
                     data, (ctype, ext) = self._download(url)
@@ -220,6 +281,10 @@ class ImageCache:
             return data, ctype
 
     def _after_error(self, url, error):
+        if error.kind == "blocked":
+            with self._lock:
+                self._paused[_site(url)] = self._clock() + BLOCK_PAUSE
+            return  # не пускает весь сайт — сам адрес не виноват
         if error.kind == "network":
             with self._lock:
                 self._network_errors += 1
@@ -255,6 +320,7 @@ class ImageCache:
 FEAT_VERSION = 1            # как PicMatch.FEAT_VERSION в web/picmatch.js
 MAX_FEAT_CHARS = 4096       # одна упакованная запись PicMatch.pack (~2.2 тыс. символов)
 MAX_LEARNED = 3             # картинок из игры на предмет (последние)
+MAX_LEARN_POST = 1000       # записей "learn" и "banner" в одном запросе (браузер шлёт их пачкой)
 SOURCES = ("site", "market")
 _BUCKET_RE = re.compile(r"grey|rainbow|\d{1,3}")
 _FEAT_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
@@ -262,6 +328,12 @@ _FEAT_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 
 def _feature_ok(value):
     return isinstance(value, str) and 0 < len(value) <= MAX_FEAT_CHARS and bool(_FEAT_RE.fullmatch(value))
+
+
+def _entries(value):
+    """Запись или список записей (словарей) из запроса; остальное отбрасывается."""
+    listed = value[:MAX_LEARN_POST] if isinstance(value, list) else [value]
+    return [entry for entry in listed if isinstance(entry, dict)]
 
 
 class FeatureStore:
@@ -295,8 +367,8 @@ class FeatureStore:
             return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     def update(self, body, sources, keys, categories):
-        """body: {"version", "feats": {ключ: {src: {"url", "f"}}}, "learn": {"key", "f"},
-        "banner": {"bucket", "category"}}.
+        """body: {"version", "feats": {ключ: {src: {"url", "f"}}}, "learn": {"key", "f"} или их список,
+        "banner": {"bucket", "category"} или их список}. Файл переписывается целиком — один раз на запрос.
         sources: {ключ: {src: адрес}} — картинки известных предметов; keys — все известные
         предметы (выученная картинка бывает и у предмета без картинки на сайте);
         categories — известные категории. Возвращает, сколько записей сохранено."""
@@ -316,18 +388,25 @@ class FeatureStore:
                     if _feature_ok(entry.get("f")):
                         data["feats"].setdefault(key, {})[src] = {"url": url, "f": entry["f"]}
                         changed += 1
-            learn = body.get("learn")
-            if isinstance(learn, dict) and learn.get("key") in keys and _feature_ok(learn.get("f")):
-                learned = data["learned"].setdefault(learn["key"], [])
+            for learn in _entries(body.get("learn")):
+                if not (isinstance(learn.get("key"), str) and learn["key"] in keys and _feature_ok(learn.get("f"))):
+                    continue
+                learned = data["learned"].get(learn["key"])
+                if not isinstance(learned, list):
+                    learned = data["learned"][learn["key"]] = []
                 if learn["f"] not in learned:
                     learned.append(learn["f"])
                     del learned[:-MAX_LEARNED]
                     changed += 1
-            banner = body.get("banner")
-            if (isinstance(banner, dict) and isinstance(banner.get("bucket"), str)
-                    and _BUCKET_RE.fullmatch(banner["bucket"]) and banner.get("category") in categories):
-                bucket = data["banners"].setdefault(banner["bucket"], {})
-                bucket[banner["category"]] = min(10 ** 6, bucket.get(banner["category"], 0) + 1)
+            for banner in _entries(body.get("banner")):
+                bucket, category = banner.get("bucket"), banner.get("category")
+                if not (isinstance(bucket, str) and _BUCKET_RE.fullmatch(bucket)
+                        and isinstance(category, str) and category in categories):
+                    continue
+                counts = data["banners"].get(bucket)
+                if not isinstance(counts, dict):
+                    counts = data["banners"][bucket] = {}
+                counts[category] = min(10 ** 6, (counts.get(category) if isinstance(counts.get(category), int) else 0) + 1)
                 changed += 1
             if changed:
                 self.path.parent.mkdir(parents=True, exist_ok=True)

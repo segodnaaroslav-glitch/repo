@@ -1349,9 +1349,11 @@ function renderCalc() {
         const options = [current, ...item.alternatives];
         const chosen = options[Number(pick.value)];
         const rest = options.filter((choice) => choice !== chosen);
-        if (window.PicTiles) PicTiles.onVariant(item, chosen);  // плитки строки — этот предмет
+        const oldKey = item.key;
         Object.assign(item, { key: chosen.key, name: chosen.name, category: chosen.category, image: chosen.image,
           value: chosen.value, prices: chosen.prices, alternatives: rest, ambiguous: false });
+        // плитки строки — этот предмет; если он уже есть другой строкой — строки сливаются
+        if (window.PicTiles) PicTiles.onVariant(item, oldKey);
         renderCalc();
       });
       nameCell.append(pick);

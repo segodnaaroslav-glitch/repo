@@ -26,6 +26,8 @@ window.PicTiles = (() => {
   const IDLE_WORKERS = 2;
   const BATCH = 120;                          // признаков в одном сохранении на сервер (файл пишется целиком)
   const OFFLINE_AFTER = 6;                    // столько обрывов подряд — картинок сейчас нет
+  const BLOCK_PAUSE = 30 * 60 * 1000;         // сайт картинок не пускает программу — его картинки позже
+  const PICKED_MAX = 500;                     // записей «picked» в одном /api/calc (как calc.MAX_PICKED)
   const THUMB_H = 64;
   const SUGGEST_MIN = 0.35;                   // похожесть, с которой предмет предлагается в списке
   const SUGGEST_COUNT = 4;
@@ -40,6 +42,7 @@ window.PicTiles = (() => {
     feats: new Map(),     // ключ -> [{key, source, feat}]
     all: null,            // все эталоны одним списком (для сравнения со всеми предметами)
     failed: new Set(),    // "ключ|источник" — не загрузились в этом сеансе
+    blocked: new Map(),   // источник (site|market) -> до какого времени его сайт не пускает программу
     inflight: new Map(),
     netFails: 0,
     offline: false,
@@ -182,6 +185,10 @@ window.PicTiles = (() => {
     return refs.loading;
   }
 
+  function blocked(source) {
+    return (refs.blocked.get(source) || 0) > Date.now();
+  }
+
   function hasStored(key, source, url) {
     const entry = refs.stored[key] && refs.stored[key][source];
     return Boolean(entry && entry.url === url);
@@ -193,7 +200,7 @@ window.PicTiles = (() => {
     const jobs = [];
     for (const key of keys) {
       const sources = Object.entries(refs.sources[key] || {});
-      const fresh = sources.filter(([src, url]) => !hasStored(key, src, url) && !refs.failed.has(`${key}|${src}`))
+      const fresh = sources.filter(([src, url]) => !hasStored(key, src, url) && !refs.failed.has(`${key}|${src}`) && !blocked(src))
         .map(([src, url]) => ({ key, src, url }));
       if (!fresh.length) continue;
       if (!firstOnly) {
@@ -227,16 +234,22 @@ window.PicTiles = (() => {
     if (refs.inflight.has(id)) return refs.inflight.get(id);
     const promise = (async () => {
       try {
-        const response = await fetch(`/api/itemimg?key=${encodeURIComponent(job.key)}&src=${encodeURIComponent(job.src)}`);
+        const response = await fetch(`/api/itemimg?key=${encodeURIComponent(job.key)}&src=${encodeURIComponent(job.src)}`,
+          { cache: "no-store" });
         if (!response.ok) {
           if (response.status === 503) noteNetFail();
+          else if (response.status === 429) refs.blocked.set(job.src, Date.now() + BLOCK_PAUSE);  // весь сайт — позже
           else refs.failed.add(id);
           return null;
         }
-        const feat = PicMatch.refFeature(await refImageData(await response.blob()));
+        const blob = await response.blob();
+        let feat = null;
+        try {
+          feat = PicMatch.refFeature(await refImageData(blob));
+        } catch (error) { /* картинка не открылась (испорчена) — как картинки нет */ }
         refs.netFails = 0;
         if (!feat) {
-          refs.failed.add(id);  // пустая картинка
+          refs.failed.add(id);  // пустая или испорченная картинка: возьмётся другая картинка предмета
           return null;
         }
         const f = PicMatch.pack(feat);
@@ -270,7 +283,7 @@ window.PicTiles = (() => {
     const worker = async () => {
       while (next < jobs.length && !refs.offline && (!alive || alive())) {
         const job = jobs[next++];
-        const f = await refJob(job);
+        const f = blocked(job.src) ? null : await refJob(job);
         if (f) {
           batch[job.key] = batch[job.key] || {};
           batch[job.key][job.src] = { url: job.url, f };
@@ -338,24 +351,56 @@ window.PicTiles = (() => {
       && y >= d.iconTop && y <= d.banner.y1 + 2)) || null;
   }
 
+  // Место плитки распознавания в пределах скриншота (для миниатюры), или null.
+  function boxGeom(box, canvas) {
+    if (!Array.isArray(box) || box.length < 4) return null;
+    const x0 = Math.max(0, Math.round(box[0])), iconTop = Math.max(0, Math.round(box[1]));
+    const x1 = Math.min(canvas.width - 1, Math.round(box[0] + box[2]) - 1);
+    const iconBottom = Math.min(canvas.height - 1, Math.round(box[1] + box[3]) - 1);
+    return x1 - x0 >= 4 && iconBottom - iconTop >= 4 ? { x0, x1, iconTop, iconBottom, banner: null } : null;
+  }
+
+  // Плитка без названия, которую не сравнить как обычно (обрезана краем скриншота, слишком мелкая):
+  // не пропадает молча — похожие предметы показываются подсказкой, а выбирает пользователь.
+  function partialTile(t, canvas, data) {
+    t.partialView = true;
+    const geom = PicMatch.tileFromBox(data, t.box, t.badgeBox, t.bg);
+    const wide = Boolean(geom && geom.x1 - geom.x0 + 1 >= MIN_TILE_WIDTH);
+    if (wide) {
+      t.geom = geom;
+      t.color = geom.color;
+      t.feat = PicMatch.tileFeature(data, geom);
+    }
+    const place = wide ? geom : boxGeom(t.box, canvas);
+    t.thumb = place ? thumb(canvas, place) : null;
+  }
+
   // Скриншот: плитки по картинке; плитки распознавания получают точное место, признаки и миниатюру.
+  // false — скриншот прочитан как текст и плиток инвентаря на нём не видно (список, чат): его
+  // строки остаются как есть. Одно случайное слово («Back» -> Black) инвентарь текстом не делает.
   async function scanShot(shot, dataUrl) {
     const { canvas, data } = drawCanvas(await loadImage(dataUrl), 0);
     const found = PicMatch.detectTiles(data).filter((d) => !d.partial && d.x1 - d.x0 + 1 >= MIN_TILE_WIDTH);
+    const mine = pics.tiles.filter((t) => t.shot === shot.index);
+    if (shot.mode === "text" && shot.text_items > 0 && found.length < 2
+        && !mine.some((t) => sameTile(found, new Set(), t))) return false;
     const used = new Set();
-    for (const tile of pics.tiles.filter((t) => t.shot === shot.index)) {
+    for (const tile of mine) {
       const hit = sameTile(found, used, tile);
       if (hit) used.add(hit);
       // У края скриншота распознавание не верит названию ('Chroma Seer' -> 'Seer'); если
       // картинка плитки видна целиком, предмет узнаётся по ней.
-      if (tile.clipped && !hit) continue;
-      tile.clipped = false;
-      const geom = hit || PicMatch.tileFromBox(data, tile.box, tile.badgeBox, tile.bg);
-      if (!geom || geom.x1 - geom.x0 + 1 < MIN_TILE_WIDTH) continue;
-      tile.geom = geom;
-      tile.color = geom.color || PicMatch.colorFromRgb(tile.bg);
-      tile.feat = PicMatch.tileFeature(data, geom);
-      tile.thumb = thumb(canvas, geom);
+      if (!tile.clipped || hit) {
+        tile.clipped = false;
+        const geom = hit || PicMatch.tileFromBox(data, tile.box, tile.badgeBox, tile.bg);
+        if (geom && geom.x1 - geom.x0 + 1 >= MIN_TILE_WIDTH) {
+          tile.geom = geom;
+          tile.color = geom.color || PicMatch.colorFromRgb(tile.bg);
+          tile.feat = PicMatch.tileFeature(data, geom);
+          tile.thumb = thumb(canvas, geom);
+        }
+      }
+      if (!tile.key && !tile.feat) partialTile(tile, canvas, data);
     }
     let number = 0;
     for (const d of found) {
@@ -369,6 +414,7 @@ window.PicTiles = (() => {
         geom: d, feat, thumb: thumb(canvas, d), color: d.color, top: [], unsure: false, ignored: false,
       });
     }
+    return true;
   }
 
   // Количество у плиток, найденных только по картинке: значок «xN» читает сервер (угол каждой
@@ -425,10 +471,12 @@ window.PicTiles = (() => {
   }
 
   // Плитка без названия: сравнить со всеми предметами (цвет баннера — мягкая подсказка).
+  // Плитка, видная не целиком, сама не решается — только подсказки.
   function decideByPicture(t) {
-    const ranked = PicMatch.applyPrior(PicMatch.rank(t.feat, allRefs(), 8), PicMatch.rarityPrior(t.color, refs.banners));
+    const ranked = t.feat
+      ? PicMatch.applyPrior(PicMatch.rank(t.feat, allRefs(), 8), PicMatch.rarityPrior(t.color, refs.banners)) : [];
     t.top = ranked.map((r) => ({ key: r.key, score: r.score }));
-    const key = PicMatch.sureKey(ranked);
+    const key = t.partialView ? null : PicMatch.sureKey(ranked);
     if (key) setKey(t, key, "pic");
     else t.unsure = true;
     return Boolean(key);
@@ -438,30 +486,38 @@ window.PicTiles = (() => {
 
   const taught = new Set();
 
-  function teach(t, key, banner) {
-    const body = { version: PicMatch.FEAT_VERSION };
-    if (t.feat) {
+  // Плитка t — предмет key: запомнить её картинку и цвет баннера. Сервер получает всё одним
+  // запросом (файл признаков переписывается целиком); body — общий запрос для нескольких плиток.
+  function teach(t, key, body) {
+    const own = body || { version: PicMatch.FEAT_VERSION, learn: [], banner: [] };
+    if (t.feat && !t.partialView) {  // плитка видна не целиком — её картинку не запоминать
       const f = PicMatch.pack(t.feat);
       addRef(key, "learned", f);
       refs.learned[key] = (refs.learned[key] || 0) + 1;
-      body.learn = { key, f };
+      own.learn.push({ key, f });
     }
-    const bucket = banner !== false && PicMatch.bannerBucket(t.color);
-    if (bucket && t.geom && !t.geom.approx) body.banner = { bucket, category: category(key) };
-    if (body.learn || body.banner) postJson("/api/picfeat", body).catch(() => {});
+    const bucket = PicMatch.bannerBucket(t.color);
+    if (bucket && t.geom && !t.geom.approx) own.banner.push({ bucket, category: category(key) });
+    if (!body) sendLearned(own);
+  }
+
+  function sendLearned(body) {
+    if (body.learn.length || body.banner.length) postJson("/api/picfeat", body).catch(() => {});
   }
 
   // Название прочитано точно и картинка с ним согласна — запомнить, как предмет выглядит в игре
   // (по одной картинке на предмет; так узнаются и предметы без картинки на сайте).
   function learnFromNames() {
+    const body = { version: PicMatch.FEAT_VERSION, learn: [], banner: [] };
     for (const t of pics.tiles) {
       if (t.source !== "ocr" || t.via !== "name" || !t.sure || t.candidates.length !== 1 || t.score < 0.97) continue;
       if (!t.feat || !t.geom || t.geom.approx || refs.learned[t.key] || taught.has(t.key)) continue;
       const score = refScore(t.feat, t.key);
       if (score !== null && score < PicMatch.PIC_AGREE) continue;
       taught.add(t.key);
-      teach(t, t.key);
+      teach(t, t.key, body);
     }
+    sendLearned(body);
   }
 
   // --- строки таблицы ----------------------------------------------------------------
@@ -482,13 +538,17 @@ window.PicTiles = (() => {
     }
   }
 
+  // Цены предметов keys (сначала — узнанные, потом — их варианты для выбора в строке):
+  // сервер берёт не больше PICKED_MAX записей за раз, поэтому — частями.
   async function fetchTemplates(keys) {
     const need = [...new Set(keys)].filter((key) => key && !pics.templates.has(key));
-    if (!need.length) return;
-    try {
-      const response = await postJson("/api/calc", { picked: need.map((key) => ({ key, qty: 1, via: "pic" })) });
-      rememberTemplates(response.items);
-    } catch (error) { /* без цен строки не добавить — плитки останутся в списке */ }
+    for (let at = 0; at < need.length; at += PICKED_MAX) {
+      const part = need.slice(at, at + PICKED_MAX);
+      try {
+        const response = await postJson("/api/calc", { picked: part.map((key) => ({ key, qty: 1, via: "pic" })) });
+        rememberTemplates(response.items);
+      } catch (error) { /* без цен строки не добавить — о таких предметах скажет строка состояния */ }
+    }
   }
 
   function counted(key) {
@@ -496,16 +556,41 @@ window.PicTiles = (() => {
     return { tiles, qty: tiles.reduce((sum, t) => sum + Math.max(1, t.qty), 0) };
   }
 
+  // Несколько строк одного предмета (вариант в строке выбран тот, что уже есть строкой) -> одна:
+  // количество складывается, а плитки пересчитает updateRow (одна стопка — один раз).
+  function mergeRows(key, keep) {
+    const rows = calc.items.filter((item) => item.key === key);
+    if (rows.length < 2) return;
+    const main = rows.includes(keep) ? keep : rows[0];
+    const alternatives = new Map((main.alternatives || []).map((alt) => [alt.key || itemKey(alt), alt]));
+    for (const row of rows) {
+      if (row === main) continue;
+      main.qty = (Number(main.qty) || 0) + (Number(row.qty) || 0);
+      main.tile_qty = (Number(main.tile_qty) || 0) + (Number(row.tile_qty) || 0);
+      main.seen = [...(main.seen || []), ...(row.seen || [])];
+      main.score = Math.min(Number(main.score) || 0, Number(row.score) || 0);
+      main.qty_uncertain = Boolean(main.qty_uncertain || row.qty_uncertain);
+      for (const alt of row.alternatives || []) {
+        const altKey = alt.key || itemKey(alt);
+        if (altKey !== key && !alternatives.has(altKey)) alternatives.set(altKey, alt);
+      }
+      calc.items.splice(calc.items.indexOf(row), 1);
+    }
+    main.alternatives = [...alternatives.values()];
+  }
+
   // Строка предмета key по плиткам: количество с плиток пересчитывается (одна стопка на
-  // нескольких скриншотах — один раз), количество из текста остаётся.
+  // нескольких скриншотах — один раз). Что сверх плиток — из текста или исправлено
+  // пользователем в строке («продаю только 5 из 12») — остаётся: меняется лишь разница плиток.
   function updateRow(key) {
+    mergeRows(key);
     const { tiles, qty } = counted(key);
     const refsOf = tiles.map((t) => ({ id: t.id, qty: t.qty }));
     let row = calc.items.find((item) => item.key === key);
     if (row) {
-      const textQty = Math.max(0, (Number(row.qty) || 0) - (Number(row.tile_qty) || 0));
+      const next = (Number(row.qty) || 0) + qty - (Number(row.tile_qty) || 0);
       Object.assign(row, {
-        qty: Math.min(9999, textQty + qty), tile_qty: qty, tiles: refsOf,
+        qty: Math.max(0, Math.min(9999, next)), tile_qty: qty, tiles: refsOf,
         ambiguous: tiles.some((t) => t.candidates.length > 1 && !t.sure),
         qty_uncertain: tiles.some((t) => t.qtyUncertain),
       });
@@ -539,23 +624,52 @@ window.PicTiles = (() => {
   }
 
   // Плитки сменили предмет: пересчитать затронутые строки (и узнать цены новых предметов).
-  async function applyKeys(keys) {
+  // alive() — расчёт ещё тот же (пока шли цены, могли начать новый: его строки не трогать).
+  async function applyKeys(keys, alive) {
     const affected = [...new Set(keys)].filter(Boolean);
-    const want = [];
+    const want = [], extra = [];
     for (const key of affected) {
       if (calc.items.some((item) => item.key === key)) continue;
       want.push(key);
       for (const t of counted(key).tiles) {
-        want.push(...(t.candidates.length > 1 ? t.candidates : t.top.slice(0, 3).map((s) => s.key)));
+        extra.push(...(t.candidates.length > 1 ? t.candidates : t.top.slice(0, 3).map((s) => s.key)));
       }
     }
-    await fetchTemplates(want);
+    await fetchTemplates([...want, ...extra]);  // цены узнанных — первыми
+    if (alive && !alive()) return 0;
     let added = 0;
     for (const key of affected) added += updateRow(key);
     return added;
   }
 
   // --- расчёт ------------------------------------------------------------------------
+
+  // Скриншот-инвентарь, который сервер прочитал как текст (названия на плитках не прочитались):
+  // предметы, найденные в этом тексте (слово «Back» — похоже на Black), не считаются — плитки
+  // решают картинки, а точно прочитанные названия остаются подсказкой у плиток этого скриншота.
+  function dropText(shots) {
+    const keys = [];
+    for (const shot of shots) {
+      const hints = (shot.text_rows || []).filter((r) => r.score >= 1).map((r) => r.key);
+      for (const t of pics.tiles) if (t.shot === shot.index) t.hints = hints;
+      for (const r of shot.text_rows || []) {
+        const row = calc.items.find((item) => item.key === r.key);
+        if (!row) continue;
+        keys.push(r.key);
+        row.qty = Math.max(0, (Number(row.qty) || 0) - (Number(r.qty) || 0));
+        for (const seen of r.seen || []) {
+          const at = (row.seen || []).indexOf(seen);
+          if (at >= 0) row.seen.splice(at, 1);
+        }
+        if (!(row.seen || []).length) row.score = 1;  // «похоже на …» было только отсюда
+        if (row.qty <= 0) {
+          calc.items.splice(calc.items.indexOf(row), 1);
+          pics.shown.delete(r.key);  // строку убрал не пользователь: плитка этого предмета её вернёт
+        }
+      }
+    }
+    return keys;
+  }
 
   async function analyse(token, response, images) {
     const alive = () => token === pics.token;
@@ -565,16 +679,16 @@ window.PicTiles = (() => {
     pics.templates = new Map();
     rememberTemplates(calc.items);
     pics.shown = new Set(calc.items.map((item) => item.key).filter(Boolean));
-    // Скриншот, прочитанный как обычный текст (список, чат), по картинке не досчитывается.
-    const work = shots.filter((s) => !(s.mode === "text" && s.text_items > 0));
-    if (!work.length) return;
+    if (!shots.length) return;
     setStatus("Ищу плитки на скриншотах по картинке…");
-    for (const shot of work) {
-      await scanShot(shot, images[shot.index].data);
+    const textShots = [];  // прочитаны как текст, но на них плитки инвентаря
+    for (const shot of shots) {
+      const inventory = await scanShot(shot, images[shot.index].data);
       if (!alive()) return;
+      if (inventory && shot.mode === "text" && shot.text_items > 0) textShots.push(shot);
     }
     const variants = pics.tiles.filter((t) => t.feat && t.candidates.length > 1 && !t.sure);
-    const nameless = pics.tiles.filter((t) => t.feat && !t.key && !t.clipped);
+    const nameless = pics.tiles.filter((t) => !t.key && (t.feat || t.partialView));
     const before = new Map(pics.tiles.map((t) => [t.id, [t.key, t.sure]]));
     const badges = readBadges(images);
     try {
@@ -585,7 +699,7 @@ window.PicTiles = (() => {
     variants.forEach((t) => t.candidates.forEach((key) => want.add(key)));
     pics.tiles.filter((t) => t.via === "name" && t.feat && t.candidates.length === 1).forEach((t) => want.add(t.key));
     const urgent = missingJobs([...want], false);
-    if (nameless.length) urgent.push(...missingJobs([...sellableKeys()].filter((key) => !want.has(key)), true));
+    if (nameless.some((t) => t.feat)) urgent.push(...missingJobs([...sellableKeys()].filter((key) => !want.has(key)), true));
     if (urgent.length) {
       await computeRefs(urgent, URGENT_WORKERS, (done, total) => {
         if (alive()) setStatus(`Готовлю картинки предметов для сравнения (один раз): ${done} из ${total}…`);
@@ -604,14 +718,17 @@ window.PicTiles = (() => {
     }
     await badges;
     if (!alive()) return;
-    const keys = [];
+    const keys = dropText(textShots);
     for (const t of pics.tiles) {
       const [key, sure] = before.get(t.id);
       if (t.key !== key || t.sure !== sure) keys.push(key, t.key);  // и «вариант подтверждён картинкой»
     }
-    const added = await applyKeys(keys);
+    const added = await applyKeys(keys, alive);
     if (!alive()) return;
-    pics.summary = { resolved, byPicture, added, offline: refs.offline };
+    const dropped = textShots.filter((shot) => (shot.text_rows || []).length)
+      .map((shot) => ({ shot: shot.index, names: shot.text_rows.map((r) => (itemOf(r.key) || { name: r.key }).name) }));
+    pics.summary = { resolved, byPicture, added, offline: refs.offline, dropped,
+                     blocked: [...refs.blocked.keys()].some(blocked) };
     renderCalc();
     renderUnsure();
     updateStatus();
@@ -626,14 +743,22 @@ window.PicTiles = (() => {
     if (s.byPicture) parts.push(`узнано плиток по картинке: ${s.byPicture}`);
     if (s.resolved) parts.push(`вариант выбран по картинке: ${s.resolved}`);
     if (unsure) parts.push(`не уверен: ${unsure} — выберите ниже`);
+    for (const d of s.dropped || []) {
+      parts.push(`со скриншота ${d.shot + 1} не учтено прочитанное как текст (${d.names.join(", ")}): на нём плитки инвентаря — их решают картинки`);
+    }
     if (s.offline) parts.push("картинки предметов не загрузились (нет связи)");
+    else if (s.blocked) parts.push("сайт картинок сейчас не пускает программу — его картинки будут позже");
     if (pics.badgeErrors.length) parts.push(`количество не прочитано: ${pics.badgeErrors.join("; ")}`);
     if (pics.noPrices.size) {
       const names = [...pics.noPrices].map((key) => (itemOf(key) || { name: key }).name);
       parts.push(`не удалось получить цены: ${names.join(", ")} — добавьте их строкой`);
     }
     setStatus(parts.length ? `По картинкам: ${parts.join("; ")}.` : "");
-    // строки добавлены или убраны — число найденных предметов в строке над таблицей тоже
+    updateFound();
+  }
+
+  // Строки добавлены или убраны — число найденных предметов в строке над таблицей тоже.
+  function updateFound() {
     const found = $("calcStatus");
     found.textContent = found.textContent.replace(/^Найдено предметов: \d+/, `Найдено предметов: ${calc.items.length}`);
   }
@@ -669,6 +794,7 @@ window.PicTiles = (() => {
   }
 
   async function choose(t, key) {
+    const token = pics.token;
     const old = t.key;
     // Строку этого предмета пользователь раньше убрал, а теперь сам выбрал его для плитки — вернуть.
     if (!calc.items.some((item) => item.key === key)) pics.shown.delete(key);
@@ -679,7 +805,8 @@ window.PicTiles = (() => {
     for (const other of pics.tiles) {
       if (other.unsure && !other.key && !other.ignored && other.feat && decideByPicture(other)) keys.push(other.key);
     }
-    await applyKeys(keys);
+    await applyKeys(keys, () => token === pics.token);
+    if (token !== pics.token) return;
     renderCalc();
     renderUnsure();
     updateStatus();
@@ -699,8 +826,13 @@ window.PicTiles = (() => {
     if (t.qtyUncertain) head.append(el("span", "badge warn-badge", "проверьте количество"));
     info.append(head);
     const top = t.top.filter((s) => s.score >= SUGGEST_MIN && itemOf(s.key)).slice(0, SUGGEST_COUNT);
-    info.append(el("span", "muted small", top.length ? `Похоже на «${itemOf(top[0].key).name}» (${pct(top[0].score)}), но не уверен`
-      : (refs.offline || !allRefs().length ? "Картинки предметов не загрузились — выберите сами" : "Не узнал по картинке")));
+    // названия, точно прочитанные на этом скриншоте как текст (плитку с ними связать не удалось)
+    const hints = (t.hints || []).filter((key) => itemOf(key) && !top.some((s) => s.key === key));
+    const guess = top.length ? `похоже на «${itemOf(top[0].key).name}» (${pct(top[0].score)}), но не уверен`
+      : (refs.offline || !allRefs().length ? "картинки предметов не загрузились — выберите сами" : "не узнал по картинке");
+    const note = t.partialView ? `Плитка видна не целиком: ${top.length ? `похоже на «${itemOf(top[0].key).name}» (${pct(top[0].score)})` : "выберите сами"}`
+      : guess[0].toUpperCase() + guess.slice(1);
+    info.append(el("span", "muted small", note));
     const controls = el("div", "pic-tile-controls");
     const select = el("select", "pic-choice");
     select.setAttribute("aria-label", "Какой это предмет");
@@ -708,6 +840,10 @@ window.PicTiles = (() => {
     for (const s of top) {
       const item = itemOf(s.key);
       select.append(new Option(`${item.name} — ${categoryTitle(item.category)} · ${pct(s.score)}`, s.key));
+    }
+    for (const key of hints) {
+      const item = itemOf(key);
+      select.append(new Option(`${item.name} — ${categoryTitle(item.category)} · прочитано на скриншоте`, key));
     }
     select.append(new Option("Другой предмет…", "__other"));
     select.append(new Option("Не считать", "__skip"));
@@ -774,7 +910,9 @@ window.PicTiles = (() => {
     refs.offline = false;
     refs.netFails = 0;
     pics.busy = analyse(token, response, images).catch((error) => {
-      if (token === pics.token) setStatus(`Сравнение по картинкам не удалось: ${error.message}`);
+      if (token !== pics.token) return;
+      const nameless = response.unknown_tiles ? `; плиток без названия: ${response.unknown_tiles} — допишите их строкой` : "";
+      setStatus(`Сравнение по картинкам не удалось: ${error.message}${nameless}`);
     });
     return pics.busy;
   }
@@ -800,13 +938,14 @@ window.PicTiles = (() => {
     return box;
   }
 
-  // Пользователь выбрал другой вариант в строке (Cowboy — нож, а не ружьё): плитки этой строки
-  // теперь этот предмет. Как он выглядит в игре, запоминается, только если плитка в строке одна:
-  // в строке из двух плиток (ружьё и нож с одним названием) одна из картинок — другой предмет.
-  function onVariant(item, chosen) {
-    const oldKey = item.key;
-    const newKey = chosen.key || itemKey(chosen);
-    if (!oldKey || oldKey === newKey) return;
+  // Пользователь выбрал другой вариант в строке (Cowboy — нож, а не ружьё); строка item уже
+  // этот предмет, oldKey — что было. Плитки строки теперь этот предмет. Как он выглядит в игре,
+  // запоминается, только если плитка в строке одна: в строке из двух плиток (ружьё и нож с одним
+  // названием) одна из картинок — другой предмет. Если у выбранного предмета уже есть строка
+  // (узнан по картинке на другом скриншоте), строки сливаются: одна стопка не считается дважды.
+  function onVariant(item, oldKey) {
+    const newKey = item.key;
+    if (!oldKey || !newKey || oldKey === newKey) return;
     const mine = new Set((item.tiles || []).map((ref) => ref.id));
     const names = new Set(pics.tiles.filter((t) => mine.has(t.id)).map((t) => t.name));
     for (const t of pics.tiles) {
@@ -820,11 +959,16 @@ window.PicTiles = (() => {
     }
     pics.shown.delete(oldKey);
     pics.shown.add(newKey);
+    if (calc.items.filter((row) => row.key === newKey).length > 1) {
+      mergeRows(newKey, item);
+      updateRow(newKey);
+      updateFound();
+    }
   }
 
   return {
     prefetch, reset, start, rowNote, onVariant,
     idle: () => pics.busy,
-    _state: { pics, refs },  // для проверок
+    _state: { pics, refs, fetchTemplates },  // для проверок
   };
 })();

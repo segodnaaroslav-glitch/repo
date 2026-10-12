@@ -230,6 +230,7 @@ class Handler(BaseHTTPRequestHandler):
         picked = calc.picked_entries(body.get("picked"), items)
         by_name = calc.name_index(items) if decoded else {}
         shots, ocr_lines, unknown_tiles, shot_info = [], [], 0, []
+        found, unmatched = calc.match_text(text, items) if text.strip() else ([], [])
         for index, raw in decoded:
             # Для браузера: что распознавание нашло на скриншоте (index — номер в списке images с 0).
             info = {"index": index - 1, "width": None, "height": None, "mode": "error", "text_items": 0, "tiles": []}
@@ -250,16 +251,30 @@ class Handler(BaseHTTPRequestHandler):
                 unknown_tiles += sum(1 for tile in tiles if not tile["name"])
                 info["mode"] = "tiles"
             else:
+                # Каждый скриншот — отдельно: «x2» в конце одного не относится к началу другого,
+                # а браузер может убрать строки скриншота, если по картинке это инвентарь.
                 lines = ocr.lines_from_words(words)
                 ocr_lines.extend(lines)
                 info["mode"] = "text"
-                info["text_items"] = len(calc.match_text("\n".join(lines), items)[0]) if lines else 0
+                shot_found, shot_unmatched = calc.match_text("\n".join(lines), items) if lines else ([], [])
+                found.extend(shot_found)
+                unmatched.extend(shot_unmatched)
+                info["text_items"] = len(shot_found)
+                info["text_rows"] = [{"key": markets.item_id(entry["item"]), "qty": entry["qty"],
+                                      "score": round(entry["score"], 2), "seen": entry["seen"]} for entry in shot_found]
             info["tiles"] = calc.describe_tiles(tiles, by_name)
         if not text.strip() and not shots and not ocr_lines and not picked and not (pictures and shot_info):
             return self._error(400, "; ".join(ocr_errors) or "На скриншотах не найдено ни одного предмета")
-        found, unmatched = calc.match_text(text + "\n" + "\n".join(ocr_lines), items)
         tile_found, tile_unmatched = calc.match_tiles(shots, items)
-        merged = {markets.item_id(entry["item"]): entry for entry in found}
+        merged = {}
+        for entry in found:  # текст и скриншоты, прочитанные как текст: один предмет — одна строка
+            key = markets.item_id(entry["item"])
+            if key in merged:
+                merged[key]["qty"] += entry["qty"]
+                merged[key]["score"] = min(merged[key]["score"], entry["score"])
+                merged[key]["seen"] += entry["seen"]
+            else:
+                merged[key] = dict(entry, seen=list(entry["seen"]))
         for entry in tile_found:
             key = markets.item_id(entry["item"])
             if key in merged:
@@ -399,10 +414,14 @@ class Handler(BaseHTTPRequestHandler):
             body, content_type = self.images.get(url)
         except imgproxy.ImageError as error:
             return self._error(error.status, str(error))
+        except Exception as error:  # ответить, а не оборвать связь: браузер примет обрыв за «нет сети»
+            return self._error(502, f"Картинка не загрузилась: {error}")
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "private, max-age=86400")
+        # Адрес запроса — ключ предмета, а не адрес картинки: из кэша браузера после смены картинки
+        # пришла бы старая, и её признаки сохранились бы для новой. Повтор дёшев — картинка на диске.
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
         self.end_headers()
@@ -423,6 +442,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(409, str(error))
         except OSError as error:
             return self._error(500, f"Не удалось сохранить признаки картинок: {error}")
+        except (TypeError, AttributeError, KeyError) as error:  # странный запрос — ответ, а не обрыв связи
+            return self._error(400, f"Неверные признаки картинок: {error}")
         return self._json(200, {"saved": saved})
 
     @staticmethod

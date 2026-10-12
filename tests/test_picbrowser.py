@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from supreme import cdp, fetcher, imgproxy, markets, ocr, parser, server, store
+from supreme import calc as calc_module, cdp, fetcher, imgproxy, markets, ocr, parser, server, store
 from tests import picgen
 from tests.test_imgproxy import FakeMonitor
 
@@ -53,14 +53,14 @@ def shot(cells, seed):
     return canvas.png(alpha=False), truth
 
 
-def ocr_tiles(truth):
+def ocr_tiles(truth, unread=UNREAD_NAMES, missed=OCR_MISSED):
     """Плитки, как их вернул бы tileocr.recognize (место приблизительное)."""
     tiles = []
     for place in truth:
         key = place["key"]
-        if key in OCR_MISSED:
+        if key in missed:
             continue
-        name = None if key in UNREAD_NAMES else picgen.ITEMS[key][0]
+        name = None if key in unread else picgen.ITEMS[key][0]
         x0, top, (b0, b1) = place["x0"], place["icon_top"], place["banner"]
         badge = place["badge"]
         tiles.append({
@@ -72,6 +72,19 @@ def ocr_tiles(truth):
             "bg": COWBOY_BG.get(key, list(picgen.ITEMS[key][4])), "clipped": False, "qty_uncertain": False,
         })
     return tiles
+
+
+def text_words(*lines):
+    """Слова распознавания: каждая строка — одним словом (для скриншотов, прочитанных как текст)."""
+    return {"width": 0, "height": 0, "words": [{"text": text, "x": 5, "y": 5 + 20 * number, "w": 40, "h": 12,
+                                                "pass": "white", "line": number} for number, text in enumerate(lines)]}
+
+
+def cut_bottom(canvas, height):
+    """Скриншот, обрезанный снизу (инвентарь прокручивается — нижний ряд виден не целиком)."""
+    cut = picgen.Canvas(canvas.width, height)
+    cut.px = canvas.px[:canvas.width * height * 4]
+    return cut.png(alpha=False)
 
 
 @unittest.skipUnless(BROWSER, "нет Edge/Chrome/Chromium")
@@ -103,6 +116,8 @@ class CalcPicturesBrowserTests(unittest.TestCase):
                                         monitor=FakeMonitor(MARKET))
         self.handler = self.httpd.RequestHandlerClass
         self.downloads, self.offline = [], False
+        self.missing, self.corrupt, self.site_blocked = set(), set(), False
+        self.inventories, self.truths = {}, {}  # скриншоты отдельных проверок: png -> ответ распознавания
         self.handler.images = imgproxy.ImageCache(self.folder / "images", download=self.download)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.addCleanup(self.httpd.server_close)
@@ -121,18 +136,25 @@ class CalcPicturesBrowserTests(unittest.TestCase):
         self.downloads.append(url)
         if self.offline:
             raise imgproxy.ImageError(503, "нет связи", "network")
-        if url not in self.pictures:
+        if self.site_blocked and url.startswith(SITE):
+            raise imgproxy.ImageError(429, "сайт не пускает программу", "blocked")
+        if url not in self.pictures or url in self.missing:
             raise imgproxy.ImageError(404, "нет картинки")
+        if url in self.corrupt:  # начало и конец PNG на месте, внутри — мусор: браузер её не откроет
+            return self.pictures[url][:40] + b"\x13" * 200 + self.pictures[url][-12:], ("image/png", ".png")
         return self.pictures[url], ("image/png", ".png")
 
     def read_inventory(self, raw, matcher):
+        if raw in self.inventories:
+            words, tiles = self.inventories[raw]
+            return words, [dict(tile) for tile in tiles]
         size = {"width": 0, "height": 0, "words": []}
         if raw == self.png_a:
             return size, ocr_tiles(self.truth_a)
         return size, []  # B: плиток не нашлось
 
     def recognize_regions(self, raw, regions, **kwargs):
-        name, truth = ("A", self.truth_a) if raw == self.png_a else ("B", self.truth_b)
+        name, truth = self.truths.get(raw) or (("A", self.truth_a) if raw == self.png_a else ("B", self.truth_b))
         self.badge_calls.append((name, len(regions)))
         words, areas = [], []
         for number, (x, y, w, h) in enumerate(regions):
@@ -213,8 +235,23 @@ class CalcPicturesBrowserTests(unittest.TestCase):
 
     # --- проверки ---
 
+    def watch_posts(self):
+        """Запросы страницы к серверу: [(адрес, тело)] — в window.seenPosts."""
+        self.js("""
+            window.seenPosts = [];
+            const real = window.postJson;
+            window.postJson = (url, body) => { seenPosts.push([url, body]); return real(url, body); };
+            return true;
+        """)
+
     def test_pictures_decide_variants_and_nameless_tiles(self):
+        self.watch_posts()
         self.run_calc(self.png_a, self.png_b)
+        # картинки из игры (плитки с точно прочитанным названием) — на сервер одним запросом
+        learn = self.js('return seenPosts.filter(([url, body]) => url === "/api/picfeat" && body.learn && body.learn.length)'
+                        '.map(([url, body]) => body.learn.map((entry) => entry.key));')
+        self.assertEqual(len(learn), 1, learn)
+        self.assertGreaterEqual(len(learn[0]), 3, learn)
         snap = self.snapshot()
         rows = self.rows(snap)
         self.assertEqual({key: row["qty"] for key, row in rows.items()}, {
@@ -314,6 +351,161 @@ class CalcPicturesBrowserTests(unittest.TestCase):
         self.assertNotIn("проверьте вариант", rows[other]["badges"])
         self.assertTrue(self.learned("godlies:Icebreaker"))  # выбор для одной плитки — запомнен
         self.assertNotIn(other, json.loads(self.handler.features.snapshot_json())["learned"])
+
+    def qty_of(self, key, value):
+        """Пользователь вписал количество в строке предмета."""
+        self.js(f"""
+            const index = calc.items.findIndex((item) => item.key === {json.dumps(key)});
+            const input = [...$("calcBody").children][index].querySelector("input.qty");
+            input.value = "{value}";
+            input.dispatchEvent(new Event("input"));
+            input.dispatchEvent(new Event("change"));
+            return true;
+        """)
+
+    def test_inventory_read_as_text_is_still_compared_by_picture(self):
+        # Названия на плитках не прочитались — сервер прочитал скриншот как текст, и слово «Seerr»
+        # нашло Seer. Плитки (по картинке их видно) всё равно сравниваются, а «Seer» не считается.
+        png, truth = shot([("ancients:Harvester", "x3"), ("godlies:Fang", "x7"), ("godlies:Icebreaker", "x2")], 21)
+        self.inventories[png] = (text_words("Seerr"), ocr_tiles(truth, unread=set(picgen.ITEMS)))
+        self.truths[png] = ("C", truth)
+        self.run_calc(png)
+        snap = self.snapshot()
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()},
+                         {"ancients:Harvester": 3, "godlies:Fang": 7, "godlies:Icebreaker": 2}, snap)
+        self.assertTrue(all("по картинке" in row["badges"] for row in snap["rows"]), snap["rows"])
+        self.assertIn("не учтено прочитанное как текст (Seer)", snap["status"])
+        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 3"), snap["calcStatus"])
+
+    def test_names_read_as_text_are_offered_for_unsure_tiles(self):
+        self.offline = True  # без картинок предметов плитки решает пользователь
+        png, truth = shot([("ancients:Harvester", "x3"), ("godlies:Fang", "x7")], 22)
+        self.inventories[png] = (text_words("Fang", "Back"), ocr_tiles(truth, unread=set(picgen.ITEMS)))
+        self.truths[png] = ("E", truth)
+        self.run_calc(png)
+        snap = self.snapshot()
+        self.assertEqual(snap["rows"], [])  # «Fang» не привязано к плитке — само не считается
+        self.assertEqual(len(snap["unsure"]), 2, snap)
+        for row in snap["unsure"]:  # но предлагается в списке у плиток этого скриншота
+            self.assertIn("godlies:Fang", row["options"])
+        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 0"), snap["calcStatus"])
+
+    def test_text_screenshot_without_tiles_keeps_its_text(self):
+        canvas = picgen.Canvas(320, 120, (40, 40, 44, 255))
+        canvas.rect(10, 10, 200, 24, (230, 230, 230))
+        png = canvas.png(alpha=False)
+        self.inventories[png] = (text_words("Harvester x2", "Seer"), [])
+        self.run_calc(png)
+        snap = self.snapshot()
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()},
+                         {"ancients:Harvester": 2, "godlies:Seer": 1})
+        self.assertEqual((snap["unsure"], snap["status"]), ([], ""))
+
+    def test_clipped_tile_without_name_is_not_lost(self):
+        # Нижний ряд обрезан краем скриншота: у Icebreaker виден значок «x2», а полоса с названием — нет.
+        cells = [("ancients:Harvester", "x3"), ("godlies:Seer", "x12"), ("godlies:Fang", "x7"),
+                 ("chromas:Chroma Seer", None), ("godlies:Icebreaker", "x2")]
+        canvas, truth = picgen.grid(cells, width=WIDTH, seed=31)
+        png = cut_bottom(canvas, truth[-1]["banner"][0] + 4)
+        tiles = ocr_tiles(truth[:4], unread=set(), missed=set())
+        clipped = ocr_tiles(truth[4:], unread=set(picgen.ITEMS), missed=set())[0]
+        clipped.update(clipped=True, name_box=None)
+        self.inventories[png] = ({"width": 0, "height": 0, "words": []}, tiles + [clipped])
+        self.truths[png] = ("D", truth)
+        self.run_calc(png)
+        snap = self.snapshot()
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()},
+                         {"ancients:Harvester": 3, "godlies:Seer": 12, "godlies:Fang": 7, "chromas:Chroma Seer": 1})
+        self.assertEqual(len(snap["unsure"]), 1, snap)  # не пропала молча: выбирает пользователь
+        self.assertTrue(snap["unsure"][0]["thumb"])
+        self.assertIn("видна не целиком", snap["unsure"][0]["text"])
+        self.assertIn("×2", snap["unsure"][0]["text"])
+        self.assertIn("не уверен: 1", snap["status"])
+        self.choose_other(0, "Icebreaker")
+        self.wait('calc.items.some((item) => item.key === "godlies:Icebreaker")')
+        icebreaker = self.rows(self.snapshot())["godlies:Icebreaker"]
+        self.assertEqual((icebreaker["qty"], icebreaker["via"]), (2, "user"))
+        time.sleep(0.3)
+        self.assertNotIn("godlies:Icebreaker", json.loads(self.handler.features.snapshot_json())["learned"])
+
+    def test_choosing_a_variant_that_already_has_a_row_merges_them(self):
+        # У ножа Cowboy картинки нет: на A вариант не выбрать, а на B то же ружьё узнано по картинке.
+        self.missing.add(MARKET["rares:Cowboy"])
+        cells = [("vintages:Cowboy", "x3"), ("godlies:Fang", "x7")]
+        png_a, truth_a = shot(cells, 41)
+        png_b, truth_b = shot(cells, 42)
+        self.inventories[png_a] = ({"width": 0, "height": 0, "words": []}, ocr_tiles(truth_a, unread=set(), missed=set()))
+        self.truths.update({png_a: ("A2", truth_a), png_b: ("B2", truth_b)})
+        self.run_calc(png_a, png_b)
+        snap = self.snapshot()
+        self.assertEqual(sorted((row["key"], row["qty"]) for row in snap["rows"]),
+                         [("godlies:Fang", 7), ("rares:Cowboy", 3), ("vintages:Cowboy", 3)], snap)
+        self.assertIn("проверьте вариант", self.rows(snap)["rares:Cowboy"]["badges"])
+        self.js("""
+            const row = [...$("calcBody").children].find((tr) => tr.querySelector("select.variant"));
+            const select = row.querySelector("select.variant");
+            select.value = "1";  // ружьё (второй вариант строки ножа)
+            select.dispatchEvent(new Event("change"));
+            return true;
+        """)
+        snap = self.snapshot()
+        self.assertEqual(sorted((row["key"], row["qty"]) for row in snap["rows"]),
+                         [("godlies:Fang", 7), ("vintages:Cowboy", 3)], snap)  # одна стопка — одна строка
+        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 2"), snap["calcStatus"])
+
+    def test_typed_quantity_is_kept(self):
+        self.offline = True
+        cells = [("godlies:Seer", "x12"), ("godlies:Fang", "x7")]
+        png_a, truth_a = shot(cells, 51)
+        png_b, truth_b = shot(cells, 52)
+        tiles = ocr_tiles(truth_a, unread=set(), missed=set())
+        tiles[0].update(score=0.9)  # «Seer» прочитано приблизительно — его картинка не запоминается
+        self.inventories[png_a] = ({"width": 0, "height": 0, "words": []}, tiles)
+        self.truths.update({png_a: ("A3", truth_a), png_b: ("B3", truth_b)})
+        self.run_calc(png_a, png_b)
+        snap = self.snapshot()
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()}, {"godlies:Seer": 12, "godlies:Fang": 7})
+        self.assertEqual(len(snap["unsure"]), 1, snap)  # Seer со скриншота B
+        self.qty_of("godlies:Seer", 5)  # «продаю только 5»
+        self.choose_other(0, "Seer")
+        self.wait('document.querySelectorAll("#calcPicTiles .pic-tile").length === 0')
+        self.assertEqual(self.rows(self.snapshot())["godlies:Seer"]["qty"], 5)
+
+    def test_prices_are_asked_in_parts(self):
+        self.watch_posts()
+        keys = [markets.item_id(item) for item in stock()] + [f"godlies:Fake {n}" for n in range(1200)]
+        self.js(f"""
+            PicTiles._state.pics.templates = new Map();
+            await PicTiles._state.fetchTemplates({json.dumps(keys)});
+            return true;
+        """)
+        sizes = self.js('return seenPosts.filter(([url]) => url === "/api/calc").map(([url, body]) => body.picked.length);')
+        self.assertEqual(sum(sizes), len(keys))
+        self.assertTrue(all(size <= calc_module.MAX_PICKED for size in sizes), sizes)
+        known = self.js("return [...PicTiles._state.pics.templates.keys()];")
+        self.assertEqual(sorted(known), sorted(markets.item_id(item) for item in stock()))
+
+    def test_broken_pictures_are_not_a_lost_connection(self):
+        self.corrupt.update(url for url in self.pictures if url.startswith(SITE))  # больше OFFLINE_AFTER
+        self.run_calc(self.png_a, self.png_b)
+        snap = self.snapshot()
+        state = self.js("return { offline: PicTiles._state.refs.offline, failed: [...PicTiles._state.refs.failed] };")
+        self.assertFalse(state["offline"])
+        self.assertNotIn("нет связи", snap["status"])
+        self.assertIn("godlies:Seer|site", state["failed"])
+        self.assertEqual(self.rows(snap)["godlies:Seer"]["qty"], 12)
+
+    def test_blocking_site_is_not_asked_again_and_again(self):
+        self.site_blocked = True
+        self.run_calc(self.png_a, self.png_b)
+        self.wait("!PicTiles._state.refs.warming")
+        snap = self.snapshot()
+        site = [url for url in self.downloads if url.startswith(SITE)]
+        self.assertTrue(1 <= len(site) <= imgproxy.PARALLEL, site)  # дальше сервер отвечает сам: пауза сайта
+        self.assertIn(MARKET["rares:Cowboy"], self.downloads)  # другой сайт картинок — как обычно
+        self.assertIn("не пускает", snap["status"])
+        self.assertEqual(self.rows(snap)["ancients:Harvester"]["qty"], 3)  # названия — как раньше
+
 
 if __name__ == "__main__":
     unittest.main()
