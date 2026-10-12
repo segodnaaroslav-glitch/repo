@@ -91,9 +91,9 @@ class Site:
 
 
 def _alive_with(text):
-    """Живые процессы (не зомби), в командной строке которых есть text (Linux)."""
+    """Живые процессы (не зомби), в командной строке которых есть text (Linux; без /proc — пусто)."""
     found = []
-    for pid in os.listdir("/proc"):
+    for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
         if not pid.isdigit():
             continue
         try:
@@ -326,6 +326,29 @@ more.onclick = add;
 </script></body></html>"""
 
 
+def _card(n, inner):
+    return f'<a href="/mm2/product/item-{n}/{_uuid(n)}">{inner}</a>'
+
+
+# Карточки, где у надписи несколько текстовых узлов: цена — целая и дробная части в разных
+# span, название — из нескольких узлов (как рисуют React и Vue), скрытая старая цена.
+SPLIT_TEXT = ("<html><body><div class='grid'>"
+              + _card(1, "<p>Item 1</p><b>от <span>231</span><span>,71</span> ₽</b><i>1 лотов</i>")
+              + _card(2, "<p><b>Chroma</b> Seer</p><b>от 101 ₽</b><i>2 лотов</i>")
+              + _card(3, "<p id='react'></p><b>от <span>1 234</span>.<span>50</span> ₽</b>")
+              + _card(4, "<p>Item 4</p><s style='display:none'>от 999 ₽</s><b>от 44 ₽</b><i>4</i> лотов")
+              + _card(5, "<p>Item 5</p><i>114</i><b>от 230 ₽</b>")
+              + "</div><script>document.getElementById('react').append('Chroma', ' ', 'Lugers')</script></body></html>")
+
+
+def page_list(numbers, more=""):
+    return f"<html><body><div class='grid'>{two_link_cards(numbers)}</div>{more}</body></html>"
+
+
+def form_more(page):
+    return f'<form action=""><input type="hidden" name="page" value="{page}"><button>Показать ещё</button></form>'
+
+
 @unittest.skipUnless(_test_browser(), "нет Edge/Chrome для проверки скрытого браузера")
 class BrowserPageTests(unittest.TestCase):
     """Один браузер на все проверки: открывается каждая страница по очереди."""
@@ -344,6 +367,19 @@ class BrowserPageTests(unittest.TestCase):
             "/never": "hang",
             "/hop": "<html><body><script>setTimeout(() => location.replace('/plain'), 500)</script></body></html>",
             "/plain": "<html><body>ok</body></html>",
+            "/split": SPLIT_TEXT,
+            "/early": "<html><head><script>location.replace('/grid')</script></head><body></body></html>",
+            # «Показать ещё» уводит на другой адрес: отправка формы, переход скриптом, ссылка на ту же страницу.
+            "/f": page_list(range(1, 4), form_more(2)),
+            "/f?page=2": page_list(range(4, 7), "<button onclick=\"location.href='/f?page=3'\">Показать ещё</button>"),
+            "/f?page=3": page_list(range(7, 10), '<a href="/f?page=4"><button>Показать ещё</button></a>'),
+            "/f?page=4": page_list(range(10, 13)),
+            "/loop": page_list(range(1, 4), form_more(2)),
+            "/loop?page=2": page_list(range(4, 7), form_more(2)),
+            "/self": page_list(range(1, 4), '<a href="/self">Показать ещё</a>'),
+            "/pg": page_list(range(1, 4), '<a href="?page=2">Показать ещё</a>'),
+            **{f"/pg?page={n}": page_list(range(3 * n - 2, 3 * n + 1), f'<a href="?page={n + 1}">Показать ещё</a>'
+                                         if n < 5 else "") for n in range(2, 6)},
             "/a": '{"page": "a"}',
             "/b": '{"page": "b"}',
             "/c": '{"page": "c"}',
@@ -380,6 +416,17 @@ class BrowserPageTests(unittest.TestCase):
                              {"name": f"Item {n}", "price": 100 + n + 0.5, "lots": n})
         self.assertEqual(result["title"], "Рынок")
 
+    def test_card_text_keeps_split_prices_and_names(self):
+        result = self.collect("/split")
+        found = {int(c["href"].rsplit("-", 1)[1]): dreampets.parse_card_text(c["text"]) for c in result["cards"]}
+        self.assertEqual(found, {
+            1: {"name": "Item 1", "price": 231.71, "lots": 1},  # не 71: "231" и ",71" — одна надпись
+            2: {"name": "Chroma Seer", "price": 101, "lots": 2},  # не "Seer"
+            3: {"name": "Chroma Lugers", "price": 1234.5, "lots": None},
+            4: {"name": "Item 4", "price": 44, "lots": 4},  # скрытая цена не читается
+            5: {"name": "Item 5", "price": 230, "lots": None},  # не 114230
+        })
+
     def test_load_more_button_is_pressed(self):
         result = self.collect("/buttons")
         self.assertEqual(sorted(dreampets.parse_card_text(c["text"])["price"] for c in result["cards"]),
@@ -391,6 +438,44 @@ class BrowserPageTests(unittest.TestCase):
         self.assertEqual(sorted(int(c["href"].rsplit("-", 1)[1]) for c in result["cards"]), list(range(1, 7)))
         self.assertEqual(result["pages"], 2)
         self.assertEqual(len(self.site.requested("/paged?page=2")), 1)
+
+    def test_load_more_that_navigates_keeps_every_page(self):
+        result = self.collect("/f")
+        self.assertEqual(sorted(int(c["href"].rsplit("-", 1)[1]) for c in result["cards"]), list(range(1, 13)))
+        self.assertEqual(result["pages"], 4)
+        self.assertEqual([len(self.site.requested(p)) for p in ("/f", "/f?page=2", "/f?page=3", "/f?page=4")],
+                         [1, 1, 1, 1])
+
+    def test_load_more_that_keeps_navigating_is_pressed_once_per_address(self):
+        result = self.collect("/loop")
+        self.assertEqual(sorted(int(c["href"].rsplit("-", 1)[1]) for c in result["cards"]), list(range(1, 7)))
+        self.assertLessEqual(len(self.site.requested("/loop?page=2")), 2)
+        before = len(self.site.requested("/self"))
+        result = self.collect("/self")  # ссылка на эту же страницу, а она перезагружается
+        self.assertEqual(len(result["cards"]), 3)
+        self.assertLessEqual(len(self.site.requested("/self")) - before, 2)
+
+    def test_link_pages_continue_where_the_last_pass_stopped(self):
+        def numbers(result):
+            return sorted(int(c["href"].rsplit("-", 1)[1]) for c in result["cards"])
+
+        first = self.collect("/pg", max_pages=2)
+        self.assertEqual(numbers(first), list(range(1, 7)))
+        self.assertTrue(first["next"].endswith("/pg?page=3"))
+        second = self.collect("/pg", max_pages=3, resume=first["next"])
+        self.assertEqual(numbers(second), [1, 2, 3] + list(range(7, 13)))  # первая страница и дальше 3-я, 4-я
+        self.assertTrue(second["next"].endswith("/pg?page=5"))
+        last = self.collect("/pg", max_pages=3, resume=second["next"])
+        self.assertEqual(numbers(last), [1, 2, 3, 13, 14, 15])
+        self.assertIsNone(last["next"])  # дошли до конца — в следующий раз с начала
+        self.assertEqual(numbers(self.collect("/pg")), list(range(1, 16)))
+
+    def test_redirect_before_dom_ready_does_not_wait_for_the_timeout(self):
+        started = time.time()
+        result = self.collect("/early")
+        self.assertLess(time.time() - started, 15)
+        self.assertEqual(len(result["cards"]), 10)
+        self.assertFalse([note for note in self.browser.notes if "не загрузилась" in note])
 
     def test_page_that_navigates_after_load(self):
         result = self.collect("/challenge")
@@ -476,13 +561,14 @@ class BrowserLifetimeTests(unittest.TestCase):
     def test_close_all_kills_live_browsers(self):
         browser = cdp.Browser(_test_browser())
         self.addCleanup(browser.close)
-        profile = browser.profile
+        profile, process = browser.profile, browser.process
         self.assertIn(browser, cdp.live_browsers())
-        self.assertTrue(_alive_with(profile))
         cdp.close_all()
         self.assertNotIn(browser, cdp.live_browsers())
-        self.assertEqual(_wait_gone(profile), [])
-        self.assertFalse(os.path.exists(profile))
+        self.assertIsNotNone(process.poll())
+        if os.path.isdir("/proc"):  # дочерние процессы браузера и профиль — проверка через /proc (не Windows)
+            self.assertEqual(_wait_gone(profile), [])
+            self.assertFalse(os.path.exists(profile))
         browser.close()  # владелец закрывает ещё раз — без ошибок
 
     @unittest.skipIf(sys.platform.startswith("win"), "проверка через /proc")
@@ -512,6 +598,117 @@ class BrowserLifetimeTests(unittest.TestCase):
                 else:
                     import shutil
                     shutil.rmtree(profile, ignore_errors=True)
+
+
+# --- проход браузера DreamPets ------------------------------------------------------
+
+def _adapter(base, cache):
+    adapter = markets.DreamPetsAdapter({"id": "dreampets", "title": "DreamPets", "kind": "dreampets",
+                                        "url": base + "/mm2/"}, cache)
+    adapter.root = base
+    adapter.report = {"steps": []}
+    adapter.sources, adapter.fresh, adapter.fresh_price = {}, set(), set()
+    return adapter
+
+
+class FakeBrowser:
+    """Вместо браузера: страницы товаров отвечают по номеру товара (журнал — requested)."""
+
+    requested = []
+    answers = {}  # номер -> (код, текст)
+    result = {"cards": [], "api": [], "title": "", "pages": 1, "url": None, "next": None}
+
+    def __init__(self, *args, **kwargs):
+        self.notes = []
+        self.kwargs = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def open(self, url, **kwargs):
+        pass
+
+    def collect_cards(self, selector, **kwargs):
+        FakeBrowser.collect_kwargs = kwargs
+        return dict(self.result)
+
+    def fetch_many(self, urls, **kwargs):
+        out = {}
+        for url in urls:
+            FakeBrowser.requested.append(url)
+            out[url] = self.answers[int(url.rsplit("-", 1)[1])]
+        return out, None
+
+
+class DreamPetsBrowserPassTests(unittest.TestCase):
+    def setUp(self):
+        FakeBrowser.requested = []
+        patch = unittest.mock.patch.object(markets.cdp, "Browser", FakeBrowser)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_failing_product_pages_do_not_pin_the_queue(self):
+        base = "https://dreampets.gg"
+        page = ('<html><head><title>Item {n} — купить в ММ2</title><meta name="description" '
+                'content="Купить Item {n} от {n}0 ₽, {n} лотов."></head></html>')
+        products = {}
+        for n in range(1, 41):  # 20 отвечают 500, 10 не отвечают (прерваны), 10 хорошие — в конце
+            products[_uuid(n)] = {"name": f"Item {n}", "url": f"{base}/mm2/product/item-{n}/{_uuid(n)}"}
+        FakeBrowser.answers = {n: (500, "") if n <= 20 else (0, "запрос прерван") if n <= 30
+                               else (200, page.format(n=n)) for n in range(1, 41)}
+        adapter = _adapter(base, {})
+        for _ in range(2):
+            adapter._browser_pass(base + "/mm2/", products, time.time(), read_pages=True)
+            time.sleep(0.01)
+        good = [u for u in FakeBrowser.requested if int(u.rsplit("-", 1)[1]) > 30]
+        self.assertEqual(len(good), 10)  # во втором проходе — уже хорошие страницы
+        self.assertEqual(products[_uuid(35)]["price"], 350)
+        self.assertTrue(all(products[_uuid(n)].get("page_at") for n in range(1, 41)))
+
+    def test_refusal_that_stops_the_pass_is_not_counted(self):
+        base = "https://dreampets.gg"
+        products = {_uuid(n): {"name": f"Item {n}", "url": f"{base}/mm2/product/item-{n}/{_uuid(n)}"} for n in (1, 2)}
+        FakeBrowser.answers = {1: (404, ""), 2: (429, "Too Many Requests")}
+        _adapter(base, {})._browser_pass(base + "/mm2/", products, time.time(), read_pages=True)
+        self.assertTrue(products[_uuid(1)].get("page_at"))
+        self.assertFalse(products[_uuid(2)].get("page_at"))  # отказ площадки — в следующий раз снова первой
+
+    def test_next_market_page_is_remembered_between_passes(self):
+        cache = {}
+        with unittest.mock.patch.dict(FakeBrowser.result, {"next": "https://dreampets.gg/mm2/?page=11"}):
+            _adapter("https://dreampets.gg", cache)._browser_pass("https://dreampets.gg/mm2/", {}, time.time(), False)
+        self.assertEqual(cache["browser_next"], "https://dreampets.gg/mm2/?page=11")
+        _adapter("https://dreampets.gg", cache)._browser_pass("https://dreampets.gg/mm2/", {}, time.time(), False)
+        self.assertEqual(FakeBrowser.collect_kwargs.get("resume"), "https://dreampets.gg/mm2/?page=11")
+        self.assertIsNone(cache["browser_next"])  # дошли до конца — в следующий раз с начала
+
+
+SPA_WITH_GUEST_API = """<html><head><title>DreamPets — MM2</title></head><body><div id="app"></div><script>
+fetch('/api/me').catch(() => null).then(() => fetch('/api/catalog?game=mm2')).then((r) => r.json()).then((data) => {
+  for (const p of data.items)
+    document.getElementById('app').insertAdjacentHTML('beforeend', '<div><a href="/mm2/product/' + p.slug + '/'
+      + p.id + '"><p>' + p.title + '</p></a><b>от ' + p.minPrice + ' ₽</b></div>');
+});
+</script></body></html>"""
+
+
+@unittest.skipUnless(_test_browser(), "нет Edge/Chrome для проверки скрытого браузера")
+class DreamPetsBrowserApiTests(unittest.TestCase):
+    def test_forbidden_guest_endpoint_does_not_stop_api_discovery(self):
+        items = [{"id": _uuid(n), "slug": f"item-{n}", "title": f"Item {n}", "minPrice": 10 + n, "lotsCount": n}
+                 for n in range(1, 13)]
+        site = Site({"/mm2/": SPA_WITH_GUEST_API, "/api/me": (403, "application/json", '{"error": "guest"}'),
+                     "/api/catalog?game=mm2": (200, "application/json", json.dumps({"items": items}))})
+        self.addCleanup(site.close)
+        cache = {}
+        with unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=_test_browser()):
+            _adapter(site.base, cache)._browser_pass(site.base + "/mm2/", cache.setdefault("products", {}),
+                                                     time.time(), read_pages=False)
+        self.assertEqual(cache.get("api_urls"), [site.base + "/api/catalog?game=mm2"])
+        self.assertEqual(len(cache["products"]), 12)
 
 
 if __name__ == "__main__":

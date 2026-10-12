@@ -927,7 +927,10 @@ class DreamPetsAdapter(Adapter):
         with cdp.Browser() as browser:
             try:
                 browser.open(base, settle=1)
-                result = browser.collect_cards(self._CARD_SELECTOR)
+                # Постраничный рынок: прошлый проход остановился на странице "browser_next" — после
+                # первой страницы продолжаем с неё, так за несколько проходов читаются все страницы.
+                result = browser.collect_cards(self._CARD_SELECTOR, resume=self.cache.get("browser_next"))
+                self.cache["browser_next"] = result.get("next")
                 cards = result["cards"]
                 for card in cards:
                     link = dreampets.PRODUCT_PATH_RE.search(card.get("href") or "")
@@ -946,7 +949,9 @@ class DreamPetsAdapter(Adapter):
                 api = [u for u in result.get("api") or [] if not self._STATIC_RE.search(u.split("#")[0])]
                 own = re.match(r"https?://[^/]+", base).group(0)
                 api.sort(key=lambda u: not u.startswith(own))  # сначала адреса самой площадки
-                responses, stop = browser.fetch_many(api[:20], pause=0.3, deadline=40) if api else ({}, None)
+                # 403 одного адреса (например, «кто я» для гостя) — не запрет площадки: идём дальше.
+                responses, stop = (browser.fetch_many(api[:20], pause=0.3, deadline=40, stop_on=(429, 503))
+                                   if api else ({}, None))
                 if stop:
                     self._step("browser-api", f"прочитано {len(responses)} из {len(api[:20])}", stop)
                 useful = []
@@ -981,8 +986,10 @@ class DreamPetsAdapter(Adapter):
                 parsed = dreampets.parse_product_page(text)
                 if parsed["price"] is not None or parsed["lots"] is not None:
                     self._upsert(products, parsed, time.time(), "браузер", key=key)
-            if status in (200, 404) and key in products:
-                products[key]["page_at"] = time.time()  # прочитана: в конец очереди (отказ — не в счёт)
+            if key in products and status not in (403, 429, 503):
+                # В конец очереди — и при ошибке (500, нет ответа): иначе такая страница вечно
+                # стояла бы первой. Только отказ площадки, остановивший чтение, — не в счёт.
+                products[key]["page_at"] = time.time()
 
     # --- результат ---
 

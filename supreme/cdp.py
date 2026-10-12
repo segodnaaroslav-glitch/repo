@@ -532,21 +532,30 @@ class Browser:
         result = self.call("Page.navigate", {"url": url}, timeout=timeout)
         if result.get("errorText") and "ERR_ABORTED" not in result["errorText"]:
             raise BrowserError(f"страница не открылась: {result['errorText']}")
-        loader = result.get("loaderId")  # события именно этой загрузки, а не прошлой страницы
+        # События этой загрузки, а не прошлой страницы. Если страница сразу ушла дальше
+        # (переадресация скриптом, проверка площадки), ждём уже новую: её номер — из frameNavigated.
+        loaders, frame = {result.get("loaderId")}, result.get("frameId")
+        events = ("Page.lifecycleEvent", "Page.frameNavigated")
 
         def stage(name):
-            return lambda params: params.get("name") == name and params.get("loaderId") == loader
+            def match(params):
+                info = params.get("frame") or {}
+                if info.get("loaderId") and not info.get("parentId") and info.get("id") == frame:
+                    loaders.add(info["loaderId"])
+                    return False
+                return params.get("name") == name and params.get("loaderId") in loaders
+            return match
 
         deadline = time.time() + timeout
         try:
-            if loader:
-                self.wait_event("Page.lifecycleEvent", timeout=timeout, match=stage("DOMContentLoaded"))
+            if result.get("loaderId"):
+                self.wait_event(events, timeout=timeout, match=stage("DOMContentLoaded"))
         except TimeoutError:
             self.notes.append(f"страница {url} не загрузилась за {timeout} с — читаю что есть")
         else:
             try:
-                if loader:
-                    self.wait_event("Page.lifecycleEvent", match=stage("load"),
+                if result.get("loaderId"):
+                    self.wait_event(events, match=stage("load"),
                                     timeout=max(0.5, min(load_wait, deadline - time.time())))
             except TimeoutError:
                 self.notes.append(f"страница {url} не догрузилась (часть файлов не пришла) — читаю что есть")
@@ -555,35 +564,55 @@ class Browser:
 
     # --- чтение страниц ---
 
-    def collect_cards(self, selector, rounds=40, timeout=150, wait_cards=30, max_pages=5, pause=0.7, stable_rounds=3):
+    def collect_cards(self, selector, rounds=40, timeout=150, wait_cards=30, max_pages=10, pause=0.7, stable_rounds=3,
+                      resume=None):
         """Докрутить список до конца и собрать карточки товаров.
 
         Работает короткими шагами, а собранное хранится здесь: если страница сама
         ушла на другой адрес (проверка площадки закончилась, переадресация), уже
         прочитанное не теряется и чтение продолжается на новой странице. «Показать
-        ещё» нажимается, только если это кнопка; если это обычная ссылка на
-        следующую страницу — она открывается (не больше max_pages страниц).
-        -> {"cards": [{"href", "text", "inner"}], "api": [...], "title", "pages", "url"}
+        ещё» нажимается после чтения шага; если нажатие увело на другую страницу,
+        это следующая страница (не больше max_pages), а на прежнем адресе кнопка
+        больше не нажимается. Обычная ссылка на следующую страницу открывается.
+        resume — страница, на которой остановился прошлый проход (его "next"): после
+        первой страницы чтение продолжается с неё, а не со второй.
+        -> {"cards": [{"href", "text", "inner"}], "api": [...], "title", "pages", "url",
+            "next": следующая страница, до которой не дошли, или None}
         """
         cards, api = {}, {}
-        title = url = None
+        title = url = following = None
         pages, navigations, scrolls, visited = 1, 0, 0, set()
+        no_click = set()  # адреса, где «Показать ещё» уводит на другую страницу
+        clicked_from = None  # адрес, где прошлый шаг нажал «Показать ещё»
+        expect_nav = False  # нажатие уже засчитано как новая страница, страница уходит
         deadline = time.time() + timeout
         waiting_since = time.time()
         last, stable, errors = -1, 0, 0
-        script = JS_CARDS_ROUND % (json.dumps(selector), int(pause * 1000))
+
+        def page_change(origin):  # нажатие «Показать ещё» увело на другую страницу
+            nonlocal pages, last, stable, scrolls, waiting_since
+            pages += 1
+            no_click.add(origin)
+            last, stable, scrolls, waiting_since = -1, 0, 0, time.time()
+
         while True:
             left = deadline - time.time()
             if left <= 1:
                 self.notes.append("карточки: время вышло")
                 break
+            script = JS_CARDS_ROUND % (json.dumps(selector), int(pause * 1000), json.dumps(pages < max_pages),
+                                       json.dumps(sorted(no_click)))
             try:
                 result = self._evaluate(script, timeout=min(30, left)) or {}
             except NavigatedError:
-                navigations += 1
-                if navigations > 10:
-                    self.notes.append("карточки: страница всё время уходит на другой адрес")
-                    break
+                if clicked_from is not None:
+                    page_change(clicked_from)
+                elif not expect_nav:
+                    navigations += 1
+                    if navigations > 10:
+                        self.notes.append("карточки: страница всё время уходит на другой адрес")
+                        break
+                clicked_from, expect_nav = None, False
                 try:
                     self.wait_ready(timeout=min(30, max(1, deadline - time.time())))
                 except BrowserError as error:
@@ -602,16 +631,25 @@ class Browser:
                 time.sleep(0.5)
                 continue
             errors = 0
+            if clicked_from is not None and (result.get("newDoc") or result.get("leaving")):
+                page_change(clicked_from)  # уже на новой странице или уходит на неё
+                expect_nav = bool(result.get("leaving"))
+            elif not result.get("leaving"):
+                expect_nav = False
+            title, url = result.get("title"), result.get("url")
+            clicked_from = url if result.get("clicked") else None
+            if url:
+                visited.add(url)
             fresh = result.get("cards") or []
             for card in fresh:
                 if card.get("href"):
                     cards[card["href"]] = card
             for address in result.get("api") or []:
                 api[address] = True
-            title, url = result.get("title"), result.get("url")
+            following = result.get("next")
             count = result.get("count") or 0
             if not count:
-                if time.time() - waiting_since > wait_cards:
+                if time.time() - waiting_since > (wait_cards if pages == 1 else min(wait_cards, 10)):
                     break  # карточек так и нет — страница не та или не пустила
                 continue
             scrolls += 1
@@ -619,7 +657,8 @@ class Browser:
             last = count
             if stable < stable_rounds and scrolls < rounds:
                 continue
-            following = result.get("next")
+            if following and pages == 1 and resume and resume not in visited and _same_site(resume, url):
+                following = resume  # прошлый проход дошёл досюда — продолжаем с этого места
             if following and following not in visited and pages < max_pages:
                 visited.add(following)
                 pages += 1
@@ -631,7 +670,9 @@ class Browser:
                 last, stable, scrolls, waiting_since = -1, 0, 0, time.time()
                 continue
             break
-        return {"cards": list(cards.values()), "api": list(api)[:200], "title": title, "pages": pages, "url": url}
+        following = following if following and following not in visited else None
+        return {"cards": list(cards.values()), "api": list(api)[:200], "title": title, "pages": pages, "url": url,
+                "next": following}
 
     def fetch_many(self, urls, pause=1.0, timeout=15, deadline=60, stop_on=(403, 429, 503)):
         """Запросы изнутри страницы (с её cookies) — по одному, с паузой.
@@ -730,6 +771,11 @@ def _kill(process):
 def _forget(browser):
     with _LIVE_LOCK:
         _LIVE.discard(browser)
+
+
+def _same_site(one, other):
+    parts = [urllib.parse.urlsplit(str(u or "")) for u in (one, other)]
+    return parts[0].scheme in ("http", "https") and parts[0][:2] == parts[1][:2]
 
 
 def local_json(url, timeout=5):
@@ -862,42 +908,52 @@ JS_UA_DATA = r"""(async () => {
   return JSON.parse(JSON.stringify(d));
 })()"""
 
-# Один шаг чтения рынка: докрутить вниз, нажать «Показать ещё» (только если это кнопка
-# или ссылка на эту же страницу), вернуть новые и изменившиеся карточки (ссылка + текст).
+# Один шаг чтения рынка: докрутить вниз, прочитать новые и изменившиеся карточки (ссылка +
+# текст), и только потом нажать «Показать ещё» (кнопку или ссылку на эту же страницу) —
+# уже после ответа: если нажатие уведёт на другую страницу, прочитанное не пропадёт.
 # Карточка — самый большой блок вокруг ссылки, где все ссылки на товар ведут на один
-# товар (картинка и название часто — две отдельные ссылки, цена — вне обеих). Текст —
-# надписи блока по одной в строке (не innerText: "<i>114</i><b>23 ₽</b>" не "11423 ₽");
-# innerText — запасной вариант для "<i>3</i> лотов".
-JS_CARDS_ROUND = r"""(async (selector, wait) => {
+# товар (картинка и название часто — две отдельные ссылки, цена — вне обеих). Текст — как
+# innerText (блоки — с новой строки, строчные части склеиваются: "от <i>231</i><i>,71</i> ₽"
+# остаётся "от 231,71 ₽", "<b>Chroma</b> Seer" — "Chroma Seer"), но на стыке разных
+# элементов число не приклеивается к числу или слову: "<i>114</i><b>от 230 ₽</b>" —
+# "114" и "от 230 ₽" на разных строках, а не "114от 230 ₽".
+# newDoc — первый шаг на этом документе (страница сменилась), leaving — страница уже уходит.
+JS_CARDS_ROUND = r"""(async (selector, wait, click, noClick) => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const here = location.href.split('#')[0];
-  const label = /показать ещё|показать еще|загрузить ещё|загрузить еще|load more|show more/i;
-  const inPlace = (el) => {
-    if (el.tagName !== 'A') return true;
-    const href = (el.getAttribute('href') || '').trim();
-    return !href || href[0] === '#' || /^javascript:/i.test(href) || el.href.split('#')[0] === here;
-  };
-  window.scrollTo(0, document.documentElement.scrollHeight);
-  await sleep(wait);
-  let next = null;
-  for (const el of document.querySelectorAll('button, [role="button"], a')) {
-    const caption = (el.textContent || '').trim();
-    if (caption.length > 60 || !label.test(caption) || el.offsetParent === null || el.disabled) continue;
-    if (inPlace(el)) { next = null; try { el.click(); } catch (e) {} await sleep(wait); break; }
-    if (!next && el.href && el.origin === location.origin) next = el.href;
-  }
+  const newDoc = !window.__mm2Cards;
   const seen = window.__mm2Cards || (window.__mm2Cards = new Map());
   const boxes = window.__mm2Boxes || (window.__mm2Boxes = new Map());
-  const skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/;
+  if (newDoc) {
+    for (const name of ['beforeunload', 'pagehide']) addEventListener(name, () => { window.__mm2Leaving = true; });
+  }
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  await sleep(wait);
+  const skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|svg)$/;
+  const kind = (c) => /[0-9]/.test(c) ? 'd' : /[A-Za-z]/.test(c) ? 'l' : /[А-Яа-яЁё]/.test(c) ? 'c' : '';
   const textOf = (root) => {
-    const parts = [];
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      if (n.parentElement && skip.test(n.parentElement.tagName)) continue;
-      const t = n.nodeValue.replace(/\s+/g, ' ').trim();
-      if (t) parts.push(t);
-    }
-    return parts.join('\n');
+    let out = '', parent = null;
+    const visit = (node, visible) => {
+      if (node.nodeType === 3) {
+        const t = node.nodeValue.replace(/\s+/g, ' ');
+        if (!visible || !t) return;
+        const a = kind(out.slice(-1)), b = kind(t[0]);
+        if (parent !== node.parentElement && a && b && (a === 'd' || b === 'd' || a !== b)) out += '\n';
+        out += t;
+        parent = node.parentElement;
+        return;
+      }
+      if (node.nodeType !== 1 || skip.test(node.tagName)) return;
+      if (node.tagName === 'BR') { out += '\n'; return; }
+      const style = getComputedStyle(node);
+      if (style.display === 'none') return;
+      const block = !/^(inline|contents|ruby)/.test(style.display);
+      if (block) out += '\n';
+      for (const child of node.childNodes) visit(child, style.visibility === 'visible');
+      if (block) out += '\n';
+    };
+    visit(root, true);
+    return out.split('\n').map((line) => line.replace(/ +/g, ' ').trim()).filter(Boolean).join('\n');
   };
   const single = (el, href) => {
     for (const x of el.querySelectorAll(selector)) if (x.href !== href) return false;
@@ -925,9 +981,30 @@ JS_CARDS_ROUND = r"""(async (selector, wait) => {
   const api = performance.getEntriesByType('resource')
     .filter((e) => e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest')
     .map((e) => e.name);
+  const leaving = !!window.__mm2Leaving;
+  const label = /показать ещё|показать еще|загрузить ещё|загрузить еще|load more|show more/i;
+  const inPlace = (el) => {
+    if (el.tagName !== 'A') return true;
+    const href = (el.getAttribute('href') || '').trim();
+    return !href || href[0] === '#' || /^javascript:/i.test(href) || el.href.split('#')[0] === here;
+  };
+  let next = null, clicked = false;
+  for (const el of leaving ? [] : document.querySelectorAll('button, [role="button"], a')) {
+    const caption = (el.textContent || '').trim();
+    if (caption.length > 60 || !label.test(caption) || el.offsetParent === null || el.disabled) continue;
+    if (inPlace(el)) {
+      if (click && !noClick.includes(here)) {
+        clicked = true;
+        setTimeout(() => { try { el.click(); } catch (e) {} }, 50);
+      }
+      next = null;
+      break;
+    }
+    if (!next && el.href && el.origin === location.origin) next = el.href;
+  }
   return { cards: fresh, count: hrefs.size, api: [...new Set(api)].slice(0, 200), title: document.title,
-           next, url: location.href };
-})(%s, %d)"""
+           next, url: here, clicked, newDoc, leaving };
+})(%s, %d, %s, %s)"""
 
 # Один запрос изнутри страницы: с её cookies, с пределом времени; HTML — без стилей,
 # картинок и обычных скриптов (данные страницы — JSON-LD, __NEXT_DATA__ и т. п. — остаются).
