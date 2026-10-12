@@ -8,6 +8,7 @@
 пары — одинаковый силуэт с другими цветами (Chroma) и одинаковое название (Cowboy).
 """
 
+import math
 import random
 import struct
 import zlib
@@ -244,6 +245,31 @@ def reference(key, size=110, fill=0.94, shift=(0.0, 0.0)):
     inner = size * fill
     draw_item(canvas, key, (size - inner) / 2 + shift[0] * size, (size - inner) / 2 + shift[1] * size, inner)
     return canvas
+
+
+def decoy(seed, size=110):
+    """Картинка «другого предмета»: случайные многоугольники случайных цветов (для отбора
+    кандидатов среди многих эталонов и проверки, что чужое не узнаётся уверенно)."""
+    rng = random.Random(seed)
+    canvas = Canvas(size, size)
+    for _ in range(rng.randint(2, 4)):
+        cx, cy, r = rng.uniform(0.25, 0.75), rng.uniform(0.25, 0.75), rng.uniform(0.12, 0.4)
+        points = []
+        for k in range(rng.randint(3, 7)):
+            angle = 6.2832 * k / 7 + rng.uniform(-0.3, 0.3)
+            dist = r * rng.uniform(0.5, 1.0)
+            points.append((size * (cx + dist * math.cos(angle)), size * (cy + dist * math.sin(angle))))
+        canvas.polygon(points, tuple(rng.randint(30, 250) for _ in range(3)) + (255,))
+    return canvas
+
+
+def add_noise(canvas, amount, seed=3):
+    """Шум сжатия скриншота: каждый канал ±amount."""
+    rng = random.Random(seed)
+    px = canvas.px
+    for i in range(0, len(px), 4):
+        for c in range(3):
+            px[i + c] = max(0, min(255, px[i + c] + rng.randint(-amount, amount)))
 
 
 # --- значок «xN»: шрифт 3x5 ---------------------------------------------------------------

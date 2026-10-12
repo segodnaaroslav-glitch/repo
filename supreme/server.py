@@ -314,17 +314,18 @@ class Handler(BaseHTTPRequestHandler):
         for number, shot in enumerate(shots, 1):
             if not isinstance(shot, dict) or not isinstance(shot.get("image"), str):
                 continue
-            boxes = []
+            # Ответ — по плитке на каждое место из запроса (в том же порядке); неверное место — 1 шт.
+            # «name» — чтобы tileocr.badge_regions взял плитку: название здесь не нужно.
+            tiles = []
             for box in (shot.get("boxes") if isinstance(shot.get("boxes"), list) else [])[:MAX_BADGE_TILES]:
-                if (isinstance(box, list) and len(box) == 4
-                        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in box)
-                        and 8 <= box[2] <= 10000 and 8 <= box[3] <= 10000 and abs(box[0]) <= 10 ** 5 and abs(box[1]) <= 10 ** 5):
-                    boxes.append([int(round(v)) for v in box])
+                ok = (isinstance(box, list) and len(box) == 4
+                      and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in box)
+                      and 8 <= box[2] <= 10000 and 8 <= box[3] <= 10000 and abs(box[0]) <= 10 ** 5 and abs(box[1]) <= 10 ** 5)
+                tiles.append({"name": "?" if ok else None, "box": [int(round(v)) for v in box] if ok else None,
+                              "qty": 1, "qty_from_badge": False})
             index = shot.get("index") if isinstance(shot.get("index"), int) else number - 1
-            # «name» — чтобы tileocr.badge_regions взял плитку: название здесь не нужно
-            tiles = [{"name": "?", "box": box, "qty": 1, "qty_from_badge": False} for box in boxes]
             read = False
-            if tiles:
+            if any(tile["box"] for tile in tiles):
                 try:
                     raw = base64.b64decode(shot["image"].split(",", 1)[-1], validate=False)
                     regions = tileocr.badge_regions(tiles)

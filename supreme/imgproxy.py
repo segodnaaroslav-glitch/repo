@@ -104,8 +104,8 @@ def _download(url, opener=None):
             body = response.read(MAX_BYTES + 1)
     except urllib.error.HTTPError as error:
         busy = error.code == 429 or error.code >= 500
-        raise ImageError(404 if error.code in (404, 410) else 502, f"сайт картинок ответил HTTP {error.code}",
-                         "busy" if busy else "final") from None
+        status = 404 if error.code in (404, 410) else 503 if busy else 502
+        raise ImageError(status, f"сайт картинок ответил HTTP {error.code}", "busy" if busy else "final") from None
     except (urllib.error.URLError, OSError, ValueError) as error:
         raise ImageError(503, f"нет связи с сайтом картинок ({error})", "network") from None
     if len(body) > MAX_BYTES:

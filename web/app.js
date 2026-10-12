@@ -1276,7 +1276,7 @@ async function runCalc() {
   button.disabled = true;
   $("calcStatus").textContent = calc.images.length ? "Распознаю скриншоты…" : "Считаю…";
   // Сравнение по картинкам (pictiles.js): плитки без названия, одинаковые названия.
-  const pictures = Boolean(window.PicTiles && calc.images.length);
+  const pictures = Boolean(window.PicTiles && window.PicMatch && calc.images.length);
   if (window.PicTiles) PicTiles.reset();
   const images = calc.images.slice();
   try {

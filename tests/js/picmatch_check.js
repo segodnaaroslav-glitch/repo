@@ -1,7 +1,7 @@
 // Проверка web/picmatch.js в Node (запускает tests/test_picmatch.py).
 // node picmatch_check.js job.json -> JSON в stdout.
-// job: {"images": [{"name", "file"}], "refs": {"ключ": ["файл", ...]}} — файлы в сыром формате
-// picgen.rgba_file (ширина, высота uint32 LE и RGBA).
+// job: {"images": [{"name", "file", "boxes"?}], "refs": {"ключ": ["файл", ...]}, "sure"?, "prior"?, "merge"?}
+// Файлы — в сыром формате picgen.rgba_file (ширина, высота uint32 LE и RGBA).
 "use strict";
 const fs = require("fs");
 const path = require("path");
@@ -14,21 +14,23 @@ function readRgba(file) {
 }
 
 const job = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const out = { images: [], roundtrip: [] };
 const refs = [];
 for (const [key, files] of Object.entries(job.refs || {})) {
   for (const file of files) {
     const feat = PM.refFeature(readRgba(file));
     // как в программе: признаки хранятся упакованными
-    refs.push({ key, feat: PM.unpack(PM.pack(feat)) });
+    const packed = PM.pack(feat);
+    const back = PM.unpack(packed);
+    out.roundtrip.push([key, packed.length, PM.similarity(feat, back).score]);
+    refs.push({ key, feat: back });
   }
 }
-const out = { images: [] };
 for (const image of job.images || []) {
   const img = readRgba(image.file);
   const started = Date.now();
   const tiles = PM.detectTiles(img);
   const result = { name: image.name, ms: Date.now() - started, tiles: [] };
-  const boxes = image.boxes || [];
   for (const t of tiles) {
     const feat = PM.tileFeature(img, t);
     const ranked = PM.rank(feat, refs, 4);
@@ -41,7 +43,7 @@ for (const image of job.images || []) {
     });
   }
   // плитки по месту из распознавания текста (приблизительному)
-  result.boxes = boxes.map((b) => {
+  result.boxes = (image.boxes || []).map((b) => {
     const t = PM.tileFromBox(img, b.box, b.badge_box || null, b.bg || null);
     if (!t) return null;
     const ranked = PM.rank(PM.tileFeature(img, t), refs, 4);
@@ -52,4 +54,5 @@ for (const image of job.images || []) {
 if (job.merge) out.merge = [...PM.mergeByKey(job.merge).entries()].map(([key, tiles]) => [key, tiles.map((t) => t.id)]);
 if (job.sure) out.sure = job.sure.map((ranked) => PM.sureKey(ranked));
 if (job.prior) out.prior = job.prior.map(([rgb, learned]) => PM.rarityPrior(PM.colorFromRgb(rgb), learned));
+if (job.apply) out.apply = job.apply.map(([ranked, categories]) => PM.applyPrior(ranked, categories).map((r) => [r.key, r.score]));
 process.stdout.write(JSON.stringify(out));

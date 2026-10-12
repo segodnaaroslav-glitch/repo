@@ -508,9 +508,10 @@
     };
     if (t.x0 < 0 || t.iconTop < 0 || t.x1 >= img.width || t.iconBottom >= img.height) return null;
     t.banner = { x0: t.x0, x1: t.x1, y0: Math.round(y + 1.08 * w), y1: Math.min(img.height - 1, Math.round(y + 1.31 * w) - 1) };
+    // значок, прочитанный вторым проходом, приходит без места — ищется в углу плитки
     t.badge = Array.isArray(badgeBox) && badgeBox.length === 4
       ? { x0: badgeBox[0], y0: badgeBox[1], x1: badgeBox[0] + badgeBox[2] - 1, y1: badgeBox[1] + badgeBox[3] - 1 }
-      : null;
+      : findBadge(img, t);
     t.color = colorFromRgb(bg);
     return t;
   }
