@@ -272,25 +272,59 @@ def lots_value(match):
     return int(re.sub(r"\D", "", match.group(1) or match.group(2))) if match else None
 
 
-def parse_card_text(text):
-    """Текст карточки товара -> {"name", "price", "lots"} (что удалось найти)."""
+def slug_fit(name, slug):
+    """Насколько название подходит к ссылке товара: 2 — то же или длиннее («Chroma Harvester»
+    для /harvester/), 1 — часть ссылки («Harvester» для /chroma-harvester/) или ссылки без
+    названия нет, 0 — другое («Knives», ник продавца)."""
+    if not slug:
+        return 1
+    key, slug_key = same_name(name), same_name(slug)
+    if key and slug_key in key:
+        return 2
+    return 1 if key and key in slug_key else 0
+
+
+def _glue(lines):
+    """Соседние надписи одной фразы — в одну строку: «от» + «328 ₽», «674» + «лотов»,
+    «1 299» + «₽». Число перед ценой («114» + «230,71 ₽») и название с числом перед
+    «Лотов пока нет» («Item 1») остаются отдельно."""
+    out = []
+    for line in lines:
+        if out and ((re.search(r"(?<![А-Яа-яЁёA-Za-z])от$", out[-1], re.I) and re.match(r"\d", line))
+                    or (re.search(r"\d$", out[-1]) and re.match(r"(?:₽|руб)", line, re.I))
+                    or (re.fullmatch(r"\d[\d  ]*", out[-1]) and re.match(r"лот", line, re.I))):
+            out[-1] += " " + line
+        else:
+            out.append(line)
+    return out
+
+
+def parse_card_text(text, slug=None):
+    """Текст карточки товара -> {"name", "price", "lots"} (что удалось найти).
+
+    slug — название из ссылки товара: из нескольких латинских надписей карточки (раздел
+    «Knives», ник продавца, название) берётся подходящая к ссылке."""
     lines = [re.sub(r"\s+", " ", line).strip() for line in str(text or "").splitlines()]
-    lines = [line for line in lines if line]
+    lines = _glue([line for line in lines if line])
     price = None
-    for number, line in enumerate(lines):
+    for line in lines:
         match = PRICE_FROM_RE.search(line) or PRICE_RE.search(line)
-        if not match and number + 1 < len(lines) and lines[number + 1].startswith("₽"):
-            match = PRICE_RE.search(f"{line} {lines[number + 1]}")
         if match:
             price = rub(match.group(1))
             break
     lots = next((lots_value(m) for m in (LOTS_RE.search(line) for line in lines) if m), None)
-    name = next((clean_name(line) for line in lines
-                 if re.search(r"[A-Za-z]", line) and "₽" not in line and not LOTS_RE.search(line)
-                 and not _BUTTON_RE.match(line) and not _RARITY_RE.match(line) and not _CHROMA_RE.match(line)
-                 and clean_name(line)), None)
-    if name and any(_CHROMA_RE.match(line) for line in lines) and not re.match(r"(?:chroma\b|c\.\s)", name, re.I):
-        name = "Chroma " + name
+    chroma = any(_CHROMA_RE.match(line) for line in lines)
+    names = []
+    for line in lines:
+        line = re.sub(r"^[^A-Za-z]*[А-Яа-яЁё][^A-Za-z]*(?=[A-Za-z])", "", line)  # «Только что купили: Harvester»
+        if (re.search(r"[A-Za-z]", line) and "₽" not in line and not LOTS_RE.search(line)
+                and not _BUTTON_RE.match(line) and not _RARITY_RE.match(line) and not _CHROMA_RE.match(line)
+                and not re.search(r"dreampets", line, re.I) and clean_name(line)):
+            name = clean_name(line)
+            if chroma and not re.match(r"(?:chroma\b|c\.\s)", name, re.I):
+                name = "Chroma " + name
+            names.append(name)
+    name = max(names, key=lambda n: slug_fit(n, slug)) if names else None  # при равенстве — первая
     return {"name": name, "price": price, "lots": lots}
 
 
@@ -308,25 +342,50 @@ _TAG_RE = re.compile(r"<!--.*?-->|<(/?)([a-zA-Z][a-zA-Z0-9:-]*)((?:[^>\"']|\"[^\
 _HREF_RE = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""", re.I)
 CARD_HREF_RE = re.compile(r"^(?:https?://[^/\"']*dreampets\.(?:gg|io))?(/mm2/product/[^\"'#?\s]+)", re.I)
 _CARD_TOP = {None, "html", "body", "main"}
+# Шапка, меню, подвал и боковая колонка страницы («Только что купили: Harvester», «Бонус от 500 ₽»)
+# — не карточка: карточка ссылки в них не выходит за их границу. Шапка и подвал внутри
+# <article>/<li> — части самой карточки.
+_CHROME = {"header", "nav", "footer", "aside"}
+_ITEM_TAGS = {"article", "li"}
 MAX_CARD = 50000  # символов разметки: одна ссылка на всю страницу — это уже не карточка
+MAX_CARD_TEXT = 600  # видимых символов (без пробелов): в карточке — название, цена, лоты и кнопки
 _HIDDEN_RE = re.compile(r"<(script|style|template|noscript|svg)\b.*?</\1\s*>", re.S | re.I)
 _BLOCK_TAG_RE = re.compile(r"</?(?:address|article|aside|blockquote|br|button|dd|div|dl|dt|figcaption|figure|footer|"
                            r"form|h[1-6]|header|hr|img|label|li|main|nav|ol|option|p|section|select|summary|table|"
                            r"tbody|td|tfoot|th|thead|tr|ul)\b[^>]*>", re.I)
+_RUB_RE = re.compile(r"₽|руб", re.I)
+_LOT_RE = re.compile(r"лот", re.I)
 
 
 def card_fragments(page_html):
     """[(путь товара, разметка его карточки)] — для каждой ссылки на товар MM2.
 
-    Карточка — самый большой элемент вокруг ссылки, где нет ссылок на другие товары
-    (ссылки на тот же товар — картинка и название — и на разделы или продавцов не
-    мешают). Так в карточку попадает всё: и цена до ссылки, и лоты после неё, но не
+    Карточка — элемент вокруг ссылки, где нет ссылок на другие товары (ссылки на тот же
+    товар — картинка и название — и на разделы или продавцов не мешают), не больше
+    MAX_CARD_TEXT видимых символов и не шире шапки или меню страницы. Подъём к большему
+    элементу кончается, когда в карточке уже есть цена и лоты или когда выше — другая цена
+    (баннер «от 500 ₽»). Так в карточку попадает и цена до ссылки, и лоты после неё, но не
     цена соседней карточки."""
     # Скрипты и стили — пробелами той же длины: позиции тегов не сдвигаются.
     page_html = _HIDDEN_RE.sub(lambda m: " " * len(m.group(0)), page_html or "")
-    root = {"tag": None, "start": 0, "end": len(page_html), "parent": None, "ids": set()}
+    # Счётчики с начала страницы: видимые символы, цены (₽), «лот» — у элемента это
+    # разница счётчиков на его конце и начале.
+    totals = [0, 0, 0]
+    last = 0
+
+    def count(chunk):
+        if chunk.strip():
+            chunk = html_lib.unescape(chunk) if "&" in chunk else chunk
+            totals[0] += len(re.sub(r"\s+", "", chunk))
+            totals[1] += len(_RUB_RE.findall(chunk))
+            totals[2] += len(_LOT_RE.findall(chunk))
+
+    root = {"tag": None, "start": 0, "end": len(page_html), "parent": None, "ids": set(), "item": False,
+            "chrome": False, "t0": (0, 0, 0), "t1": None}
     stack, anchors = [root], []
     for match in _TAG_RE.finditer(page_html):
+        count(page_html[last:match.start()])
+        last = match.end()
         closing, tag, attrs = match.group(1), (match.group(2) or "").lower(), match.group(3) or ""
         if not tag:
             continue  # комментарий
@@ -334,18 +393,20 @@ def card_fragments(page_html):
             for depth in range(len(stack) - 1, 0, -1):
                 if stack[depth]["tag"] == tag:
                     for node in stack[depth + 1:]:
-                        node["end"] = match.start()
-                    stack[depth]["end"] = match.end()
+                        node["end"], node["t1"] = match.start(), tuple(totals)
+                    stack[depth]["end"], stack[depth]["t1"] = match.end(), tuple(totals)
                     del stack[depth:]
                     break
             continue
         top = stack[-1]
         if top["tag"] in _IMPLIED_CLOSE.get(tag, ()) or (top["tag"] == "p" and tag in _CLOSES_P):
-            top["end"] = match.start()
+            top["end"], top["t1"] = match.start(), tuple(totals)
             stack.pop()
         if tag in _VOID_TAGS:
             continue
-        node = {"tag": tag, "start": match.start(), "end": len(page_html), "parent": stack[-1], "ids": set()}
+        node = {"tag": tag, "start": match.start(), "end": len(page_html), "parent": stack[-1], "ids": set(),
+                "item": stack[-1]["item"] or tag in _ITEM_TAGS, "chrome": tag in _CHROME and not stack[-1]["item"],
+                "t0": tuple(totals), "t1": None}
         stack.append(node)
         href = _HREF_RE.search(attrs) if tag == "a" else None
         path = CARD_HREF_RE.match(html_lib.unescape(next(g for g in href.groups() if g is not None))) if href else None
@@ -355,21 +416,35 @@ def card_fragments(page_html):
             while node is not None:
                 node["ids"].add(pid)
                 node = node["parent"]
+    count(page_html[last:])
+    for node in stack:
+        node["t1"] = node["t1"] or tuple(totals)
+
+    def stat(node, field):
+        return (node["t1"] or totals)[field] - node["t0"][field]
+
     cards = []
     for node, path in anchors:
-        while (node["parent"]["tag"] not in _CARD_TOP and len(node["parent"]["ids"]) <= 1
-               and node["parent"]["end"] - node["parent"]["start"] <= MAX_CARD):
-            node = node["parent"]
+        while True:
+            parent = node["parent"]
+            if (parent["tag"] in _CARD_TOP or parent["chrome"] or len(parent["ids"]) > 1
+                    or parent["end"] - parent["start"] > MAX_CARD or stat(parent, 0) > MAX_CARD_TEXT):
+                break
+            if stat(node, 1) and (stat(node, 2) or stat(parent, 1) > stat(node, 1)):
+                break  # цена уже есть, и лоты тоже — или выше чужая цена
+            node = parent
         cards.append((path, page_html[node["start"]:node["end"]]))
     return cards
 
 
 def visible_text(fragment):
     """Текст разметки по строкам. Соседние теги — разные надписи: "<i>114</i><b>230,71 ₽</b>"
-    — это "114" и "230,71 ₽", а не "114 230,71 ₽"; "1<span>,</span>320" остаётся "1,320"."""
+    и "<i>114</i> <b>230,71 ₽</b>" — это "114" и "230,71 ₽", а не "114 230,71 ₽";
+    "1<span>,</span>320" и "от <b>328</b> ₽" остаются одной надписью."""
     text = _HIDDEN_RE.sub(" ", fragment or "")
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     text = re.sub(r">(?=<)", ">\n", text)
+    text = re.sub(r"(</[^>]+>)[ \t\xa0]+(?=<[a-zA-Z])", "\\1\n", text)
     text = re.sub(r"<[^>]*>", "", _BLOCK_TAG_RE.sub("\n", text))
     lines = (re.sub(r"\s+", " ", html_lib.unescape(line)).strip() for line in text.split("\n"))
     return "\n".join(line for line in lines if line)
@@ -392,7 +467,8 @@ def _meta(page_html, names):
 _RELATED_RE = re.compile(r"^(?:похож|рекоменд|другие (?:товары|предметы|лоты)|с этим товаром|вам (?:может|также)|"
                          r"смотрите также|недавно просмотр|популярные|you may also|related|similar)", re.I)
 _PROMO_RE = re.compile(r"бонус|пополн|кэшб|кешб|cashback|промокод|скидк|депозит|реферал", re.I)
-_SOLD_RE = re.compile(r"продан|продаж|куплен", re.I)  # "Продано 1 250 лотов" — не лоты в продаже
+# "Продано 1 250 лотов", "Продажи за месяц: 1 250 лотов" — не лоты в продаже; "В продаже 674 лота" — они.
+_SOLD_RE = re.compile(r"продан|продал|продаж|куплен|купил", re.I)
 _SOLD_OUT_RE = re.compile(r"нет в наличии|нет лотов|нет предложений|распродан|закончил|out of stock|sold out", re.I)
 
 
@@ -460,17 +536,23 @@ def _main_lines(page_html):
     return lines[:end]
 
 
+def _before(line, start, cut):
+    """Текст той же фразы перед совпадением: не дальше 30 символов и не через cut
+    (конец предложения, цену): слово «кэшбэк» в конце описания к цене не относится."""
+    return re.split(cut, line[max(0, start - 30):start])[-1]
+
+
 def _scan(lines):
     """(цена «от N ₽», число лотов, «нет в наличии») в строках."""
     price = lots = None
     sold_out = False
-    for line in lines:
-        if price is None and not _PROMO_RE.search(line):
-            match = PRICE_FROM_RE.search(line)
-            price = rub(match.group(1)) if match else None
+    for line in _glue(lines):
+        if price is None:
+            price = next((rub(m.group(1)) for m in PRICE_FROM_RE.finditer(line)
+                          if not _PROMO_RE.search(_before(line, m.start(), r"[.;!?](?:\s|$)|₽"))), None)
         if lots is None:
-            lots = next((lots_value(m) for m in LOTS_RE.finditer(line) if not _SOLD_RE.search(line[:m.start()])),
-                        None)
+            lots = next((lots_value(m) for m in LOTS_RE.finditer(line) if not _SOLD_RE.search(
+                re.sub(r"в\s+продаже", "", _before(line, m.start(), r"[.,;!?](?:\s|$)|₽"), flags=re.I))), None)
         sold_out = sold_out or bool(_SOLD_OUT_RE.search(line))
     return price, lots, sold_out
 
@@ -481,7 +563,9 @@ def parse_product_page(page_html, url=None):
     Сначала данные страницы — только этого товара (по uuid/slug или названию); лоты,
     которых там нет, — из описания страницы или основного блока. Без данных — описание
     и основной блок, но не баннеры, не «продано N» и не «Похожие товары». Лотов нет
-    («Нет в наличии», «0 лотов») — price None, lots 0: товар не продаётся."""
+    («0 лотов», 0 в данных) — price None, lots 0: товар не продаётся. Если об этом
+    говорит только надпись («Нет в наличии») без цен и чисел, source — "phrase": на
+    странице, которую дорисовывает скрипт, такая надпись бывает и у товара с лотами."""
     page_html = page_html or ""
     name = _page_name(page_html)
     product = _page_product(page_html, name, *_page_link(page_html, url))
@@ -493,8 +577,10 @@ def parse_product_page(page_html, url=None):
         lots = product["lots"] if product["lots"] is not None else lots
     else:
         price, source = next((found[0] for found in (meta, main) if found[0] is not None), None), "text"
-    if lots == 0 or (price is None and lots is None and (meta[2] or main[2])):
-        price, lots = None, 0
+    if lots == 0:
+        price = None
+    elif price is None and lots is None and (meta[2] or main[2]):
+        price, lots, source = None, 0, "phrase"
     return {"name": name or (product["name"] if product else None), "price": price, "lots": lots, "source": source}
 
 

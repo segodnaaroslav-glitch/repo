@@ -134,16 +134,39 @@ class MissingPagesTests(DreamPetsCase):
         products = cache["products"]
         self.assertGreater(products[U3]["at"], 0)  # таймаут: очередь до него дошла
         self.assertNotIn("gemstone", offers)  # данных о нём нет — и не «нет в продаже»
-        self.assertEqual((products[U2]["price"], products[U2]["lots"], products[U2]["missing"]), (None, 0, 1))
-        self.assertEqual((offers["seer"]["available"], offers["seer"]["stock"]), (False, 0))
-        for _ in range(markets.DreamPetsAdapter.MISSING_DROP - 1):
+        self.assertEqual((products[U2]["price"], products[U2]["lots"], products[U2]["missing"]), (None, None, 1))
+        # Не продаётся, но лоты неизвестны (не 0): исчезнувшая страница — не купленные лоты.
+        self.assertEqual((offers["seer"]["available"], offers["seer"]["price"], offers["seer"]["stock"]),
+                         (False, None, None))
+        for _ in range(markets.DreamPetsAdapter.MISSING_DROP):
             self.adapter(site, cache).fetch()
-        self.assertNotIn(U2, cache["products"])  # 404 три раза подряд — запись удалена
+        self.assertIn(U2, cache["products"])  # 404 подряд, но за минуты (сбой площадки) — запись остаётся
+        cache["products"][U2]["missing_since"] -= markets.DreamPetsAdapter.MISSING_TIME
+        self.adapter(site, cache).fetch()
+        self.assertNotIn(U2, cache["products"])  # 404 подряд больше 12 часов — запись удалена
         self.assertIn(U2, cache["gone"])
         adapter = self.adapter(site, cache)
         self.assertNotIn("seer", self.offers(adapter))  # ссылка на рынке осталась, но запись не вернулась
         self.assertNotIn(U2, cache["products"])
         self.assertTrue(adapter.complete)
+
+        # Раз в GONE_RECHECK страница снятого товара проверяется снова: 404 — опять снят ...
+        requests = len(site.product_requests())
+        cache["gone"][U2] -= markets.DreamPetsAdapter.GONE_RECHECK
+        adapter = self.adapter(site, cache)
+        self.assertNotIn("seer", self.offers(adapter))
+        self.assertTrue(adapter.complete)
+        self.assertEqual(site.product_requests()[requests:].count(f"/mm2/product/seer/{U2}"), 1)
+        self.assertNotIn(U2, cache["products"])
+        self.assertGreater(cache["gone"][U2], time.time() - 60)
+        self.adapter(site, cache).fetch()
+        self.assertNotIn(U2, cache["products"])
+        # ... а страница снова есть — товар вернулся, хоть цену ему не дал ни один список.
+        site.routes[f"/mm2/product/seer/{U2}"] = page("Seer", "17", 82)
+        cache["gone"][U2] -= markets.DreamPetsAdapter.GONE_RECHECK
+        offers = self.offers(self.adapter(site, cache))
+        self.assertEqual((offers["Seer"]["price"], offers["Seer"]["stock"]), (17.0, 82))
+        self.assertNotIn(U2, cache["gone"])
 
     def test_gone_product_comes_back_when_listed_with_a_price(self):
         adapter = self.bare()
@@ -163,7 +186,7 @@ class MissingPagesTests(DreamPetsCase):
         site.routes["/mm2/"] = seer
         site.routes.pop(f"/mm2/product/harvester/{U1}")  # снят с продажи: 404
         harvester = self.offers(self.adapter(site, cache))["Harvester"]
-        self.assertEqual((harvester["price"], harvester["stock"], harvester["available"]), (None, 0, False))
+        self.assertEqual((harvester["price"], harvester["stock"], harvester["available"]), (None, None, False))
 
         entry = {"name": "Seer", "price": 17.0, "lots": 82, "at": 1, "url": f"{site.base}/mm2/product/seer/{U2}"}
         adapter = self.adapter(site, cache)
@@ -186,7 +209,7 @@ class ProductPageTests(unittest.TestCase):
                 f'<div><a href="/mm2/product/seer/{U2}">Seer</a><span>от 17 ₽</span><span>82 лота</span></div>'
                 '</body></html>')
         self.assertEqual(dreampets.parse_product_page(html), {"name": "Harvester", "price": None, "lots": 0,
-                                                              "source": "text"})
+                                                              "source": "phrase"})  # только надпись
         zero = page("Harvester", "328.98", 0)  # «0 лотов» — не продаётся, хоть цена и написана
         self.assertEqual((dreampets.parse_product_page(zero)["price"], dreampets.parse_product_page(zero)["lots"]),
                          (None, 0))
@@ -533,6 +556,276 @@ class CardTests(DreamPetsCase):
         self.assertEqual(products[U3]["name"], "Harvester")
         adapter._upsert(products, {"name": "Knife", "price": 300.0}, 1, "браузер", f"/mm2/product/harvester/{U3}")
         self.assertEqual(products[U3]["name"], "Harvester")
+
+
+
+class ReviewCardTests(DreamPetsCase):
+    """Карточки: раздел или продавец перед названием, шапка, пробел между надписями."""
+
+    def test_category_or_seller_link_before_the_title_is_not_the_name(self):
+        html = (f'<div class=card><a href=/mm2/catalog/knives>Knives</a><a href=/mm2/product/harvester/{U1}><img></a>'
+                f'<a href=/mm2/product/harvester/{U1}><p>Harvester</p></a><b>от 328 ₽</b><i>3 лотов</i></div>'
+                f'<div class=card><a href=/seller/ProTrader>ProTrader</a><a href=/mm2/product/seer/{U2}><p>Seer</p></a>'
+                f'<b>от 17 ₽</b></div>'
+                f'<div class=card><a href=/mm2/catalog/halloween>Halloween 2023</a>'
+                f'<a href=/mm2/product/chroma-harvester/{U3}><span>Chroma</span><p>Harvester</p></a><b>от 900 ₽</b></div>')
+        adapter = self.bare()
+        products = {}
+        adapter._absorb_market(html, products, 1)
+        self.assertEqual({k: (e["name"], e["price"], e.get("lots")) for k, e in products.items()},
+                         {U1: ("Harvester", 328.0, 3), U2: ("Seer", 17.0, None), U3: ("Chroma Harvester", 900.0, None)})
+
+    def test_listing_name_that_does_not_fit_the_link_does_not_rename(self):
+        adapter = self.bare()
+        products = {}
+        adapter._upsert(products, {"name": None}, 0, "slug", f"/mm2/product/harvester/{U1}")
+        adapter._upsert(products, {"name": "Knives", "price": 328.0}, 1, "страница рынка", f"/mm2/product/harvester/{U1}")
+        self.assertEqual((products[U1]["name"], products[U1]["price"]), ("harvester", 328.0))
+        adapter._upsert(products, {"name": "Chroma Harvester", "price": 900.0}, 1, "страница рынка",
+                        f"/mm2/product/harvester/{U1}")
+        self.assertEqual(products[U1]["name"], "Chroma Harvester")  # длиннее ссылки — можно
+        # Новая запись из браузера: ник продавца вместо названия — название из ссылки.
+        adapter._upsert(products, {"name": "ProTrader", "price": 17.0}, 1, "браузер", f"/mm2/product/seer/{U2}")
+        self.assertEqual(products[U2]["name"], "seer")
+        adapter._upsert(products, {"name": "Seer", "price": 17.0}, 1, "браузер", f"/mm2/product/seer/{U2}")
+        self.assertEqual(products[U2]["name"], "Seer")
+
+    def test_links_in_the_header_are_not_cards(self):
+        html = (f'<div id=__next><header><a href="/">DreamPets</a><div>Бонус при пополнении от 500 ₽</div>'
+                f'<div>Только что купили: <a href=/mm2/product/harvester/{U1}>Harvester</a></div></header>'
+                f'<main><div class=grid><div class=card><a href=/mm2/product/harvester/{U1}><p>Harvester</p></a>'
+                f'<b>от 328.98 ₽</b><i>674 лотов</i></div><div class=card><a href=/mm2/product/seer/{U2}><p>Seer</p></a>'
+                f'<b>от 17 ₽</b><i>82 лота</i></div></div></main></div>')
+        self.assertEqual(CardTests.prices(self, html), {"Harvester": (328.98, 674), "Seer": (17.0, 82)})
+        # Один товар на странице и баннер выше: карточка кончается на своей цене.
+        single = (f'<div id=__next><div class=promo>Бонус при пополнении от 500 ₽</div><div class=card>'
+                  f'<a href=/mm2/product/harvester/{U1}><p>Harvester</p></a><b>от 328.98 ₽</b></div></div>')
+        self.assertEqual(CardTests.prices(self, single), {"Harvester": (328.98, None)})
+        self.assertIsNone(dreampets.parse_card_text("DreamPets\nот 500 ₽")["name"])
+        # Товар только в шапке: ни цены баннера, ни «Только что купили» в названии.
+        ticker = html.split("<main>")[0] + "</div>"
+        self.assertEqual(CardTests.prices(self, ticker), {"Harvester": (None, None)})
+        # А шапка и подвал внутри <article> — части карточки.
+        article = (f'<div class=grid><article><header><a href=/mm2/product/harvester/{U1}>Harvester</a></header>'
+                   f'<footer><b>от 328.98 ₽</b> <i>674 лотов</i></footer></article><article><header>'
+                   f'<a href=/mm2/product/seer/{U2}>Seer</a></header><footer><b>от 17 ₽</b></footer></article></div>')
+        self.assertEqual(CardTests.prices(self, article), {"Harvester": (328.98, 674), "Seer": (17.0, None)})
+
+    def test_spaced_inline_tags_are_separate_labels(self):
+        self.assertEqual(CardTests.prices(self, f'<div><a href="/mm2/product/delta/{U1}"><p>Delta</p><i>114</i> '
+                                                f'<b>230,71 ₽</b></a></div>'), {"Delta": (230.71, None)})
+        # Одна фраза в соседних надписях — по-прежнему одна: «от» + цена, число + «лотов».
+        self.assertEqual(CardTests.prices(self, f'<div><a href="/mm2/product/delta/{U1}"><p>Delta</p><span>от</span> '
+                                                f'<b>230,71 ₽</b> <i>674</i> <span>лотов</span></a></div>'),
+                         {"Delta": (230.71, 674)})
+        self.assertEqual(dreampets.parse_product_page('<h1>Delta</h1><p><span>от</span> <b>230,71 ₽</b></p>'
+                                                      '<p><i>674</i> <span>лотов</span></p>')["price"], 230.71)
+
+
+class ReviewPageTextTests(unittest.TestCase):
+    """Описание страницы: «бонусы», «скидка», «продажа» и «в продаже» рядом с ценой и лотами."""
+
+    @staticmethod
+    def parsed(description, body='<div id="app"></div>'):
+        result = dreampets.parse_product_page(f'<html><head><title>Harvester — купить в ММ2</title><meta '
+                                              f'name="description" content="{description}"></head><body>{body}'
+                                              f'</body></html>')
+        return result["price"], result["lots"]
+
+    def test_promo_and_sale_words_elsewhere_in_the_description(self):
+        for description in (
+                "Купить Harvester в ММ2 от 328.98 ₽, 674 лотов. Моментальная доставка, кэшбэк и бонусы за покупку",
+                "Harvester в ММ2 от 328.98 ₽ со скидкой до 10%, 674 лотов",
+                "Продажа и покупка Harvester в ММ2 от 328.98 ₽, 674 лотов",
+                "Купить Harvester в ММ2 от 328.98 ₽. В продаже 674 лота."):
+            self.assertEqual(self.parsed(description), (328.98, 674), description)
+        # А рядом с числом эти слова по-прежнему значат не цену и не лоты в продаже.
+        self.assertEqual(self.parsed("Бонус при пополнении от 500 ₽. Harvester от 328.98 ₽"), (328.98, None))
+        self.assertEqual(self.parsed("Продано 1 250 лотов за месяц, в продаже 674 лота"), (None, 674))
+        self.assertEqual(self.parsed("Продажи за месяц: 1 250 лотов"), (None, None))
+
+    def test_in_stock_wording(self):
+        self.assertEqual(self.parsed("", "<h1>Harvester</h1><p>В продаже 674 лота</p>"), (None, 674))
+        self.assertEqual(self.parsed("Купить Harvester в ММ2. В продаже 0 лотов."), (None, 0))
+        self.assertEqual(dreampets.parse_product_page(
+            '<title>Harvester — купить в ММ2</title><meta name="description" content="В продаже 0 лотов">')["source"],
+            "text")  # «0 лотов» — число, а не только надпись
+
+
+class ReviewMissingTests(DreamPetsCase):
+    """404 — не покупки; блокировки карты сайта и API; перерыв в работе; долгий ответ."""
+
+    def monitor(self, routes):
+        path = self.tmp / "values.json"
+        data = store.empty_data()
+        store.replace_category(data, "godlies", [parser.make_item(name, "godlies", {"value": "100"})
+                                                 for name in ("Harvester", "Seer")], "site")
+        store.save(data, path)
+        site = self.site(routes)
+        config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": site.base + "/mm2/"}
+        monitor = markets.MarketMonitor(path, [config])
+        return site, monitor, monitor.markets[0]
+
+    def test_404_is_not_counted_as_bought_lots(self):
+        routes = {"/mm2/": links(("harvester", U1), ("seer", U2)),
+                  f"/mm2/product/harvester/{U1}": page("Harvester", "328.98", 5),
+                  f"/mm2/product/seer/{U2}": page("Seer", "17", 82)}
+        site, monitor, market = self.monitor(routes)
+        monitor.poll(market)
+        self.assertEqual((market.status, market.complete, market.offers["godlies:Seer"]["stock"]), ("ok", True, 82))
+        site.routes.pop(f"/mm2/product/seer/{U2}")  # 404: снят или сбой площадки
+        monitor.poll(market)
+        self.assertEqual(market.status, "ok")
+        seer = market.offers["godlies:Seer"]
+        self.assertEqual((seer["price"], seer["stock"], seer["available"]), (None, None, False))
+        self.assertEqual((market.sales, market.listed), ({}, {}))
+        site.routes[f"/mm2/product/seer/{U2}"] = page("Seer", "17", 82)  # вернулся
+        monitor.poll(market)
+        self.assertEqual(market.offers["godlies:Seer"]["stock"], 82)
+        self.assertEqual((market.sales, market.listed), ({}, {}))
+
+    def test_sitemap_refusal_is_not_a_block(self):
+        site = self.site({"/mm2/": links(("harvester", U1)), "/sitemap_index.xml": 403,
+                          f"/mm2/product/harvester/{U1}": page("Harvester", "328.98", 674)})
+        cache = {}
+        for _ in range(2):
+            adapter = self.adapter(site, cache)
+            offers = self.offers(adapter)
+            self.assertEqual(offers["Harvester"]["price"], 328.98)  # страницы товаров читаются
+            self.assertNotIn("не обновлена", adapter.note)
+        self.assertEqual(site.log.count("/sitemap_index.xml"), 1)  # в следующий раз — через час
+        self.assertGreater(cache["sitemap_at"], time.time() - 60)
+        # 503 карты сайта: остальную карту — в следующий раз, а страницы — сейчас.
+        site.routes["/sitemap.xml"] = 503
+        cache["sitemap_at"] = 0
+        requests = len(site.log)
+        offers = self.offers(self.adapter(site, cache))
+        self.assertEqual(offers["Harvester"]["price"], 328.98)
+        self.assertNotIn("/sitemap_index.xml", site.log[requests:])
+        self.assertIn(f"/mm2/product/harvester/{U1}", site.log[requests:])
+
+    def test_relative_sitemap_in_robots(self):
+        sitemap = f'<urlset><url><loc>{{base}}/mm2/product/seer/{U2}</loc></url></urlset>'
+        site = self.site({"/mm2/": links(("harvester", U1)), "/robots.txt": "User-agent: *\nSitemap: /maps/products.xml",
+                          f"/mm2/product/harvester/{U1}": page("Harvester", "328.98", 674),
+                          f"/mm2/product/seer/{U2}": page("Seer", "17", 82)})
+        site.routes["/maps/products.xml"] = sitemap.format(base=site.base)
+        offers = self.offers(self.adapter(site))
+        self.assertEqual((offers["Seer"]["price"], offers["Harvester"]["price"]), (17.0, 328.98))
+        self.assertIn("/maps/products.xml", site.log)
+
+    def test_api_rate_limit_is_a_pause_not_a_bad_address(self):
+        site = self.site({"/mm2/": links(("harvester", U1)), "/api/catalog": 429, "/api/other": 429,
+                          f"/mm2/product/harvester/{U1}": page("Harvester", "555", 9)})
+        cache = {"api_urls": [site.base + "/api/catalog", site.base + "/api/other"],
+                 "products": {U1: {"name": "Harvester", "price": 100.0, "lots": 5, "at": 1,
+                                   "url": f"{site.base}/mm2/product/harvester/{U1}"}}}
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "_browser_pass") as browser:
+            for _ in range(markets.DreamPetsAdapter.API_FAILS + 1):
+                cache["browser_at"] = 0
+                with self.assertRaises(markets.fetcher.BlockedError):
+                    self.adapter(site, cache).fetch()
+        self.assertEqual(browser.call_args[0][3], False)  # после 429 — без страниц товаров
+        self.assertEqual(cache["api_urls"], [site.base + "/api/catalog", site.base + "/api/other"])  # не забыт
+        self.assertFalse(cache.get("api_fails"))
+        self.assertEqual(site.log.count("/api/other"), 0)  # после первого 429 — ни одного запроса больше
+        self.assertEqual(site.product_requests(), [])
+        self.assertNotIn("/sitemap.xml", site.log)
+        self.assertEqual(cache["products"][U1]["price"], 100.0)
+
+    def test_time_while_the_program_was_closed_does_not_hide_prices(self):
+        keys = [uid(n) for n in range(1, 31)]
+        routes = {"/mm2/": links(*((f"item-{n}", key) for n, key in enumerate(keys, 1)))}
+        routes.update({f"/mm2/product/item-{n}/{key}": page(f"Item {n}", 10 + n, n) for n, key in enumerate(keys, 1)})
+        site = self.site(routes)
+        night = time.time() - 9 * 3600
+        cache = {"poll_at": night, "products": {
+            key: {"name": f"Item {n}", "price": 10.0 + n, "lots": n, "at": night, "seen": night, "page_at": night,
+                  "url": f"{site.base}/mm2/product/item-{n}/{key}"} for n, key in enumerate(keys, 1)}}
+        site.routes["/mm2/"] = links(*((f"item-{n}", key) for n, key in enumerate(keys[:2], 1)))  # на рынке — два
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "PAGES_PER_POLL", 3):
+            adapter = self.adapter(site, cache)
+            offers = self.offers(adapter)
+        self.assertEqual(len(offers), 30)  # «данные с прошлого запуска», пока страницы читаются по очереди
+        # А не подтверждённый 6 часов работы — по-прежнему скрыт.
+        cache["poll_at"] = time.time()
+        cache["products"][keys[-1]]["seen"] = time.time() - markets.DreamPetsAdapter.STALE_AFTER - 60
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "PAGES_PER_POLL", 0):
+            self.assertNotIn("Item 30", self.offers(self.adapter(site, cache)))
+
+    def test_slow_page_does_not_hold_the_poll(self):
+        class Trickle(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/mm2/":
+                    body = (f'<a href="/mm2/product/harvester/{U1}"><p>Harvester</p><b>от 328.98 ₽</b></a>'
+                            f'<a href="/mm2/product/seer/{U2}">Seer</a>').encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if not self.path.startswith("/mm2/product/"):
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)  # заголовки сразу, тело — по байту
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.2)
+                except OSError:
+                    pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets",
+                  "url": f"http://127.0.0.1:{httpd.server_address[1]}/mm2/"}
+        started = time.time()
+        with unittest.mock.patch.multiple(markets.DreamPetsAdapter, PAGES_TIME=1, PAGE_TIMEOUT=1):
+            adapter = markets.DreamPetsAdapter(config, {})
+            offers = {o["name"]: o for o in adapter.fetch()}
+        self.assertLess(time.time() - started, 4)  # не 8 секунд, пока сервер отдаёт по байту
+        self.assertEqual(offers["Harvester"]["price"], 328.98)
+
+
+class ReviewPhraseTests(DreamPetsCase):
+    """Надпись «Нет в наличии» на заготовке страницы, которую дорисовывает скрипт."""
+
+    def test_phrase_only_pages_keep_listing_prices_and_mark_pages_useless(self):
+        keys = [uid(n) for n in range(1, 9)]
+        shell = '<h1>Item {n}</h1><div><p>Лотов пока нет</p><p>Нет в наличии</p></div>'
+        routes = {"/mm2/": links(*((f"item-{n}", key) for n, key in enumerate(keys, 1)))}
+        routes.update({f"/mm2/product/item-{n}/{key}": shell.format(n=n) for n, key in enumerate(keys, 1)})
+        site = self.site(routes)
+        cache = {"products": {key: {"name": f"Item {n}", "price": 10.0 + n, "lots": 3, "at": 1, "source": "браузер",
+                                    "url": f"{site.base}/mm2/product/item-{n}/{key}"}
+                              for n, key in enumerate(keys, 1)}}
+        cache["products"][keys[0]]["source"] = markets.DreamPetsAdapter.PAGES  # цена была с самой страницы
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "_browser_pass"):
+            offers = {o["id"]: o for o in self.adapter(site, cache).fetch()}
+        self.assertEqual([offers[key]["price"] for key in keys[1:]], [10.0 + n for n in range(2, 9)])
+        self.assertEqual((offers[keys[0]]["price"], offers[keys[0]]["stock"]), (None, 0))
+        self.assertGreater(cache.get("pages_useless_until", 0), time.time())  # браузер снова понадобится
+
+    def test_browser_sold_out_page_clears_the_price(self):
+        # Так страницу товара передаёт и браузер: lots 0 — цены нет, название страницы не переименовывает.
+        adapter = self.bare()
+        products = {U1: {"name": "Harvester", "price": 328.98, "lots": 5, "at": 1, "source": "браузер",
+                         "url": f"https://dreampets.gg/mm2/product/harvester/{U1}"}}
+        adapter._upsert(products, {"name": "Seer", "price": None, "lots": 0, "source": "phrase"}, 2, "браузер", key=U1)
+        self.assertEqual([(o["name"], o["price"], o["stock"], o["available"]) for o in adapter._offers(products)],
+                         [("Harvester", None, 0, False)])
+        adapter._upsert(products, {"name": "Harvester", "price": 300.0, "lots": 0}, 3, "api", key=U1)
+        self.assertIsNone(products[U1]["price"])  # 0 лотов — не продаётся, какая бы цена ни была
 
 
 if __name__ == "__main__":

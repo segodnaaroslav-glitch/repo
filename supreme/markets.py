@@ -595,8 +595,10 @@ class DreamPetsAdapter(Adapter):
     BROWSER_EVERY = 10 * 60
     MAX_SITEMAPS = 40
     USELESS_PAGES = 6  # прочитано столько страниц, и ни на одной нет ни цены, ни лотов — рисуются скриптом
-    MISSING_DROP = 3  # страница товара — 404 столько раз подряд: запись удаляется
-    GONE_KEEP = 3 * 24 * 3600  # удалённый товар столько не возвращается из карты сайта (без цены)
+    MISSING_DROP = 3  # страница товара — 404 столько раз подряд ...
+    MISSING_TIME = 12 * 3600  # ... и не меньше столько времени с первого 404: запись удаляется
+    GONE_KEEP = 3 * 24 * 3600  # удалённый товар столько помнится снятым (ссылка без цены его не возвращает) ...
+    GONE_RECHECK = 6 * 3600  # ... но его страница раз в столько проверяется снова
     STALE_AFTER = 6 * 3600  # товар не подтверждён столько времени — его данные не показываются
     FORGET_AFTER = 7 * 24 * 3600  # ... а столько — запись удаляется из кэша
     API_FAILS = 3  # адрес данных из браузера столько раз подряд без товаров — забывается
@@ -626,6 +628,7 @@ class DreamPetsAdapter(Adapter):
         now = time.time()
         products = self.cache.setdefault("products", {})  # uuid -> данные товара
         self._migrate_cache(products, now)
+        self._skip_downtime(products, now)
         self._new_poll()
         blocked = None
 
@@ -638,14 +641,11 @@ class DreamPetsAdapter(Adapter):
             self._absorb_market(market_html, products, now)
 
         if not blocked:
-            self._api_urls(base, products, now)
+            blocked = self._api_urls(base, products, now)
 
         if not blocked and not self._stopped() and (
                 not products or now - self.cache.get("sitemap_at", 0) >= self.SITEMAP_EVERY):
-            try:
-                self._sitemaps(products)
-            except fetcher.BlockedError as error:
-                blocked = error
+            self._sitemaps(products)  # её отказ — не блокировка (см. _sitemaps)
 
         pages_useless = self.cache.get("pages_useless_until", 0) > now
         priced_now = sum(1 for key in products if key in self.fresh)
@@ -724,6 +724,20 @@ class DreamPetsAdapter(Adapter):
             self.cache["gone"] = {k: t for k, t in gone.items()
                                   if isinstance(t, (int, float)) and (now or time.time()) - t < self.GONE_KEEP}
 
+    def _skip_downtime(self, products, now):
+        """Время, когда программа была закрыта (или площадка долго не опрашивалась), не
+        считается «товар не подтверждён»: иначе после ночи почти все цены пропали бы до
+        конца круга по страницам. Отметки seen сдвигаются на этот перерыв."""
+        last = self.cache.get("poll_at")
+        interval = self.config.get("interval")
+        interval = interval if isinstance(interval, (int, float)) and interval > 0 else POLL_EVERY
+        pause = now - last - max(3 * interval, MAX_BACKOFF) if isinstance(last, (int, float)) else 0
+        if pause > 0:
+            for entry in products.values():
+                if isinstance(entry.get("seen"), (int, float)):
+                    entry["seen"] = min(now, entry["seen"] + pause)
+        self.cache["poll_at"] = now
+
     def _forget(self, products):
         """Товары, которых неделю не подтверждал ни один источник, — из кэша."""
         now = time.time()
@@ -765,10 +779,13 @@ class DreamPetsAdapter(Adapter):
 
         То же название, лучше записанное ("Eternal III" вместо "eternal iii"), — всегда можно.
         Ссылка и заголовок страницы товара известный товар не переименовывают. Название
-        из списка не заменяет название, совпадающее со ссылкой, и не укорачивает его
-        («Harvester» для /chroma-harvester/ — значок Chroma потерян); совпадающее со
-        ссылкой название, наоборот, исправляет неподходящее."""
+        из списка заменяет название из ссылки, только если подходит к ней: то же или длиннее
+        («Chroma Harvester» для /harvester/), но не короче («Harvester» для /chroma-harvester/
+        — значок Chroma потерян) и не другое («Knives» — раздел, ник продавца). Совпадающее
+        со ссылкой название, наоборот, исправляет неподходящее."""
         current = entry.get("name")
+        if not current and source not in ("slug", self.PAGES):
+            current = dreampets.slug_name(entry.get("url"))  # новая запись: название ссылки уже есть
         if not current:
             return False
         new, old = parser.name_key(name), parser.name_key(current)
@@ -784,7 +801,7 @@ class DreamPetsAdapter(Adapter):
             return False
         if old == slug_key and current != slug:
             return True
-        return new in slug_key
+        return slug_key not in new
 
     def _upsert(self, products, data, now, source, link=None, key=None):
         """Добавить или обновить товар: по ссылке (uuid), иначе по названию."""
@@ -800,11 +817,19 @@ class DreamPetsAdapter(Adapter):
             wanted = parser.name_key(name)
             key = self._named(products, wanted) or "name:" + wanted
         gone = self.cache.get("gone") or {}
+        recheck = False
         if key in gone:
-            if data.get("price") is None and data.get("lots") is None:
-                return None  # снят с продажи (404), а ссылка на него осталась, например, в карте сайта
-            gone.pop(key)  # снова продаётся
+            if data.get("price") is not None or data.get("lots") is not None:
+                gone.pop(key)  # снова продаётся
+            elif key not in products:
+                # Снят с продажи (404), а ссылка осталась, например, в карте сайта: раз в
+                # GONE_RECHECK страница проверяется снова (одна страница; 404 — опять снят).
+                if time.time() - gone[key] < self.GONE_RECHECK:
+                    return None
+                recheck = True
         entry = products.setdefault(key, {"at": 0})
+        if recheck:
+            entry.update(at=time.time(), page_at=0)  # данных нет, но и ждать нечего — страница первой в очереди
         entry["seen"] = time.time()  # источник подтвердил, что товар есть
         if link:
             entry["url"] = self._absolute(link)
@@ -834,6 +859,13 @@ class DreamPetsAdapter(Adapter):
             price = min(price, entry["price"])
         if by_name and key in self.fresh:
             lots = None  # цена и лоты этого опроса уже есть (те же данные из второго источника — не новые)
+        if price is not None or lots is not None:
+            entry.pop("missing", None)  # страница снова есть (или товар снова в списке)
+            entry.pop("missing_since", None)
+        if lots == 0:
+            # Лотов нет — не продаётся, какую бы цену ни показывал источник (последнюю, старую).
+            price = entry["price"] = None
+            entry["at"] = now or time.time()
         if price is not None:
             entry["price"] = price
             entry["at"] = now
@@ -890,17 +922,31 @@ class DreamPetsAdapter(Adapter):
 
     def _cards(self, page_html):
         """Карточки со ссылками: весь текст карточки вокруг ссылки на товар — название,
-        цена и лоты могут стоять и до ссылки, и после, и внутри неё."""
-        cards = {}
+        цена и лоты могут стоять и до ссылки, и после, и внутри неё.
+
+        У одной ссылки бывает несколько карточек (подборка вверху и сетка): берётся та, чьё
+        название подходит к ссылке, потом — где больше данных, потом — меньшая; недостающее
+        берётся из карточек с тем же названием."""
+        found = {}
         for path, fragment in dreampets.card_fragments(page_html):
             link = self._absolute(path)
-            card = dreampets.parse_card_text(dreampets.visible_text(fragment))
-            if not card["name"]:
-                card["name"] = dreampets.slug_name(link)
-            known = cards.setdefault(link, {"name": None, "price": None, "lots": None})
-            for field in ("name", "price", "lots"):
-                if known[field] is None:
-                    known[field] = card[field]
+            slug = dreampets.slug_name(link)
+            card = dreampets.parse_card_text(dreampets.visible_text(fragment), slug)
+            fit = dreampets.slug_fit(card["name"], slug) if card["name"] else 1
+            filled = sum(card[field] is not None for field in ("price", "lots"))
+            found.setdefault(link, []).append((-fit, -filled, len(fragment), card))
+        cards = {}
+        for link, variants in found.items():
+            variants.sort(key=lambda variant: variant[:3])
+            best = dict(variants[0][3])
+            for *_, card in variants[1:]:
+                if card["name"] is None or best["name"] is None or \
+                        dreampets.same_name(card["name"]) == dreampets.same_name(best["name"]):
+                    for field in ("name", "price", "lots"):
+                        if best[field] is None:
+                            best[field] = card[field]
+            best["name"] = best["name"] or dreampets.slug_name(link)
+            cards[link] = best
         return cards
 
     def _absorb_json(self, data, products, now, source):
@@ -919,9 +965,11 @@ class DreamPetsAdapter(Adapter):
     def _api_urls(self, base, products, now):
         """Адреса данных, которые нашёл браузер. Адрес, который без браузера не открывается
         (403 — нужны его cookies) или перестал отдавать товары, — не блокировка площадки:
-        после API_FAILS неудач подряд он просто забывается."""
+        после API_FAILS неудач подряд он просто забывается. 429/503 — не неудача адреса, а
+        просьба площадки подождать: возвращается эта ошибка (иначе None)."""
         urls = self.cache.get("api_urls") or []
         fails = {url: n for url, n in (self.cache.get("api_fails") or {}).items() if url in urls}
+        blocked = None
         for url in list(urls)[:5]:
             if self._stopped():
                 break
@@ -933,6 +981,12 @@ class DreamPetsAdapter(Adapter):
                 self._step("api", url, str(error))
                 continue  # нет связи — адрес тут ни при чём
             except fetcher.FetchError as error:  # и BlockedError
+                if isinstance(error, fetcher.BlockedError) and self._http_code(error) in (429, 503):
+                    # «Слишком много запросов» — адрес рабочий, просто не сейчас; и остальным
+                    # запросам этого опроса лучше подождать.
+                    self._step("api", url, str(error))
+                    blocked = error
+                    break
                 found, result = 0, str(error)
             if found:
                 fails.pop(url, None)
@@ -944,35 +998,54 @@ class DreamPetsAdapter(Adapter):
                 fails.pop(url)
         if fails or "api_fails" in self.cache:
             self.cache["api_fails"] = fails
+        return blocked
 
     # --- карта сайта ---
 
     def _sitemaps(self, products):
-        queue = []
+        """Карта сайта. Её отказ (403/429/503) — не блокировка площадки: страницы товаров
+        и рынок от этого не перестают читаться. 403 (так отвечают и на несуществующий файл)
+        — пропустить этот файл; 429/503 — карту дочитать в следующий раз (через SITEMAP_EVERY)."""
+        from urllib.parse import urljoin  # noqa: E402 (нужен только здесь)
+
+        def absolute(url):  # "Sitemap: /sitemap.xml" бывает и относительным
+            url = urljoin(self.root + "/", url.strip())
+            return url if re.match(r"https?://", url, re.I) else None
+
+        def get(url, raw=False):
+            try:
+                return _request(url, headers=HTML_HEADERS, timeout=self.PAGE_TIMEOUT, raw=raw)
+            except fetcher.FetchError:
+                raise
+            except Exception as error:  # оборванный ответ, неверный адрес — ошибка этого файла, а не опроса
+                raise fetcher.FetchError(f"{type(error).__name__}: {error}") from error
+
+        queue, stop = [], None
         try:
-            queue += dreampets.sitemap_urls_from_robots(_request(self.root + "/robots.txt", headers=HTML_HEADERS,
-                                                                 timeout=self.PAGE_TIMEOUT))
-        except fetcher.BlockedError:
-            raise
-        except fetcher.FetchError as error:
+            queue += dreampets.sitemap_urls_from_robots(get(self.root + "/robots.txt"))
+        except fetcher.FetchError as error:  # и BlockedError
             self._step("robots", self.root + "/robots.txt", str(error))
+            if isinstance(error, fetcher.BlockedError) and self._http_code(error) != 403:
+                stop = error
+        queue = [url for url in map(absolute, queue) if url]
         for default in (self.root + "/sitemap.xml", self.root + "/sitemap_index.xml"):
             if default not in queue:
                 queue.append(default)
         seen, found = set(), 0
-        while queue and len(seen) < self.MAX_SITEMAPS and not self._stopped():
+        while queue and not stop and len(seen) < self.MAX_SITEMAPS and not self._stopped():
             url = queue.pop(0)
             if url in seen:
                 continue
             seen.add(url)
             try:
-                raw = _request(url, headers=HTML_HEADERS, timeout=self.PAGE_TIMEOUT, raw=True)
-            except fetcher.BlockedError:
-                raise
-            except fetcher.FetchError as error:
+                raw = get(url, raw=True)
+            except fetcher.FetchError as error:  # и BlockedError
                 self._step("sitemap", url, str(error))
+                if isinstance(error, fetcher.BlockedError) and self._http_code(error) != 403:
+                    stop = error  # «не спешите» — остальное в следующий раз
                 continue
             children, pages = dreampets.parse_sitemap(raw)
+            children = [url for url in map(absolute, children) if url]
             queue += [c for c in children if c not in seen]
             for page in pages:
                 if dreampets.PRODUCT_PATH_RE.search(page):
@@ -1028,6 +1101,12 @@ class DreamPetsAdapter(Adapter):
             try:
                 key, page_html, error = results.get(timeout=0.2)
             except queue.Empty:
+                if time.time() > deadline + self.PAGE_TIMEOUT:
+                    # Ответ, который приходит по байту, держит поток дольше PAGE_TIMEOUT: его не
+                    # ждём (поток-демон закончится сам, его результат никто не прочтёт).
+                    halt.set()
+                    failures.append("страница отвечает слишком долго")
+                    break
                 if any(worker.is_alive() for worker in workers) or not results.empty():
                     continue
                 break
@@ -1045,12 +1124,24 @@ class DreamPetsAdapter(Adapter):
                     entry["at"] = entry.get("at") or time.time()  # не прочитана, но очередь до неё дошла
                 continue
             entry.pop("missing", None)
+            entry.pop("missing_since", None)
+            (self.cache.get("gone") or {}).pop(key, None)  # повторная проверка снятого товара: страница есть
             parsed = dreampets.parse_product_page(page_html, entry["url"])
             read_ok += 1
             if parsed["price"] is None and parsed["lots"] is None:
                 entry["at"] = entry.get("at") or time.time()  # прочитана: на этой странице цены нет
                 continue
-            useful += 1
+            if parsed.get("source") == "phrase":
+                # Только надпись «Нет в наличии» без чисел: так выглядит и пустая заготовка
+                # страницы, которую дорисовывает скрипт. Для проверки «страницы бесполезны»
+                # это не данные, а цену со списка, API или браузера она не стирает — только
+                # данные, прочитанные раньше с самой страницы.
+                if entry.get("source") not in (None, self.PAGES) or (entry.get("price") is None
+                                                                      and entry.get("lots") is None):
+                    entry["at"] = entry.get("at") or time.time()
+                    continue
+            else:
+                useful += 1
             # Заголовок страницы называет безымянный товар, но известный не переименовывает
             # (только пишет то же название лучше) — см. _keeps_name.
             data = {"lots": parsed["lots"], "name": parsed["name"]}
@@ -1060,11 +1151,8 @@ class DreamPetsAdapter(Adapter):
                     self.fresh.add(key)
                 else:
                     data["lots"] = None
-            elif parsed["lots"] == 0:
-                entry["price"] = None  # лотов нет — не продаётся
-                entry["at"] = time.time()
             else:
-                data["price"] = parsed["price"]  # None — цены на странице нет, прежняя остаётся
+                data["price"] = parsed["price"]  # None — цены на странице нет, прежняя остаётся (0 лотов — нет)
             self._upsert(products, data, time.time(), self.PAGES, key=key)
         self._step("pages", f"{len(due)} в очереди", f"прочитано {read_ok}, с ценой или лотами {useful}, "
                    f"ошибок {len(failures)}" + (f": {failures[-1]}" if failures else ""))
@@ -1075,15 +1163,19 @@ class DreamPetsAdapter(Adapter):
             raise blocked
 
     def _not_found(self, products, key):
-        """Страницы товара нет (404): не продаётся. После MISSING_DROP раз подряд запись
-        удаляется, и карта сайта не возвращает её GONE_KEEP (список с ценой — вернёт)."""
-        entry = products[key]
+        """Страницы товара нет (404): не продаётся. Число лотов при этом неизвестно (None,
+        а не 0): исчезнувшая страница — не купленные лоты. После MISSING_DROP раз подряд и
+        не меньше MISSING_TIME с первого 404 запись удаляется, и ссылка без цены не
+        возвращает её GONE_KEEP (список с ценой — вернёт; см. GONE_RECHECK)."""
+        entry, now = products[key], time.time()
         entry["missing"] = entry.get("missing", 0) + 1
-        entry["price"], entry["lots"], entry["at"] = None, 0, time.time()
+        entry.setdefault("missing_since", now)
+        entry["price"], entry["lots"], entry["at"] = None, None, now
         self.updated.add(key)
-        if entry["missing"] >= self.MISSING_DROP:
-            products.pop(key)
-            self.cache.setdefault("gone", {})[key] = time.time()
+        gone = self.cache.setdefault("gone", {})
+        if key in gone or (entry["missing"] >= self.MISSING_DROP and now - entry["missing_since"] >= self.MISSING_TIME):
+            products.pop(key)  # (key в gone — повторная проверка снятого товара: снова 404)
+            gone[key] = now
             for marks in (self.fresh, self.fresh_price, self.got_price, self.updated):
                 marks.discard(key)
 
@@ -1137,18 +1229,19 @@ class DreamPetsAdapter(Adapter):
         for key, entry in products.items():
             lots = entry.get("lots")
             price = entry.get("price")
-            if not entry.get("name") or (price is None and lots is None):
+            missing = bool(entry.get("missing"))  # страницы нет (404): не продаётся, лоты неизвестны
+            if not entry.get("name") or (price is None and lots is None and not missing):
                 continue  # ещё не прочитан — данных нет (это не «нет в продаже»)
             if now - entry.get("seen", now) > self.STALE_AFTER:
                 continue  # давно не подтверждён ни списком, ни картой сайта, ни страницей — данные устарели
             offers.append({
                 "id": key,
                 "name": entry["name"],
-                "price": price,
+                "price": None if missing else price,
                 "currency": "RUB",
-                "stock": lots,
+                "stock": None if missing else lots,  # не 0: исчезнувшие лоты — не покупки
                 "sales_week": None,
-                "available": bool(lots) if lots is not None else price is not None,
+                "available": False if missing else bool(lots) if lots is not None else price is not None,
                 "url": entry.get("url") or self.config["url"],
             })
         return offers
