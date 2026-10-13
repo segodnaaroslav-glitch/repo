@@ -938,6 +938,8 @@ function marketTile(item, id) {
     tile.append(el("p", "muted small", "Не найден на площадке."));
     return tile;
   }
+  // Какой именно товар площадки взят (одноимённых бывает много: нож/пистолет, годы, редкость).
+  if (info.product) tile.append(el("p", "muted small", `товар площадки: ${info.product}`));
   const priceRow = el("div", "tile-price");
   priceRow.append(infoNode(info));
   tile.append(priceRow);

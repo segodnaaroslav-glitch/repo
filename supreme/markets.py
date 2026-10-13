@@ -2018,6 +2018,8 @@ class MarketMonitor:
                     "price_rub": offer.get("price_rub"),
                     "price_rub_approx": bool(offer.get("price_rub_approx")),
                     "year": offer.get("year"),
+                    "product": " · ".join(str(part) for part in (
+                        offer.get("name"), offer.get("rarity"), offer.get("kind"), offer.get("year")) if part),
                     "currency": offer.get("currency") or "USD",
                     "fee": config.get("fee", 0),
                     "stock": offer.get("stock"),
