@@ -37,6 +37,20 @@ class Upstream(BaseHTTPRequestHandler):
         "/svg.svg": (200, "image/svg+xml", b"<svg xmlns='http://www.w3.org/2000/svg'><script/></svg>"),
         "/big.webp": (200, "image/webp", WEBP + b"\x00" * (imgproxy.MAX_BYTES + 10)),
         "/busy.webp": (503, "text/plain", b"busy"),
+        # JPEG с лишними байтами после конца картинки — бывает у настоящих сайтов
+        "/tail.jpg": (200, "image/jpeg", b"\xff\xd8\xff\xe0" + b"\x01" * 50 + b"\xff\xda" + b"\x02" * 50
+                      + b"\xff\xd9" + b"\x00" * 100),
+        "/broken.png": (200, "image/png", BIG_PNG[:3000]),  # на самом сайте такая (длина совпала): испорчена
+    }
+    CHALLENGE = b"<html><script src='/_Incapsula_Resource?x=1'></script>Request unsuccessful. Incapsula incident ID: 1</html>"
+    refusals = {
+        "/forbidden.webp": (403, "application/xml", b"<Error><Code>AccessDenied</Code></Error>"),  # так CDN отвечает «нет»
+        "/legal.webp": (451, "text/plain", b"unavailable"),
+        "/page.webp": (200, "text/html; charset=utf-8", b"<html><body>Not found</body></html>"),
+        "/challenge.webp": (200, "text/html; charset=utf-8", CHALLENGE),
+        "/challenge403.webp": (403, "text/html", CHALLENGE),
+        "/cloudflare.webp": (503, "text/html", b"<title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/x'>"),
+        "/limit.webp": (429, "text/plain", b"slow down"),
     }
 
     def log_message(self, *args):
@@ -65,10 +79,8 @@ class Upstream(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
             return
-        if self.path in ("/forbidden.webp", "/legal.webp", "/challenge.webp"):  # сайт не пускает программу
-            status, ctype = {"/forbidden.webp": (403, "text/plain"), "/legal.webp": (451, "text/plain"),
-                             "/challenge.webp": (200, "text/html; charset=utf-8")}[self.path]
-            body = b"<html>Request unsuccessful. Incapsula incident ID: 1</html>"
+        if self.path in self.refusals:  # отказ: одна картинка или весь сайт не пускает программу
+            status, ctype, body = self.refusals[self.path]
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
@@ -99,9 +111,14 @@ class Upstream(BaseHTTPRequestHandler):
 class Clock:
     def __init__(self):
         self.now = 1000.0
+        self.slept = []
 
     def __call__(self):
         return self.now
+
+    def sleep(self, seconds):  # бережность к сайту (imgproxy.PACE) — без настоящего ожидания
+        self.slept.append(seconds)
+        self.now += seconds
 
 
 class ImageCacheTests(unittest.TestCase):
@@ -119,7 +136,10 @@ class ImageCacheTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.folder = Path(tmp.name) / "images"
         self.clock = Clock()
-        self.cache = imgproxy.ImageCache(self.folder, download=self.download, clock=self.clock)
+        self.cache = self.make_cache(self.download)
+
+    def make_cache(self, download):
+        return imgproxy.ImageCache(self.folder, download=download, clock=self.clock, sleep=self.clock.sleep)
 
     def url(self, name):
         return "https://cdn.starpets.gg/" + name
@@ -147,7 +167,7 @@ class ImageCacheTests(unittest.TestCase):
         self.assertEqual(self.cache.get(self.url("ok.webp")), (WEBP, "image/webp"))
         self.assertEqual(self.cache.get(self.url("raw.png")), (PNG, "image/png"))  # тип — по самим байтам
         for name, status in (("html.png", 502), ("text.webp", 502), ("svg.svg", 502), ("big.webp", 502),
-                             ("unsized.webp", 502), ("redirect.webp", 502), ("missing.webp", 404), ("busy.webp", 503)):
+                             ("unsized.webp", 502), ("redirect.webp", 502), ("missing.webp", 404), ("busy.webp", 502)):
             self.assertEqual(self.status(self.url(name)), status, name)
         self.assertEqual(sorted(p.suffix for p in self.folder.iterdir() if p.name != "failed.json"), [".png", ".webp"])
         self.assertEqual(imgproxy.sniff(GIF), ("image/gif", ".gif"))
@@ -173,12 +193,16 @@ class ImageCacheTests(unittest.TestCase):
             self.assertEqual((caught.exception.status, caught.exception.kind), (status, kind), error)
 
     def test_cut_off_pictures_are_not_cached(self):
-        for name, kind in (("short.png", "network"), ("cut-chunked.png", "network"), ("cut-unsized.png", "busy")):
+        # обрыв связи — 503 (network); картинка не целиком без объявленной длины — сайт занят (502, busy);
+        # не целиком, хотя длина совпала, — такая она на сайте (502, final)
+        for name, status, kind in (("short.png", 503, "network"), ("cut-chunked.png", 503, "network"),
+                                   ("cut-unsized.png", 502, "busy"), ("broken.png", 502, "final")):
             with self.assertRaises(imgproxy.ImageError) as caught:
                 self.cache.get(self.url(name))
-            self.assertEqual((caught.exception.status, caught.exception.kind), (503, kind), name)
+            self.assertEqual((caught.exception.status, caught.exception.kind), (status, kind), name)
         self.assertEqual([p.name for p in self.folder.iterdir()], ["failed.json"])  # обрывки на диск не попали
-        self.assertEqual(list(json.loads((self.folder / "failed.json").read_text("utf-8"))), [self.url("cut-unsized.png")])
+        self.assertEqual(sorted(json.loads((self.folder / "failed.json").read_text("utf-8"))),
+                         [self.url("broken.png"), self.url("cut-unsized.png")])
         # обрывок, сохранённый раньше, не отдаётся — картинка скачивается заново
         url = self.url("raw.png")
         (self.folder / (imgproxy.ImageCache._name(url) + ".png")).write_bytes(BIG_PNG[:1000])
@@ -187,45 +211,149 @@ class ImageCacheTests(unittest.TestCase):
 
     def test_complete_pictures(self):
         avif = (16).to_bytes(4, "big") + b"ftypavif\x00\x00\x00\x00" + (12).to_bytes(4, "big") + b"mdatabcd"
+        jpeg = b"\xff\xd8\xff\xe0" + b"\x01" * 100 + b"\xff\xda" + b"\x02" * 100 + b"\xff\xd9"
         for data, ext in ((picgen.png_bytes(4, 4, bytes(64)), ".png"), (WEBP, ".webp"), (GIF, ".gif"),
-                          (b"\xff\xd8\xff\xe0" + b"\x01" * 100 + b"\xff\xd9", ".jpg"), (avif, ".avif")):
+                          (jpeg, ".jpg"), (b"\xff\xd8\xff\xe0" + b"\x01" * 100 + b"\xff\xd9", ".jpg"), (avif, ".avif")):
             self.assertEqual(imgproxy.sniff(data)[1], ext)
             self.assertTrue(imgproxy.complete(data, ext), ext)
             self.assertFalse(imgproxy.complete(data[:len(data) * 2 // 3], ext), ext)
+            if ext in (".png", ".webp", ".jpg"):  # лишние байты после конца картинки — не беда
+                self.assertTrue(imgproxy.complete(data + b"\x00\x13" * 100, ext), ext)
+        # конец картинки (FF D9) внутри её начала (миниатюра в EXIF) — не конец всей картинки
+        thumb = b"\xff\xd8\xff\xe1" + b"\xff\xd8" + b"\x01" * 20 + b"\xff\xd9" + b"\xff\xda" + b"\x02" * 300
+        self.assertFalse(imgproxy.complete(thumb, ".jpg"))
+        self.assertEqual(self.cache.get(self.url("tail.jpg"))[1], "image/jpeg")  # и сама загрузка принимает
 
-    def test_a_blocking_site_is_paused_as_a_whole(self):
-        # 403, 451, «страница защиты» вместо картинки: сайт не пускает программу.
-        for name in ("forbidden.webp", "legal.webp", "challenge.webp"):
+    def test_refusals(self):
+        # Отказ в одной картинке (403 от CDN — и на «нет такой», страница вместо картинки) — виновата
+        # она; 429 и страница защиты от ботов — сайт не пускает программу.
+        for name, status, kind in (("forbidden.webp", 502, "denied"), ("legal.webp", 502, "denied"),
+                                   ("page.webp", 502, "denied"), ("challenge.webp", 429, "blocked"),
+                                   ("challenge403.webp", 429, "blocked"), ("cloudflare.webp", 429, "blocked"),
+                                   ("limit.webp", 429, "blocked")):
             with self.assertRaises(imgproxy.ImageError) as caught:
                 self.download(self.url(name))
-            self.assertEqual((caught.exception.status, caught.exception.kind), (429, "blocked"), name)
+            self.assertEqual((caught.exception.status, caught.exception.kind), (status, kind), name)
+
+    def fake_site(self, answer):
+        """ImageCache с подделкой загрузки: answer(url) -> ImageError или None (картинка)."""
         calls = []
 
         def download(url):
             calls.append(url)
-            if "supremevalues.com" in url:
-                raise imgproxy.ImageError(429, "не пускает", "blocked")
+            error = answer(url)
+            if error:
+                raise error
             return PNG, ("image/png", ".png")
 
-        cache = imgproxy.ImageCache(self.folder, download=download, clock=self.clock)
+        cache = self.make_cache(download)
 
         def status(url):
             try:
                 cache.get(url)
             except imgproxy.ImageError as error:
-                return error.status
-            return 200
+                return error.status, error.kind
+            return 200, None
 
+        return cache, calls, status
+
+    def test_a_blocking_site_is_paused_as_a_whole(self):
+        _, calls, status = self.fake_site(
+            lambda url: imgproxy.ImageError(429, "не пускает", "blocked") if "supremevalues.com" in url else None)
         # тысяча картинок защищённого сайта — один запрос к нему, остальные ждут паузу
         site = "https://supremevalues.com/mm2/items/"
-        self.assertEqual({status(f"{site}{number}.webp") for number in range(1000)}, {429})
-        self.assertEqual(status("https://www.supremevalues.com/x.webp"), 429)  # поддомен — тот же сайт
+        self.assertEqual({status(f"{site}{number}.webp") for number in range(1000)}, {(429, "blocked")})
+        self.assertEqual(status("https://www.supremevalues.com/x.webp"), (429, "blocked"))  # поддомен — тот же сайт
         self.assertEqual(len(calls), 1)
-        self.assertEqual(status(self.url("ok.webp")), 200)  # StarPets пускает
+        self.assertEqual(status(self.url("ok.webp")), (200, None))  # StarPets пускает
         self.assertFalse((self.folder / "failed.json").exists())  # сами адреса не виноваты
         self.clock.now += imgproxy.BLOCK_PAUSE + 1
-        self.assertEqual(status(site + "again.webp"), 429)
+        self.assertEqual(status(site + "again.webp"), (429, "blocked"))
         self.assertEqual(len([url for url in calls if "supremevalues" in url]), 2)
+
+    def test_one_refused_picture_is_only_that_picture(self):
+        site = "https://cdn.starpets.gg/MM/"
+        _, calls, status = self.fake_site(
+            lambda url: imgproxy.ImageError(502, "отказ", "denied") if "missing" in url else None)
+        self.assertEqual(status(site + "Gun1.webp"), (200, None))
+        self.assertEqual(status(site + "missing.webp"), (502, "denied"))
+        for name in ("Knife2.webp", "Luger.webp", "Seer.webp"):  # остальные картинки сайта — как обычно
+            self.assertEqual(status(site + name), (200, None), name)
+        self.assertEqual(status(site + "missing.webp"), (502, "denied"))  # запомнена: не спрашивается снова
+        self.assertEqual(calls.count(site + "missing.webp"), 1)
+        self.assertEqual(list(json.loads((self.folder / "failed.json").read_text("utf-8"))), [site + "missing.webp"])
+        # Несколько разных картинок подряд — уже не случайность: сайт не пускает программу.
+        for number in range(imgproxy.DENIED_AFTER):
+            self.assertEqual(status(f"{site}missing{number}.webp"), (502, "denied"))
+        before = len(calls)
+        self.assertEqual(status(site + "Fang.webp"), (429, "blocked"))
+        self.assertEqual(len(calls), before)
+        self.assertEqual(status("https://supremevalues.com/mm2/items/fang.webp"), (200, None))  # другой сайт — как обычно
+
+    def test_each_site_has_its_own_connection(self):
+        # supremevalues.com не открывается (провайдер), StarPets — открывается: его картинки берутся.
+        _, calls, status = self.fake_site(
+            lambda url: imgproxy.ImageError(503, "таймаут", "network") if "supremevalues.com" in url else None)
+        site = "https://supremevalues.com/mm2/items/"
+        for number in range(imgproxy.OFFLINE_AFTER + 5):
+            self.assertEqual(status(f"{site}{number}.webp"), (503, "network"))
+            if number % 2:  # успехи другого сайта не сбрасывают счёт обрывов этого
+                self.assertEqual(status(f"{self.url('MM/110x110/')}{number}.webp"), (200, None))
+        self.assertEqual(len([url for url in calls if url.startswith(site)]), imgproxy.OFFLINE_AFTER)
+        self.assertEqual(status(self.url("MM/110x110/Gun1.webp")), (200, None))
+        self.assertFalse((self.folder / "failed.json").exists())
+
+    def test_polite_to_each_site(self):
+        _, calls, status = self.fake_site(lambda url: imgproxy.ImageError(502, "занят", "busy") if "busy" in url else None)
+        starts = []
+        site = "https://supremevalues.com/mm2/items/"
+        for number in range(4):
+            status(f"{site}{number}.webp")
+            starts.append(self.clock.now)
+        gap = imgproxy.PACE["supremevalues.com"][1]
+        self.assertTrue(all(b - a >= gap - 1e-9 for a, b in zip(starts, starts[1:])), starts)
+        # сайт занят — промежуток растёт (вдвое, не больше SLOW_MAX), удачная загрузка его возвращает
+        self.clock.slept.clear()
+        for name in ("busy1", "busy2", "busy3", "ok1", "ok2", "ok3"):
+            status(f"{site}{name}.webp")
+        self.assertEqual([round(s, 2) for s in self.clock.slept], [gap, gap, 2 * gap, 4 * gap, 8 * gap, gap])
+        self.assertEqual(len(calls), 10)
+
+    def test_parallel_downloads_per_site(self):
+        active, peak, lock = {}, {}, threading.Lock()
+
+        def download(url):
+            site = imgproxy.site_of(url)
+            with lock:
+                active[site] = active.get(site, 0) + 1
+                peak[site] = max(peak.get(site, 0), active[site])
+                peak["all"] = max(peak.get("all", 0), sum(active.values()))
+            time.sleep(0.03)
+            with lock:
+                active[site] -= 1
+            return PNG, ("image/png", ".png")
+
+        cache = imgproxy.ImageCache(self.folder, download=download)
+        urls = ([f"https://supremevalues.com/mm2/items/{n}.webp" for n in range(8)]
+                + [self.url(f"MM/{n}.webp") for n in range(8)])
+        with mock.patch.dict(imgproxy.PACE, {"supremevalues.com": (2, 0.0), "starpets.gg": (3, 0.0)}):
+            threads = [threading.Thread(target=cache.get, args=(url,)) for url in urls]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual((peak["supremevalues.com"], peak["starpets.gg"]), (2, 3))
+        self.assertLessEqual(peak["all"], imgproxy.PARALLEL)
+
+    def test_downloads_per_run_are_limited(self):
+        _, calls, status = self.fake_site(lambda url: None)
+        site = "https://supremevalues.com/mm2/items/"
+        with mock.patch.dict(imgproxy.SESSION_CAP, {"supremevalues.com": 3}):
+            answers = [status(f"{site}{number}.webp") for number in range(6)]
+            self.assertEqual(status(site + "0.webp"), (200, None))  # скачанная — с диска
+            self.assertEqual(status(self.url("ok.webp")), (200, None))  # у StarPets предела нет
+        self.assertEqual(answers, [(200, None)] * 3 + [(429, "capped")] * 3)
+        self.assertEqual(len(calls), 4)
 
     def test_one_download_then_disk(self):
         url, out = self.url("ok.webp"), []
@@ -242,9 +370,9 @@ class ImageCacheTests(unittest.TestCase):
     def test_failures_are_remembered(self):
         for _ in range(3):
             self.assertEqual(self.status(self.url("missing.webp")), 404)
-            self.assertEqual(self.status(self.url("busy.webp")), 503)
+            self.assertEqual(self.status(self.url("busy.webp")), 502)
         self.assertEqual((Upstream.calls["/missing.webp"], Upstream.calls["/busy.webp"]), (1, 1))
-        restarted = imgproxy.ImageCache(self.folder, download=self.download, clock=self.clock)
+        restarted = self.make_cache(self.download)
         with self.assertRaises(imgproxy.ImageError):
             restarted.get(self.url("missing.webp"))
         self.assertEqual(Upstream.calls["/missing.webp"], 1)  # и после перезапуска — по failed.json
@@ -265,7 +393,7 @@ class ImageCacheTests(unittest.TestCase):
             calls.append(url)
             raise imgproxy.ImageError(503, "нет связи", "network")
 
-        cache = imgproxy.ImageCache(self.folder, download=offline, clock=self.clock)
+        cache = self.make_cache(offline)
         for number in range(10):
             with self.assertRaises(imgproxy.ImageError) as caught:
                 cache.get(self.url(f"{number}.webp"))
@@ -278,8 +406,7 @@ class ImageCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), imgproxy.OFFLINE_AFTER + 1)
 
     def test_cache_size_is_limited(self):
-        cache = imgproxy.ImageCache(self.folder, download=lambda url: (PNG[:-12] + url.encode() * 20 + IEND,
-                                                                        ("image/png", ".png")))
+        cache = self.make_cache(lambda url: (PNG[:-12] + url.encode() * 20 + IEND, ("image/png", ".png")))
         with mock.patch.object(imgproxy, "MAX_CACHE_BYTES", 3000):
             for number in range(40):
                 cache.get(self.url(f"{number:02d}.png"))
@@ -508,7 +635,25 @@ class ItemImageEndpointTests(PicServerTests):
             status, _, body = self.request("GET", f"/api/itemimg?key={key}&src=site")
             self.assertEqual(status, 429, body)
             self.assertIn("не пускает", json.loads(body)["error"])
+            self.assertEqual((json.loads(body)["kind"], json.loads(body)["site"]), ("blocked", "supremevalues.com"))
         self.assertEqual(len(calls), 1)
+
+    def test_errors_say_why(self):
+        # Браузер считает «нет связи» только по настоящим обрывам: почему — в ответе (kind).
+        answers = {"https://supremevalues.com/mm2/items/cowboy.webp": imgproxy.ImageError(502, "занят", "busy"),
+                   "https://supremevalues.com/mm2/items/seer.webp": imgproxy.ImageError(503, "таймаут", "network"),
+                   self.MARKET["rares:Cowboy"]: RuntimeError("неожиданно")}
+
+        def download(url):
+            raise answers[url]
+
+        handler = self.httpd.RequestHandlerClass
+        handler.images = imgproxy.ImageCache(handler.images.folder, download=download)
+        for query, status, kind, site in (("key=vintages%3ACowboy&src=site", 502, "busy", "supremevalues.com"),
+                                          ("key=godlies%3ASeer&src=site", 503, "network", "supremevalues.com"),
+                                          ("key=rares%3ACowboy&src=market", 502, "final", "starpets.gg")):
+            got, _, body = self.request("GET", "/api/itemimg?" + query)
+            self.assertEqual((got, json.loads(body)["kind"], json.loads(body)["site"]), (status, kind, site), query)
 
     def test_foreign_pages_and_hosts_refused(self):
         for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Host": "evil.example"}):

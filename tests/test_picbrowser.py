@@ -116,14 +116,18 @@ class CalcPicturesBrowserTests(unittest.TestCase):
                                         monitor=FakeMonitor(MARKET))
         self.handler = self.httpd.RequestHandlerClass
         self.downloads, self.offline = [], False
-        self.missing, self.corrupt, self.site_blocked = set(), set(), False
+        self.missing, self.corrupt, self.busy, self.site_blocked, self.site_down = set(), set(), set(), False, False
+        self.gate = None  # threading.Event: картинки отдаются, только когда он открыт (медленная сеть)
+        self.badge_errors = set()  # скриншоты, значки которых распознавание не прочитало (ошибка)
         self.inventories, self.truths = {}, {}  # скриншоты отдельных проверок: png -> ответ распознавания
         self.handler.images = imgproxy.ImageCache(self.folder / "images", download=self.download)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
         for patch in (mock.patch.object(ocr, "read_inventory", side_effect=self.read_inventory),
-                      mock.patch.object(ocr, "recognize_regions", side_effect=self.recognize_regions)):
+                      mock.patch.object(ocr, "recognize_regions", side_effect=self.recognize_regions),
+                      # бережность к сайтам проверяется в test_imgproxy; здесь — без ожидания
+                      mock.patch.dict(imgproxy.PACE, {site: (parallel, 0.0) for site, (parallel, _) in imgproxy.PACE.items()})):
             patch.start()
             self.addCleanup(patch.stop)
         self.badge_calls = []
@@ -134,10 +138,14 @@ class CalcPicturesBrowserTests(unittest.TestCase):
 
     def download(self, url):
         self.downloads.append(url)
-        if self.offline:
+        if self.gate is not None:
+            self.gate.wait(30)
+        if self.offline or (self.site_down and url.startswith(SITE)):
             raise imgproxy.ImageError(503, "нет связи", "network")
         if self.site_blocked and url.startswith(SITE):
             raise imgproxy.ImageError(429, "сайт не пускает программу", "blocked")
+        if url in self.busy:
+            raise imgproxy.ImageError(502, "сайт занят", "busy")
         if url not in self.pictures or url in self.missing:
             raise imgproxy.ImageError(404, "нет картинки")
         if url in self.corrupt:  # начало и конец PNG на месте, внутри — мусор: браузер её не откроет
@@ -156,6 +164,8 @@ class CalcPicturesBrowserTests(unittest.TestCase):
     def recognize_regions(self, raw, regions, **kwargs):
         name, truth = self.truths.get(raw) or (("A", self.truth_a) if raw == self.png_a else ("B", self.truth_b))
         self.badge_calls.append((name, len(regions)))
+        if name in self.badge_errors:
+            raise ocr.OcrError("распознавание не ответило вовремя")
         words, areas = [], []
         for number, (x, y, w, h) in enumerate(regions):
             place = next((t for t in truth if t["x0"] <= x + w / 2 <= t["x1"] and abs(y - t["icon_top"]) < 20), None)
@@ -180,7 +190,7 @@ class CalcPicturesBrowserTests(unittest.TestCase):
             time.sleep(0.1)
         self.fail(f"не дождался: {condition}")
 
-    def run_calc(self, *pngs):
+    def add_files(self, *pngs):
         shots = json.dumps([base64.b64encode(png).decode() for png in pngs])
         return self.js(f"""
             $("calcClear").click();
@@ -188,10 +198,13 @@ class CalcPicturesBrowserTests(unittest.TestCase):
                                                             `shot${{i}}.png`, {{ type: "image/png" }}));
             addCalcFiles(files);
             while (calc.images.some((image) => !image.data)) await new Promise((r) => setTimeout(r, 20));
-            await runCalc();
-            await PicTiles.idle();
             return true;
         """)
+
+    def run_calc(self, *pngs, wait=True):
+        """Скриншоты -> «Посчитать». wait=False — не ждать сравнения по картинкам (строки уже показаны)."""
+        self.add_files(*pngs)
+        return self.js(f"await runCalc(); {'await PicTiles.idle();' if wait else ''} return true;")
 
     def snapshot(self):
         return self.js("""
@@ -281,7 +294,6 @@ class CalcPicturesBrowserTests(unittest.TestCase):
         self.wait('document.querySelectorAll("#calcPicTiles .pic-tile").length === 0')
         luger = self.rows(self.snapshot())["commons:Luger"]
         self.assertEqual((luger["qty"], luger["via"]), (1, "user"))
-        self.wait("!PicTiles._state.refs.warming")  # остальные картинки посчитаны в фоне
         self.assertTrue(self.learned("commons:Luger"))  # выбор пользователя запомнен
         saved = json.loads(self.handler.features.snapshot_json())
         self.assertEqual(len(saved["feats"]), len(picgen.ITEMS) - len(NO_PICTURE))
@@ -377,18 +389,45 @@ class CalcPicturesBrowserTests(unittest.TestCase):
         self.assertIn("не учтено прочитанное как текст (Seer)", snap["status"])
         self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 3"), snap["calcStatus"])
 
+    def test_offline_inventory_read_as_text_keeps_its_rows(self):
+        # Без связи и без сохранённых картинок: плитки сравнить не с чем — скриншот, прочитанный как
+        # текст, считается по тексту, как без картинок (а не плитками, которые решать пользователю).
+        self.offline = True
+        png, truth = shot([("ancients:Harvester", "x3"), ("godlies:Fang", "x7")], 22)
+        self.inventories[png] = (text_words("Harvester x3", "Fang x7"), ocr_tiles(truth, unread=set(picgen.ITEMS)))
+        self.truths[png] = ("E", truth)
+        self.run_calc(png)
+        snap = self.snapshot()
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()},
+                         {"ancients:Harvester": 3, "godlies:Fang": 7}, snap)
+        self.assertEqual(snap["unsure"], [])  # не вдобавок к строкам: их не посчитать дважды
+        self.assertIn("посчитан по прочитанному тексту", snap["status"])
+        self.assertNotIn("не учтено", snap["status"])
+        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 2"), snap["calcStatus"])
+
     def test_names_read_as_text_are_offered_for_unsure_tiles(self):
-        self.offline = True  # без картинок предметов плитки решает пользователь
+        # Картинки есть, но плитки по ним не узнаны: строки текста остаются, а прочитанное название
+        # предлагается у плиток; выбранная плитка не добавляется к строке текста, а уточняет её.
+        self.missing.update(url for url in self.pictures if "harvester" in url or "fang" in url or "scythe" in url)
         png, truth = shot([("ancients:Harvester", "x3"), ("godlies:Fang", "x7")], 22)
         self.inventories[png] = (text_words("Fang", "Back"), ocr_tiles(truth, unread=set(picgen.ITEMS)))
         self.truths[png] = ("E", truth)
         self.run_calc(png)
         snap = self.snapshot()
-        self.assertEqual(snap["rows"], [])  # «Fang» не привязано к плитке — само не считается
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()}, {"godlies:Fang": 1}, snap)
         self.assertEqual(len(snap["unsure"]), 2, snap)
-        for row in snap["unsure"]:  # но предлагается в списке у плиток этого скриншота
+        for row in snap["unsure"]:  # предлагается в списке у плиток этого скриншота
             self.assertIn("godlies:Fang", row["options"])
-        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 0"), snap["calcStatus"])
+        index = next(i for i, row in enumerate(snap["unsure"]) if "×7" in row["text"])
+        self.choose_other(index, "Fang")
+        self.wait('document.querySelectorAll("#calcPicTiles .pic-tile").length === 1')
+        self.assertEqual({key: row["qty"] for key, row in self.rows(self.snapshot()).items()}, {"godlies:Fang": 7})
+        self.choose_other(0, "Harvester")
+        self.wait('document.querySelectorAll("#calcPicTiles .pic-tile").length === 0')
+        snap = self.snapshot()
+        self.assertEqual({key: row["qty"] for key, row in self.rows(snap).items()},
+                         {"godlies:Fang": 7, "ancients:Harvester": 3}, snap)
+        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 2"), snap["calcStatus"])
 
     def test_text_screenshot_without_tiles_keeps_its_text(self):
         canvas = picgen.Canvas(320, 120, (40, 40, 44, 255))
@@ -486,25 +525,134 @@ class CalcPicturesBrowserTests(unittest.TestCase):
         self.assertEqual(sorted(known), sorted(markets.item_id(item) for item in stock()))
 
     def test_broken_pictures_are_not_a_lost_connection(self):
-        self.corrupt.update(url for url in self.pictures if url.startswith(SITE))  # больше OFFLINE_AFTER
+        site = [item["image"] for item in stock() if item.get("image")]
+        self.corrupt.update(site[::2])  # больше OFFLINE_AFTER плохих картинок: испорченные
+        self.busy.update(site[1::2])    # и «сайт занят»
         self.run_calc(self.png_a, self.png_b)
         snap = self.snapshot()
-        state = self.js("return { offline: PicTiles._state.refs.offline, failed: [...PicTiles._state.refs.failed] };")
-        self.assertFalse(state["offline"])
+        state = self.js("return { down: [...PicTiles._state.refs.down], failed: [...PicTiles._state.refs.failed] };")
+        self.assertEqual(state["down"], [])
         self.assertNotIn("нет связи", snap["status"])
         self.assertIn("godlies:Seer|site", state["failed"])
+        self.assertEqual(set(site) - {url for url in site if url in self.downloads}, set())  # спрошены все
         self.assertEqual(self.rows(snap)["godlies:Seer"]["qty"], 12)
 
     def test_blocking_site_is_not_asked_again_and_again(self):
         self.site_blocked = True
         self.run_calc(self.png_a, self.png_b)
-        self.wait("!PicTiles._state.refs.warming")
         snap = self.snapshot()
         site = [url for url in self.downloads if url.startswith(SITE)]
         self.assertTrue(1 <= len(site) <= imgproxy.PARALLEL, site)  # дальше сервер отвечает сам: пауза сайта
         self.assertIn(MARKET["rares:Cowboy"], self.downloads)  # другой сайт картинок — как обычно
         self.assertIn("не пускает", snap["status"])
         self.assertEqual(self.rows(snap)["ancients:Harvester"]["qty"], 3)  # названия — как раньше
+
+    def market_everywhere(self, but=()):
+        """Картинки StarPets у всех предметов (как у настоящих: почти всё продаётся на StarPets), кроме but."""
+        market = {key: f"https://cdn.starpets.gg/MM/110x110/{number}.webp"
+                  for number, key in enumerate(picgen.ITEMS) if key not in NO_PICTURE and key not in but}
+        self.pictures = dict(self.pictures)
+        for key, url in market.items():
+            self.pictures[url] = picgen.reference(key).png()
+        self.handler.monitor = FakeMonitor(market)
+        return market
+
+    def test_adding_screenshots_downloads_nothing(self):
+        # Картинки предметов — только в расчёте и только нужные, а не все сразу при добавлении скриншота.
+        self.add_files(self.png_a, self.png_b)
+        time.sleep(2)
+        self.assertEqual(self.downloads, [])
+
+    def test_bulk_pictures_come_from_starpets(self):
+        # Для плиток без названия нужны картинки всех предметов: их раздаёт CDN StarPets. С сайта
+        # предметов (под защитой от ботов) — только картинки вариантов одного названия.
+        market = self.market_everywhere()
+        self.run_calc(self.png_a, self.png_b)
+        rows = self.rows(self.snapshot())
+        self.assertEqual((rows["godlies:Elderwood Scythe"]["qty"], rows["vintages:Cowboy"]["qty"]), (1, 40))
+        self.assertEqual([url for url in self.downloads if url.startswith(SITE)],
+                         [SITE + "cowboy-vintages.webp"])  # нож Cowboy — только на StarPets
+        self.assertEqual(set(market.values()) - set(self.downloads), set())
+
+    def test_unreachable_picture_site_does_not_stop_the_other(self):
+        # supremevalues.com не открывается (провайдер), StarPets — открывается. Картинки предметов,
+        # которые есть только на сайте, не загрузятся, но картинки StarPets — да, в том же расчёте.
+        only_site = {"ancients:Harvester", "godlies:Seer", "chromas:Chroma Seer", "godlies:Fang", "godlies:Icebreaker"}
+        market = self.market_everywhere(but=only_site)
+        self.site_down = True
+        self.run_calc(self.png_a, self.png_b)
+        snap = self.snapshot()
+        rows = self.rows(snap)
+        self.assertEqual({key: row["qty"] for key, row in rows.items()}, {
+            "ancients:Harvester": 3, "godlies:Seer": 12, "chromas:Chroma Seer": 1, "godlies:Fang": 7,
+            "godlies:Elderwood Scythe": 1, "vintages:Cowboy": 40, "rares:Cowboy": 1}, snap)
+        for key in ("godlies:Elderwood Scythe", "vintages:Cowboy", "rares:Cowboy"):  # по картинкам StarPets
+            self.assertIn("по картинке", rows[key]["badges"], key)
+        self.assertIn("нет связи с supremevalues.com", snap["status"])
+        self.assertNotIn("картинки предметов не загрузились", snap["status"])
+        self.assertEqual(self.js("return [...PicTiles._state.refs.down];"), ["supremevalues.com"])
+        feats = json.loads(self.handler.features.snapshot_json())["feats"]
+        self.assertEqual({key for key, entry in feats.items() if "market" in entry}, set(market))
+        self.assertLessEqual(len([url for url in self.downloads if url.startswith(SITE)]), imgproxy.OFFLINE_AFTER + 2)
+
+    def test_unread_badges_ask_to_check_quantity(self):
+        # Значки скриншота без плиток распознавания не прочитались (ошибка распознавания): количество
+        # его плиток не угадывается молча — «проверьте количество», и у плитки, где браузер значка
+        # не увидел (мелкое «x2» он может пропустить).
+        png, truth = shot([("godlies:Fang", "x7"), ("godlies:Seer", None)], 71)
+        self.truths[png] = ("F", truth)
+        self.badge_errors.add("F")
+        self.run_calc(png)
+        snap = self.snapshot()
+        rows = self.rows(snap)
+        self.assertEqual(set(rows), {"godlies:Fang", "godlies:Seer"}, snap)
+        for key in rows:
+            self.assertIn("проверьте количество", rows[key]["badges"], key)
+        self.assertIn("количество не прочитано", snap["status"])
+
+    def cowboy_shot(self):
+        """Скриншот: Cowboy (ружьё x3, серая полоса — вариант не ясен) и Fang x7 — названия прочитаны."""
+        png, truth = shot([("vintages:Cowboy", "x3"), ("godlies:Fang", "x7")], 61)
+        self.inventories[png] = ({"width": 0, "height": 0, "words": []}, ocr_tiles(truth, unread=set(), missed=set()))
+        self.truths[png] = ("C2", truth)
+        self.gate = threading.Event()  # картинки придут, когда пользователь уже что-то сделал
+        self.addCleanup(self.gate.set)
+        self.run_calc(png, wait=False)
+        return self.rows(self.snapshot())
+
+    def test_removed_row_does_not_come_back(self):
+        rows = self.cowboy_shot()
+        cowboy = next(key for key in rows if key.endswith(":Cowboy"))
+        self.assertIn("проверьте вариант", rows[cowboy]["badges"])
+        self.js(f"""
+            const index = calc.items.findIndex((item) => item.key === {json.dumps(cowboy)});
+            [...$("calcBody").children][index].querySelector("button.icon").click();
+            return true;
+        """)
+        self.gate.set()
+        self.js("await PicTiles.idle(); return true;")
+        snap = self.snapshot()
+        self.assertEqual([row["key"] for row in snap["rows"]], ["godlies:Fang"], snap)  # ни ружьё, ни нож
+        self.assertNotIn("вариант выбран по картинке", snap["status"])
+        self.assertTrue(snap["calcStatus"].startswith("Найдено предметов: 1"), snap["calcStatus"])
+
+    def test_variant_chosen_by_user_is_not_relabelled(self):
+        rows = self.cowboy_shot()
+        server = next(key for key in rows if key.endswith(":Cowboy"))
+        chosen = ({"vintages:Cowboy", "rares:Cowboy"} - {server}).pop()
+        self.js("""
+            const select = document.querySelector("#calcBody select.variant");
+            select.value = "1";
+            select.dispatchEvent(new Event("change"));
+            return true;
+        """)
+        self.gate.set()
+        self.js("await PicTiles.idle(); return true;")
+        snap = self.snapshot()
+        rows = self.rows(snap)
+        self.assertEqual(sorted(rows), sorted(["godlies:Fang", chosen]), snap)  # выбор пользователя остался
+        self.assertNotIn("по картинке", rows[chosen]["badges"])
+        self.assertNotIn("вариант выбран по картинке", snap["status"])
 
 
 if __name__ == "__main__":
