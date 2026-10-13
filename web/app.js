@@ -376,8 +376,50 @@ function findItem(key) {
 
 // --- шапка и автообновление ----------------------------------------------------
 
+// Дата «Values Last Updated» в разметке сайта — по времени восточного побережья США
+// ("October 11th, 2026 at 7:08 PM"); сам сайт в браузере переводит её в местное время
+// (то же обновление — "October 12th, 2026 at 2:08 AM" в Москве). Показываем так же.
+const SITE_TIME_ZONE = "America/New_York";
+const MONTHS_EN = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+function zoneOffsetMinutes(ts, zone) {
+  const parts = {};
+  for (const part of new Intl.DateTimeFormat("en-US", {
+    timeZone: zone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric",
+    hour: "numeric", minute: "numeric",
+  }).formatToParts(new Date(ts))) parts[part.type] = Number(part.value);
+  return (Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour % 24, parts.minute) - ts) / 60000;
+}
+
+function siteTime(text) {
+  const match = /([A-Za-z]{3,})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})(?:\s*(?:at\s+)?(\d{1,2}):(\d{2})\s*([AP]\.?M\.?)?)?/i
+    .exec(String(text || ""));
+  const month = match ? MONTHS_EN.indexOf(match[1].slice(0, 3).toLowerCase()) : -1;
+  if (month < 0) return null;
+  const year = Number(match[3]), day = Number(match[2]);
+  if (match[4] === undefined) {
+    return new Date(year, month, day).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+  }
+  let hour = Number(match[4]) % 12;
+  if (!match[6] && Number(match[4]) >= 12) hour = Number(match[4]);
+  if (match[6] && /^p/i.test(match[6])) hour += 12;
+  try {
+    let ts = Date.UTC(year, month, day, hour, Number(match[5]));
+    ts -= zoneOffsetMinutes(ts, SITE_TIME_ZONE) * 60000;
+    ts = Date.UTC(year, month, day, hour, Number(match[5])) - zoneOffsetMinutes(ts, SITE_TIME_ZONE) * 60000;  // переход на летнее время
+    return new Date(ts).toLocaleString("ru-RU", {
+      day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+  } catch (error) {
+    return null;  // браузер без часовых поясов — как написано на сайте
+  }
+}
+
 function renderHeader() {
-  $("siteUpdated").textContent = state.data.site_last_updated || "—";
+  const raw = state.data.site_last_updated;
+  const local = raw ? siteTime(raw) : null;
+  $("siteUpdated").textContent = local || raw || "—";
+  $("siteUpdated").title = raw ? `на сайте: ${raw} (время США); здесь — по вашему времени, как показывает сам сайт` : "";
   $("fetchedAt").textContent = fmtDate(state.data.fetched_at);
   renderRate();
 }

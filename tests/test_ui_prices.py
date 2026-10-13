@@ -125,6 +125,18 @@ class PriceUiTests(unittest.TestCase):
         self.js(f"(async () => {{ $('calcText').value = {json.dumps(text)}; await runCalc(); }})()")
         return self.js("[...document.querySelectorAll('#calcTotals > *')].map((n) => n.textContent)")
 
+    def test_site_time_in_local_zone(self):
+        # Дата обновления сайта — по времени пользователя, как показывает сам сайт.
+        self.browser.call("Emulation.setTimezoneOverride", {"timezoneId": "Europe/Moscow"})
+        self.addCleanup(self.browser.call, "Emulation.setTimezoneOverride", {"timezoneId": ""})
+        self.assertEqual(self.js("siteTime('October 11th, 2026 at 7:08 PM')"), "12 октября 2026 г. в 02:08")
+        self.browser.call("Emulation.setTimezoneOverride", {"timezoneId": "Europe/Kaliningrad"})
+        self.assertEqual(self.js("siteTime('October 11th, 2026 at 7:08 PM')"), "12 октября 2026 г. в 01:08")
+        self.assertIsNone(self.js("siteTime('скоро')"))
+        self.js("state.data.site_last_updated = 'October 11th, 2026 at 7:08 PM'; renderHeader()")
+        self.assertIn("2026", self.js("$('siteUpdated').textContent"))
+        self.assertIn("October 11th, 2026 at 7:08 PM", self.js("$('siteUpdated').title"))
+
     def test_ruble_only_price_is_for_sale(self):
         # Только рублёвая цена StarPets — тоже «продаётся»: строка в «Площадках» и выплата.
         rows = self.js("[...document.querySelectorAll('#mkBody tr')].map((tr) => "
@@ -210,3 +222,4 @@ class PriceUiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
