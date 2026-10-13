@@ -226,7 +226,8 @@ def _variant_rank(item, offer):
     exact = 0 if parser.name_key(offer.get("name") or "") == parser.name_key(item["name"]) else 1
     priced = 0 if offer.get("price") is not None or offer.get("price_rub") is not None else 1
     popularity = offer.get("popularity")
-    return (rarity_miss, year_miss, priced, exact, popularity if isinstance(popularity, (int, float)) else 1.0)
+    stock = offer.get("stock") if isinstance(offer.get("stock"), int) else 0  # больше лотов — основной вариант
+    return (rarity_miss, year_miss, priced, exact, popularity if isinstance(popularity, (int, float)) else 1.0, -stock)
 
 
 # --- оценка ликвидности на площадке ------------------------------------------
@@ -1417,6 +1418,7 @@ class DreamPetsAdapter(Adapter):
                 "sales_week": None,
                 "available": False if missing else bool(lots) if lots is not None else price is not None,
                 "rarity": entry.get("rarity"),
+                "product": True,  # отдельная страница товара: одноимённые — разные варианты, их цены не смешивать
                 "url": entry.get("url") or self.config["url"],
             })
         return offers
@@ -1815,7 +1817,8 @@ class MarketMonitor:
                 matched[key] = dict(offer)
             elif (offer.get("id") is not None and previous.get("id") is not None and offer["id"] != previous["id"]
                   and (offer.get("year") is not None or previous.get("year") is not None
-                       or offer.get("rarity") != previous.get("rarity"))):
+                       or offer.get("rarity") != previous.get("rarity")
+                       or (offer.get("product") and previous.get("product")))):
                 # Разные товары площадки с одним названием (Cane 2015 / 2018 / 2021, Laser
                 # Godly / Rare-нож): не смешивать, а выбрать подходящий этому предмету.
                 if _variant_rank(by_key[key], offer) < _variant_rank(by_key[key], previous):

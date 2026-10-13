@@ -778,6 +778,14 @@ class SameNameRarityTests(unittest.TestCase):
         self.assertEqual(got[("godlies", "Laser")]["price"], 75.0)  # не дешёвый винтаж и не нож
         self.assertEqual(got[("vintages", "Laser")]["price"], 50.0)
 
+    def test_dreampets_same_name_products_are_not_mixed_into_the_cheapest(self):
+        offers = [{"id": "u1", "name": "Laser", "price": 40.0, "currency": "RUB", "stock": 2, "available": True,
+                   "product": True},  # другой вариант без значка: дешевле, лотов мало
+                  {"id": "u2", "name": "Laser", "price": 75.0, "currency": "RUB", "stock": 30, "available": True,
+                   "product": True}]
+        got = self.monitor(offers, {"godlies": ["Laser"]})
+        self.assertEqual((got[("godlies", "Laser")]["price"], got[("godlies", "Laser")]["stock"]), (75.0, 30))
+
     def test_single_item_prefers_the_product_of_its_rarity(self):
         offers = [{"id": 1, "name": "Laser", "rarity": "rare", "kind": "knife", "year": 2026, "price": 1.48,
                    "popularity": 0.1, "available": True},
