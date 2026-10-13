@@ -78,7 +78,7 @@ def build_matcher(items):
     usable = [i for i in items if not i.get("secret") and not parser.is_placeholder(i)]
     index = markets.build_index(usable)
     keys = {}
-    for item in usable:
+    for item in sorted(usable, key=markets.category_rank):  # одноимённые: как у площадок (Godlies первыми)
         keys.setdefault(parser.name_key(item["name"]), item)
 
     def find(name, line=None):
@@ -255,6 +255,8 @@ def name_index(items):
     for item in items:
         if not item.get("secret") and not parser.is_placeholder(item):
             by_key.setdefault(parser.name_key(item["name"]), []).append(item)
+    for same in by_key.values():  # первым — тот, чем чаще торгуют (Laser — Godlies, а не Vintages)
+        same.sort(key=markets.category_rank)
     return by_key
 
 

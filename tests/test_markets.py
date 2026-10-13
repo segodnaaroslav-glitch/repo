@@ -727,6 +727,76 @@ class StarPetsVariantTests(unittest.TestCase):
         self.assertEqual(items["Elf"]["market"]["sp"]["price"], 18.52)  # без года — самый популярный, а не самый дешёвый
 
 
+class SameNameRarityTests(unittest.TestCase):
+    """Laser — это Godly, Vintage (2014), Chroma и Rare-нож 2026: у каждого своя цена."""
+
+    def monitor(self, offers, categories):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "values.json"
+        data = store.empty_data()
+        for category, names in categories.items():  # Vintages идут раньше Godlies — как на сайте
+            store.replace_category(data, category, [
+                parser.make_item(name, category, {"value": "10", "demand": "3", "rarity": "3"}) for name in names], "site")
+        store.save(data, path)
+
+        class Fake(markets.Adapter):
+            def fetch(self):
+                return offers
+
+        monitor = markets.MarketMonitor(path, [{"id": "m", "title": "M", "kind": "fake", "url": "u"}], adapters={"fake": Fake})
+        monitor.poll(monitor.markets[0])
+        return {(i["category"], i["name"]): (i.get("market") or {}).get("m")
+                for i in monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(path)["items"]])}
+
+    def test_starpets_laser_variants_go_to_their_own_items(self):
+        sp = markets.StarPetsAdapter({"id": "m", "title": "M", "kind": "starpets", "url": "https://starpets.gg/mm2"})
+        rows = [  # как в каталоге StarPets: у всех четырёх name = "Laser"
+            {"id": 474, "name": "Laser", "realName": "Laser", "subtype": "gun", "year": None, "rare": "godly",
+             "chroma": False, "_rank": 0.3},
+            {"id": 785, "name": "Laser", "realName": "Disint", "subtype": "gun", "year": 2014, "rare": "vintage",
+             "chroma": False, "_rank": 0.6},
+            {"id": 580, "name": "Laser", "realName": "LaserChroma", "subtype": "gun", "year": None, "rare": "godly",
+             "chroma": True, "_rank": 0.4},
+            {"id": 37790685, "name": "Laser", "realName": "laser_k_2026", "subtype": "knife", "year": 2026,
+             "rare": "rare", "chroma": False, "_rank": 0.1},
+        ]
+        prices = {474: 0.89, 785: 0.59, 580: 1.89, 37790685: 1.48}
+        offers = [sp._offer(row, prices[row["id"]]) for row in rows]
+        got = self.monitor(offers, {"vintages": ["Laser"], "chromas": ["Chroma Laser"], "godlies": ["Laser"]})
+        self.assertEqual(got[("godlies", "Laser")]["price"], 0.89)  # раньше — «нет в продаже»
+        self.assertEqual(got[("vintages", "Laser")]["price"], 0.59)
+        self.assertEqual(got[("chromas", "Chroma Laser")]["price"], 1.89)
+
+    def test_unknown_rarity_goes_to_the_godly_and_rare_knife_does_not_mix_in(self):
+        offers = [{"id": "a", "name": "Laser", "price": 75.0, "currency": "RUB", "stock": 3, "available": True},
+                  {"id": "b", "name": "Laser", "rarity": "Винтажный", "price": 50.0, "currency": "RUB", "stock": 1,
+                   "available": True},
+                  {"id": "c", "name": "Laser", "rarity": "rare", "kind": "knife", "year": 2026, "price": 120.0,
+                   "currency": "RUB", "stock": 9, "available": True}]
+        got = self.monitor(offers, {"vintages": ["Laser"], "godlies": ["Laser"]})
+        self.assertEqual(got[("godlies", "Laser")]["price"], 75.0)  # не дешёвый винтаж и не нож
+        self.assertEqual(got[("vintages", "Laser")]["price"], 50.0)
+
+    def test_single_item_prefers_the_product_of_its_rarity(self):
+        offers = [{"id": 1, "name": "Laser", "rarity": "rare", "kind": "knife", "year": 2026, "price": 1.48,
+                   "popularity": 0.1, "available": True},
+                  {"id": 2, "name": "Laser", "rarity": "godly", "kind": "gun", "price": 0.89, "popularity": 0.3,
+                   "available": True}]
+        got = self.monitor(offers, {"godlies": ["Laser"]})
+        self.assertEqual(got[("godlies", "Laser")]["price"], 0.89)
+
+    def test_dreampets_card_badge_and_link_give_rarity(self):
+        from supreme import dreampets
+        self.assertEqual(dreampets.parse_card_text("Vintage\nLaser\nот 50 ₽\n2 лота")["rarity"], "Vintage")
+        self.assertIsNone(dreampets.parse_card_text("Knife\nLaser\nот 50 ₽")["rarity"])
+        adapter = markets.DreamPetsAdapter({"id": "d", "title": "D", "kind": "dreampets", "url": "https://dp.test/mm2/"})
+        products = {}
+        adapter._upsert(products, {"name": "Laser", "price": 50.0}, 1.0, "рынок", "/mm2/product/laser-vintage/" + U1)
+        self.assertEqual(products[U1]["rarity"], "vintage")
+        self.assertEqual(adapter._offers(products)[0]["rarity"], "vintage")
+
+
 U1 = "2c0af45a-9134-4c09-9b86-502e81ac758e"
 U2 = "3a61a47a-fde2-4740-8de8-c214e8aefca8"
 PRODUCT_PAGE = ('<html><head><title>Harvester — купить в ММ2 (Murder Mystery 2)</title>'

@@ -101,18 +101,64 @@ def market_key(name):
     return parser.name_key(text)
 
 
+# Редкость товара на площадке -> категория Supreme Values. Один и тот же «Laser» бывает
+# Godly, Vintage (2014), Chroma и Rare-ножом 2026 — это разные предметы с разной ценой.
+RARITY_CATEGORY = {
+    "godly": "godlies", "ancient": "ancients", "unique": "uniques", "vintage": "vintages",
+    "legendary": "legendaries", "rare": "rares", "uncommon": "uncommons", "common": "commons",
+}
+_RARITY_WORDS = (
+    ("uncommon", r"uncommon|необычн"), ("common", r"common|обычн"), ("godly", r"godly|годли|божеств"),
+    ("ancient", r"ancient|древн|эншент"), ("unique", r"unique|уникальн"), ("vintage", r"vintage|винтаж"),
+    ("legendary", r"legendary|легендарн"), ("rare", r"rare|редк"),
+)
+# Предмет с неизвестной редкостью (площадка её не показала) из нескольких одноимённых:
+# сначала то, чем торгуют чаще всего.
+_CATEGORY_PREFERENCE = ("godlies", "ancients", "chromas", "uniques", "legendaries", "rares", "uncommons",
+                        "commons", "vintages", "pets", "misc", "sets")
+
+
+def category_rank(item):
+    """Порядок одноимённых предметов: сначала то, чем чаще торгуют."""
+    try:
+        return _CATEGORY_PREFERENCE.index(item.get("category"))
+    except ValueError:
+        return len(_CATEGORY_PREFERENCE)
+
+
+def rarity(value):
+    """'Godly', 'godly', 'Годли', 'Винтажный' -> 'godly' / 'vintage' …; иначе None."""
+    text = str(value or "").strip().lower()
+    for name, pattern in _RARITY_WORDS:
+        if re.match(rf"(?:{pattern})", text):
+            return name
+    return None
+
+
+def expected_category(offer):
+    """Категория Supreme Values, которой подходит товар площадки, или None (неизвестно)."""
+    if str(offer.get("kind") or "").lower() == "pet":
+        return "pets"
+    if re.match(r"(?:chroma\b|c\.\s)", str(offer.get("name") or "").strip(), re.I):
+        return "chromas"
+    return RARITY_CATEGORY.get(rarity(offer.get("rarity")))
+
+
 def build_index(items):
     """Поиск предметов Supreme Values по названию товара на площадке.
 
     Точное название ищется первым. Упрощённый ключ (без "Gun", "Knife", "(Godly)")
     используется, только если он однозначен: "Flowerwood" и "Flowerwood Gun" —
-    разные предметы. Секретные и Untradables не сопоставляются.
+    разные предметы. Секретные и Untradables не сопоставляются. Одноимённые предметы
+    разных категорий (Laser — Godlies и Laser — Vintages) хранятся все, выбор — по
+    редкости товара (find_item).
     """
-    exact, loose, ambiguous = {}, {}, set()
+    exact, every, loose, ambiguous = {}, {}, {}, set()
     for item in items:
         if item.get("secret") or item.get("category") == "untradables":
             continue
         exact.setdefault(parser.name_key(item["name"]), item)
+        every.setdefault(parser.name_key(item["name"]), []).append(item)
         key = market_key(item["name"])
         if not key:
             continue
@@ -122,18 +168,39 @@ def build_index(items):
             loose.setdefault(key, item)
     for key in ambiguous:
         loose.pop(key, None)
-    return {"exact": exact, "loose": loose}
+    for same in every.values():
+        same.sort(key=category_rank)
+    for key, same in every.items():
+        exact[key] = same[0]
+    return {"exact": exact, "every": every, "loose": loose}
+
+
+def _pick(candidates, offer):
+    """Из одноимённых предметов — подходящий товару по редкости. Редкость известна, но
+    ни один не подходит (Laser — Rare-нож 2026, а в списке Godly и Vintage) — None:
+    чужая цена хуже, чем никакой."""
+    if len(candidates) < 2:
+        return candidates[0] if candidates else None
+    category = expected_category(offer)
+    if category is None:
+        return candidates[0]
+    return next((item for item in candidates if item.get("category") == category), None)
 
 
 def find_item(index, offer):
     """Предмет Supreme Values для товара площадки или None."""
     name = str(offer.get("name") or "")
     kind = str(offer.get("kind") or "").lower()
+    every = index.get("every") or {key: [item] for key, item in index["exact"].items()}
     if kind in ("gun", "knife", "pet"):  # "Flowerwood" с типом Gun — это "Flowerwood Gun"
-        item = index["exact"].get(parser.name_key(f"{name} {kind}"))
-        if item:
-            return item
-    return index["exact"].get(parser.name_key(name)) or index["loose"].get(market_key(name))
+        same = every.get(parser.name_key(f"{name} {kind}"))
+        if same:
+            return _pick(same, offer)
+    same = every.get(parser.name_key(name))
+    if same:
+        return _pick(same, offer)
+    item = index["loose"].get(market_key(name))
+    return _pick([item], offer) if item else None
 
 
 def item_id(item):
@@ -149,15 +216,17 @@ def _item_years(item):
 
 
 def _variant_rank(item, offer):
-    """Насколько товар площадки подходит предмету (меньше — лучше): совпадение года
-    из названия/происхождения, точное название, есть ли цена, популярность."""
+    """Насколько товар площадки подходит предмету (меньше — лучше): редкость, совпадение
+    года из названия/происхождения, есть ли цена, точное название, популярность."""
+    category = expected_category(offer)
+    rarity_miss = 0 if category is None or category == item.get("category") else 1  # Rare-нож, а предмет Godly
     years = _item_years(item)
     year = offer.get("year")
     year_miss = 0 if not years else (0 if year in years else 1)
     exact = 0 if parser.name_key(offer.get("name") or "") == parser.name_key(item["name"]) else 1
     priced = 0 if offer.get("price") is not None or offer.get("price_rub") is not None else 1
     popularity = offer.get("popularity")
-    return (year_miss, priced, exact, popularity if isinstance(popularity, (int, float)) else 1.0)
+    return (rarity_miss, year_miss, priced, exact, popularity if isinstance(popularity, (int, float)) else 1.0)
 
 
 # --- оценка ликвидности на площадке ------------------------------------------
@@ -559,6 +628,7 @@ class StarPetsAdapter(Adapter):
             "name": name,
             "image": image if isinstance(image, str) and image.startswith("https://") else None,
             "kind": "pet" if kind == "pet" else subtype,
+            "rarity": rarity(row.get("rare")),
             "year": year,
             "real_name": row.get("realName"),
             "price": price,
@@ -885,6 +955,13 @@ class DreamPetsAdapter(Adapter):
         entry["seen"] = time.time()  # источник подтвердил, что товар есть
         if link:
             entry["url"] = self._absolute(link)
+        if rarity(data.get("rarity")):
+            entry["rarity"] = rarity(data.get("rarity"))
+        elif not entry.get("rarity") and link:
+            # /mm2/product/laser-vintage/<uuid>: редкость словом в ссылке (если она там есть)
+            slug = re.search(r"/product/([^/?#]+)", str(link))
+            words = slug.group(1).lower().split("-") if slug else []
+            entry["rarity"] = next((w for w in words if w in RARITY_CATEGORY), None)
         if name and not self._keeps_name(entry, name, source):
             entry["name"] = name
             self._index_name(products, key)
@@ -1339,6 +1416,7 @@ class DreamPetsAdapter(Adapter):
                 "stock": None if missing else lots,  # не 0: исчезнувшие лоты — не покупки
                 "sales_week": None,
                 "available": False if missing else bool(lots) if lots is not None else price is not None,
+                "rarity": entry.get("rarity"),
                 "url": entry.get("url") or self.config["url"],
             })
         return offers
@@ -1736,9 +1814,10 @@ class MarketMonitor:
             if previous is None:
                 matched[key] = dict(offer)
             elif (offer.get("id") is not None and previous.get("id") is not None and offer["id"] != previous["id"]
-                  and (offer.get("year") is not None or previous.get("year") is not None)):
-                # Разные товары площадки с одним названием (Cane 2015 / 2018 / 2021):
-                # не смешивать, а выбрать подходящий этому предмету.
+                  and (offer.get("year") is not None or previous.get("year") is not None
+                       or offer.get("rarity") != previous.get("rarity"))):
+                # Разные товары площадки с одним названием (Cane 2015 / 2018 / 2021, Laser
+                # Godly / Rare-нож): не смешивать, а выбрать подходящий этому предмету.
                 if _variant_rank(by_key[key], offer) < _variant_rank(by_key[key], previous):
                     matched[key] = dict(offer)
             else:  # несколько предложений одного товара: самое дешёвое, количество суммируется

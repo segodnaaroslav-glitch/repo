@@ -413,12 +413,13 @@ class BrowserPageTests(unittest.TestCase):
         for card in result["cards"]:
             n = int(card["href"].rsplit("-", 1)[1])
             self.assertEqual(dreampets.parse_card_text(card["text"]),
-                             {"name": f"Item {n}", "price": 100 + n + 0.5, "lots": n})
+                             {"name": f"Item {n}", "price": 100 + n + 0.5, "lots": n, "rarity": None})
         self.assertEqual(result["title"], "Рынок")
 
     def test_card_text_keeps_split_prices_and_names(self):
         result = self.collect("/split")
-        found = {int(c["href"].rsplit("-", 1)[1]): dreampets.parse_card_text(c["text"]) for c in result["cards"]}
+        found = {int(c["href"].rsplit("-", 1)[1]): {k: v for k, v in dreampets.parse_card_text(c["text"]).items()
+                                                     if k != "rarity"} for c in result["cards"]}
         self.assertEqual(found, {
             1: {"name": "Item 1", "price": 231.71, "lots": 1},  # не 71: "231" и ",71" — одна надпись
             2: {"name": "Chroma Seer", "price": 101, "lots": 2},  # не "Seer"

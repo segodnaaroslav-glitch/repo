@@ -234,6 +234,7 @@ def walk_products(data, depth=0, parent=None):
             _, pid = _first(data, ID_KEYS, lambda v: v if isinstance(v, (str, int)) and not isinstance(v, bool) else None)
             slug = data.get("slug") if isinstance(data.get("slug"), str) else None
             found = {"name": name, "price": price, "lots": lots, "id": pid, "slug": slug,
+                     "rarity": next((data[k] for k in ("rarity", "rare", "quality") if isinstance(data.get(k), str)), None),
                      "keys": (name_key, price_key, count_key)}
         offers = data.get("offers")
         if name and isinstance(offers, dict) and price is None:  # JSON-LD Product + AggregateOffer
@@ -264,7 +265,7 @@ _BUTTON_RE = re.compile(r"^(купить|в корзину|продать|под
 # названия: значок Chroma над "Harvester" значит товар "Chroma Harvester".
 _RARITY_RE = re.compile(r"^(common|uncommon|rare|legendary|godly|ancient|vintage|unique|pet|misc|knife|gun|weapon|"
                         r"mm2|мм2|нож|пистолет|оружие|питомец|"
-                        r"обычн\w*|необычн\w*|редк\w*|легендарн\w*|древн\w*|винтажн\w*)$", re.I)
+                        r"обычн\w*|необычн\w*|редк\w*|легендарн\w*|древн\w*|винтажн\w*|годли|уникальн\w*)$", re.I)
 _CHROMA_RE = re.compile(r"^(?:chroma|хрома)$", re.I)
 
 
@@ -314,6 +315,10 @@ def parse_card_text(text, slug=None):
             break
     lots = next((lots_value(m) for m in (LOTS_RE.search(line) for line in lines) if m), None)
     chroma = any(_CHROMA_RE.match(line) for line in lines)
+    # Значок редкости (Godly, Vintage, «Винтажный») — какой из одноимённых предметов это
+    rarity = next((m.group(1) for m in (_RARITY_RE.match(line) for line in lines)
+                   if m and not re.match(r"(?:pet|misc|knife|gun|weapon|mm2|мм2|нож|пистолет|оружие|питомец)$",
+                                         m.group(1), re.I)), None)
     names = []
     for line in lines:
         line = re.sub(r"^[^A-Za-z]*[А-Яа-яЁё][^A-Za-z]*(?=[A-Za-z])", "", line)  # «Только что купили: Harvester»
@@ -325,7 +330,7 @@ def parse_card_text(text, slug=None):
                 name = "Chroma " + name
             names.append(name)
     name = max(names, key=lambda n: slug_fit(n, slug)) if names else None  # при равенстве — первая
-    return {"name": name, "price": price, "lots": lots}
+    return {"name": name, "price": price, "lots": lots, "rarity": rarity}
 
 
 # --- карточки в разметке ------------------------------------------------------------
