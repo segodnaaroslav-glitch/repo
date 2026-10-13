@@ -8,6 +8,12 @@ on:
 permissions:
   contents: write
 
+# Новый запуск отменяет старый на той же ветке: иначе старая сборка, закончив позже,
+# перезапишет выложенный exe более старой версией.
+concurrency:
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
