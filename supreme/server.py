@@ -10,7 +10,7 @@ from pathlib import Path
 import base64
 import binascii
 
-from . import autosync, calc, imgproxy, liquidity, markets, ocr, parser, paths, store, tileocr
+from . import autosync, calc, dpreport, imgproxy, liquidity, markets, ocr, parser, paths, store, tileocr
 
 WEB_DIR = paths.resource_dir() / "web"
 STATIC_FILES = {
@@ -449,6 +449,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, f"Неверные признаки картинок: {error}")
         return self._json(200, {"saved": saved})
 
+    def _dreampets_check(self):
+        """«Проверить DreamPets»: отчёт о том, что площадка на самом деле показывает и отдаёт."""
+        ours, base = {}, "https://dreampets.gg/mm2/"
+        if self.monitor is not None:
+            for market in self.monitor.markets:
+                if market.config.get("kind") != "dreampets":
+                    continue
+                base = market.config.get("url") or base
+                for key, offer in dict(market.offers).items():
+                    ours[f"{key} {offer.get('url')}"] = {
+                        "item": key, "name": offer.get("name"), "price": offer.get("price"),
+                        "stock": offer.get("stock"), "rarity": offer.get("rarity"), "url": offer.get("url")}
+                for key, entry in dict((market.cache or {}).get("products") or {}).items():
+                    ours.setdefault(f"cache {key} {entry.get('url')}", dict(entry, cache_key=key))
+        try:
+            path, report = dpreport.make_report(base, ours=ours)
+        except Exception as error:  # отчёт — подсказка разработчику, программу он не роняет
+            return self._error(500, f"Не удалось проверить DreamPets: {error}")
+        if os.name == "nt":
+            try:
+                os.startfile(str(path.parent))  # открыть папку с отчётом
+            except OSError:
+                pass
+        return self._json(200, {"path": str(path), "cards": len(report["cards"]), "api": len(report["api"]),
+                                "pages": len(report["pages"]), "notes": report["notes"][:5]})
+
     @staticmethod
     def _calc_item(item):
         market = item.get("market") or {}
@@ -550,6 +576,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(409, "Площадки выключены")
             self.monitor.poll_now()
             return self._json(202, self._status())
+        if path == "/api/dreampets/check":
+            return self._dreampets_check()
         if path == "/api/check":
             if self.sync is None:
                 return self._error(409, "Автообновление выключено")

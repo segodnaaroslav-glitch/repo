@@ -1619,6 +1619,7 @@ class MarketState:
         return {
             "id": self.config["id"],
             "title": self.config["title"],
+            "kind": self.config.get("kind"),
             "url": self.config.get("url"),
             "status": self.status,
             "message": self.message,

@@ -266,6 +266,7 @@ class Browser:
         self.session = None
         self.next_id = 0
         self.events = []
+        self.responses = None  # capture_network(): ответы сети вкладки (Network.responseReceived)
         self.notes = []  # что пошло не так, но не помешало (для отчёта)
         self._lock = threading.Lock()
         sweep_stale_profiles()
@@ -447,8 +448,26 @@ class Browser:
 
     def _keep(self, message):
         if "method" in message and message.get("sessionId") == self.session:
+            if message["method"].startswith("Network."):
+                if self.responses is not None and message["method"] == "Network.responseReceived":
+                    self.responses.append(message.get("params") or {})
+                    del self.responses[:-2000]
+                return  # сетевые события не вытесняют события загрузки страницы
             self.events.append(message)
             del self.events[:-200]
+
+    def capture_network(self):
+        """Запоминать ответы, которые получает страница (её API) — для отчёта о площадке."""
+        self.responses = []
+        self.call("Network.enable", {"maxResourceBufferSize": 20_000_000, "maxTotalBufferSize": 100_000_000})
+
+    def response_body(self, request_id, timeout=15):
+        """Тело ответа, полученного страницей (после capture_network)."""
+        result = self.call("Network.getResponseBody", {"requestId": request_id}, timeout=timeout)
+        body = result.get("body") or ""
+        if result.get("base64Encoded"):
+            body = base64.b64decode(body).decode("utf-8", "replace")
+        return body
 
     def call(self, method, params=None, timeout=60, browser=False):
         """Команда DevTools. browser=True — команда самому браузеру, иначе — вкладке."""

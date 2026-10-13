@@ -1030,6 +1030,7 @@ function renderMarketCards() {
   const box = $("marketCards");
   const live = (state.status && state.status.markets) || markets;
   $("marketsBtn").classList.toggle("hidden", !live.length);
+  $("dpCheckBtn").classList.toggle("hidden", !live.some((m) => m.kind === "dreampets"));
   box.replaceChildren(...live.map((market) => {
     const card = el("div", "market");
     const head = el("div", "market-head");
@@ -1636,6 +1637,21 @@ async function pollMarkets() {
   pollSoon();
 }
 
+async function checkDreamPets() {
+  const button = $("dpCheckBtn");
+  button.disabled = true;
+  toast("Проверяю DreamPets в скрытом браузере — это 1–2 минуты…");
+  try {
+    const result = await postJson("/api/dreampets/check");
+    toast(`Готово: карточек ${result.cards}, ответов площадки ${result.api}, страниц ${result.pages}. ` +
+          `Файл: ${result.path} — пришлите его разработчику.`);
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function checkSite() {
   try {
     await postJson("/api/check");
@@ -1862,6 +1878,7 @@ function init() {
   $("updateBtn").addEventListener("click", startUpdate);
   $("checkBtn").addEventListener("click", checkSite);
   $("marketsBtn").addEventListener("click", pollMarkets);
+  $("dpCheckBtn").addEventListener("click", checkDreamPets);
   $("importForm").addEventListener("submit", submitImport);
   $("drawerClose").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {
