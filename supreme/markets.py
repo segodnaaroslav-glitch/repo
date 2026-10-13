@@ -187,6 +187,104 @@ def _pick(candidates, offer):
     return next((item for item in candidates if item.get("category") == category), None)
 
 
+def candidate_items(index, offer):
+    """Все предметы Supreme Values с названием товара площадки (одноимённые — все)."""
+    name = str(offer.get("name") or "")
+    kind = str(offer.get("kind") or "").lower()
+    every = index.get("every") or {key: [item] for key, item in index["exact"].items()}
+    if kind in ("gun", "knife", "pet"):
+        same = every.get(parser.name_key(f"{name} {kind}"))
+        if same:
+            return list(same)
+    same = every.get(parser.name_key(name))
+    if same:
+        return list(same)
+    item = index["loose"].get(market_key(name))
+    return [item] if item else []
+
+
+# Соседние ступени редкости: площадка и Supreme Values иногда относят предмет к соседней
+# (Common/Uncommon) — такой товар годится, если лучшего нет. Дальше — это другой предмет.
+_LADDER = ("commons", "uncommons", "rares", "legendaries", "godlies", "ancients")
+_KIND_WORDS = (("gun", re.compile(r"(?:^|[^a-z])(?:gun|g)(?:[^a-z]|$)")), ("knife", re.compile(r"(?:^|[^a-z])(?:knife|k)(?:[^a-z]|$)")))
+
+
+def _item_kind(item):
+    """Нож / пистолет / питомец по категории, названию или имени картинки; иначе None."""
+    if item.get("category") == "pets":
+        return "pet"
+    name = str(item.get("name") or "").lower()
+    if re.search(r"\bgun\b", name):
+        return "gun"
+    if re.search(r"\bknife\b", name):
+        return "knife"
+    stem = re.sub(r"\.[a-z0-9]+$", "", str(item.get("image") or "").rsplit("/", 1)[-1].lower())
+    for kind, pattern in _KIND_WORDS:
+        if stem and pattern.search(stem.replace("-", "_")):
+            return kind
+    return None
+
+
+def _plain(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def offer_fit(item, offer):
+    """Насколько товар площадки подходит предмету: число (меньше — лучше) или None —
+    точно другой предмет. Учитываются редкость (категория), год из происхождения,
+    нож/пистолет/питомец, внутреннее имя картинки, есть ли цена, популярность и лоты."""
+    score = 0.0
+    category, own = expected_category(offer), item.get("category")
+    if category and category != own:
+        if category in _LADDER and own in _LADDER and abs(_LADDER.index(category) - _LADDER.index(own)) == 1:
+            score += 60
+        else:
+            return None
+    years, year = _item_years(item), offer.get("year")
+    if years:
+        score += -20 if year in years else (50 if year is not None else 10)
+    elif year is not None:
+        score += 3  # у предмета год не указан — скорее основной товар без года
+    kind, offer_kind = _item_kind(item), str(offer.get("kind") or "").lower() or None
+    if kind and offer_kind and kind != offer_kind:
+        score += 40
+    stem = _plain(re.sub(r"\.[a-z0-9]+$", "", str(item.get("image") or "").rsplit("/", 1)[-1]))
+    if stem and stem in (_plain(offer.get("real_name")), _plain(offer.get("image_id"))):
+        score -= 200  # одна и та же картинка в игре — тот самый предмет
+    if offer.get("price") is None and offer.get("price_rub") is None:
+        score += 2
+    popularity = offer.get("popularity")
+    score += popularity if isinstance(popularity, (int, float)) else 1.0
+    stock = offer.get("stock")
+    if isinstance(stock, int):
+        score -= min(stock, 1000) / 1000.0  # больше лотов — основной вариант
+    return score
+
+
+def assign_offers(groups):
+    """Одноимённые предметы и товары одной группы: каждому предмету — самый подходящий
+    товар, один товар — одному предмету. groups: [(предметы, товары)].
+    -> ({id предмета: товар}, сколько товаров не подошло ни одному)."""
+    matched, unused = {}, 0
+    for items, offers in groups:
+        pairs = []
+        for i, item in enumerate(items):
+            for j, offer in enumerate(offers):
+                fit = offer_fit(item, offer)
+                if fit is not None:
+                    pairs.append((fit, i, j))
+        pairs.sort()
+        taken_items, taken_offers = set(), set()
+        for fit, i, j in pairs:
+            if i in taken_items or j in taken_offers:
+                continue
+            taken_items.add(i)
+            taken_offers.add(j)
+            matched[item_id(items[i])] = offers[j]
+        unused += len(offers) - len(taken_offers)
+    return matched, unused
+
+
 def find_item(index, offer):
     """Предмет Supreme Values для товара площадки или None."""
     name = str(offer.get("name") or "")
@@ -630,6 +728,8 @@ class StarPetsAdapter(Adapter):
             "image": image if isinstance(image, str) and image.startswith("https://") else None,
             "kind": "pet" if kind == "pet" else subtype,
             "rarity": rarity(row.get("rare")),
+            "product": True,  # отдельный товар каталога: одноимённые — разные предметы
+            "image_id": row.get("imageId"),
             "year": year,
             "real_name": row.get("realName"),
             "price": price,
@@ -1807,7 +1907,16 @@ class MarketMonitor:
         by_key = {item_id(item): item for item in items}
         matched = {}
         unmatched = 0
+        groups = {}  # товары-страницы (StarPets, DreamPets): одноимённые сопоставляются вместе
         for offer in offers:
+            if offer.get("product"):
+                candidates = candidate_items(index, offer)
+                if not candidates:
+                    unmatched += 1
+                    continue
+                group = groups.setdefault(tuple(item_id(c) for c in candidates), (candidates, []))
+                group[1].append(offer)
+                continue
             item = find_item(index, offer)
             if item is None:
                 unmatched += 1
@@ -1834,6 +1943,9 @@ class MarketMonitor:
                 if offer.get("popularity") is not None:
                     previous["popularity"] = min(previous.get("popularity", 1), offer["popularity"])
                 previous["available"] = bool(previous.get("available")) or bool(offer.get("available"))
+        assigned, unused = assign_offers(groups.values())
+        matched.update((key, dict(offer)) for key, offer in assigned.items())
+        unmatched += unused
         now = _now()
         cutoff = (now - timedelta(hours=HISTORY_HOURS)).timestamp()
         with self._lock:

@@ -1341,3 +1341,31 @@ class DreamPetsBrowserPagesTests(unittest.TestCase):
         # страницы нет — не продаётся; число лотов неизвестно (не «все куплены»)
         self.assertEqual((products[U2]["price"], products[U2]["lots"], products[U2]["missing"]), (None, None, 1))
         self.assertTrue(products[U1]["page_at"] and products[U2]["page_at"])
+
+
+class SameNameGroupTests(unittest.TestCase):
+    """StarPets называет одинаково десятки разных товаров (Pumpkin: ножи, пистолеты, питомцы
+    разных лет): каждому предмету — свой товар по категории, году и типу, один товар — одному."""
+
+    def test_group_assignment_by_year_kind_and_rarity(self):
+        def item(name, category, origin=""):
+            return parser.make_item(name, category, {"value": "1", "demand": "1", "rarity": "1", "origin": origin})
+
+        items = [item("Pumpkin", "pets", "Halloween 2018"), item("Elf", "commons", "Christmas 2017"),
+                 item("Elf", "pets", "Christmas 2019")]
+        sp = markets.StarPetsAdapter({"id": "m", "title": "M", "kind": "starpets", "url": "https://starpets.gg/mm2"})
+        rows = [("Pumpkin", "weapon", "knife", "uncommon", 2020, 0.06), ("Pumpkin", "pet", "floating", "common", 2018, 0.32),
+                ("Pumpkin", "pet", "floating", "common", 2019, 0.08), ("Elf", "weapon", "knife", "common", 2017, 0.08),
+                ("Elf", "weapon", "gun", "common", 2023, 0.05), ("Elf", "pet", "walking", "uncommon", 2019, 18.52)]
+        offers = [sp._offer({"id": n, "name": name, "_type": kind, "subtype": sub, "rare": rare, "year": year,
+                             "_rank": 0.5}, price) for n, (name, kind, sub, rare, year, price) in enumerate(rows)]
+        index = markets.build_index(items)
+        groups = {}
+        for offer in offers:
+            candidates = markets.candidate_items(index, offer)
+            groups.setdefault(tuple(markets.item_id(c) for c in candidates), (candidates, []))[1].append(offer)
+        got, unused = markets.assign_offers(groups.values())
+        self.assertEqual(got["pets:Pumpkin"]["price"], 0.32)  # питомец 2018, а не нож и не питомец 2019
+        self.assertEqual(got["commons:Elf"]["price"], 0.08)  # нож 2017
+        self.assertEqual(got["pets:Elf"]["price"], 18.52)
+        self.assertEqual(unused, 3)
