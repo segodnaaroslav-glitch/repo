@@ -1406,6 +1406,7 @@ function renderCalc() {
     remove.setAttribute("aria-label", `Убрать: ${item.name}`);
     remove.addEventListener("click", () => {
       calc.items.splice(index, 1);
+      if (window.PicTiles) PicTiles.onRemove(item);  // плитки строки больше не считаются
       renderCalc();
     });
     removeCell.append(remove);

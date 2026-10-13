@@ -413,9 +413,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body, content_type = self.images.get(url)
         except imgproxy.ImageError as error:
-            return self._error(error.status, str(error))
+            # kind — почему: «нет связи» браузер считает только по настоящим обрывам связи с сайтом
+            # (network), а не по одной плохой картинке; site — с каким сайтом.
+            return self._json(error.status, {"error": str(error), "kind": error.kind, "site": imgproxy.site_of(url)})
         except Exception as error:  # ответить, а не оборвать связь: браузер примет обрыв за «нет сети»
-            return self._error(502, f"Картинка не загрузилась: {error}")
+            return self._json(502, {"error": f"Картинка не загрузилась: {error}", "kind": "final",
+                                    "site": imgproxy.site_of(url)})
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))

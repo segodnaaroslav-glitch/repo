@@ -10,6 +10,7 @@ web/picmatch.js) хранятся в data/picfeat.json — тоже считаю
 ключу), только https и только с supremevalues.com и starpets.gg.
 """
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -26,14 +27,26 @@ from pathlib import Path
 ALLOWED_SITES = ("supremevalues.com", "starpets.gg")  # и их поддомены (cdn.starpets.gg)
 MAX_BYTES = 2 * 1024 * 1024        # картинка предмета — десятки КБ; больше — не картинка предмета
 MAX_CACHE_BYTES = 150 * 1024 * 1024
+PAGE_BYTES = 64 * 1024             # страница вместо картинки читается до стольких байт (ищется защита сайта)
 TIMEOUT = 10
-FAIL_RETRY = 6 * 3600              # адрес, который ответил «нет такой картинки», не запрашивается 6 часов
-BUSY_RETRY = 10 * 60               # сайт перегружен (5xx) — 10 минут
-BLOCK_PAUSE = 30 * 60              # сайт не пускает программу (403, 429, страница защиты) — весь сайт на 30 минут
-BLOCK_STATUSES = (401, 403, 429, 451)
-OFFLINE_AFTER = 4                  # столько обрывов связи подряд — сети нет:
-OFFLINE_PAUSE = 60                 # минуту картинки не запрашиваются (ответ сразу, без ожидания)
-PARALLEL = 4                       # одновременных загрузок с сайтов
+FAIL_RETRY = 6 * 3600              # адрес, который ответил «нет такой картинки» или отказал, не запрашивается 6 часов
+BUSY_RETRY = 10 * 60               # сайт перегружен (5xx) или картинка пришла не целиком — 10 минут
+BLOCK_PAUSE = 30 * 60              # сайт не пускает программу (429, страница защиты) — весь сайт на 30 минут
+DENIED_STATUSES = (401, 403, 451)  # отказ в одной картинке: CDN так отвечает и на «нет такой картинки»
+DENIED_AFTER = 3                   # столько разных картинок подряд сайт не отдал — он не пускает программу
+OFFLINE_AFTER = 4                  # столько обрывов связи с сайтом подряд — связи с ним нет:
+OFFLINE_PAUSE = 60                 # минуту его картинки не запрашиваются (ответ сразу, без ожидания)
+PARALLEL = 4                       # одновременных загрузок со всех сайтов
+# Бережно к сайтам: (загрузок одновременно, секунд между началами загрузок). supremevalues.com
+# под защитой от ботов и отдаёт ещё и цены: поток запросов закрыл бы программе и их. Картинки
+# StarPets раздаёт CDN.
+PACE = {"supremevalues.com": (2, 0.4), "starpets.gg": (3, 0.1)}
+PACE_DEFAULT = (2, 0.4)
+SLOW_MAX = 5.0                     # сайт занят или рвёт связь — промежуток удваивается, но не больше 5 с
+SESSION_CAP = {"supremevalues.com": 300}  # загрузок с сайта за запуск программы; остальные — в следующий раз
+# Страница защиты от ботов (Imperva у supremevalues.com, Cloudflare) вместо картинки.
+_CHALLENGE = (b"_incapsula_resource", b"request unsuccessful", b"incapsula incident", b"cf-chl",
+              b"challenge-platform", b"just a moment...", b"attention required! | cloudflare", b"captcha")
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
@@ -50,9 +63,11 @@ _EXTENSIONS = (".webp", ".png", ".jpg", ".gif", ".avif")
 
 
 class ImageError(Exception):
-    """kind: "final" — картинки нет (запомнить надолго), "busy" — сайт занят,
-    "network" — нет связи (не запоминать для адреса), "blocked" — сайт не пускает программу
-    (пауза для всего сайта: тысяча запросов подряд к защищённому сайту только продлит блокировку)."""
+    """kind: "final" — картинки нет (запомнить надолго), "denied" — сайт не отдал эту картинку
+    (запомнить надолго; несколько разных подряд — сайт не пускает программу), "busy" — сайт занят
+    (запомнить ненадолго), "network" — нет связи с сайтом (не запоминать для адреса), "blocked" —
+    сайт не пускает программу (пауза для всего сайта: тысяча запросов подряд к защищённому сайту
+    только продлит блокировку), "capped" — с сайта на этот запуск скачано достаточно."""
 
     def __init__(self, status, message, kind="final"):
         super().__init__(message)
@@ -74,32 +89,38 @@ def sniff(data):
 
 def complete(data, ext):
     """Картинка пришла целиком? Обрыв связи посреди загрузки даёт начало файла с верными
-    первыми байтами: такой файл не открывается, и в кэше он остался бы навсегда."""
-    if ext == ".png":
-        return b"IEND" in data[-64:]
+    первыми байтами: такой файл не открывается (или открывается наполовину серым), и в кэше
+    он остался бы навсегда. Лишние байты после конца картинки — не беда."""
+    if ext == ".png":  # блок IEND (длина 0, тип, контрольная сумма)
+        end = data.rfind(b"\x00\x00\x00\x00IEND")
+        return end >= 8 and end + 12 <= len(data)
     if ext == ".webp":
         return len(data) >= 12 and int.from_bytes(data[4:8], "little") + 8 <= len(data)
-    if ext == ".jpg":
-        return b"\xff\xd9" in data[-64:]  # в сжатых данных JPEG пары FF D9 не бывает
+    if ext == ".jpg":  # конец картинки (FF D9) — после последнего блока сжатых данных (FF DA)
+        return data.rfind(b"\xff\xd9") > max(1, data.rfind(b"\xff\xda"))
     if ext == ".gif":
         return b";" in data[-32:]
-    if ext == ".avif":  # коробки ISO BMFF: размеры складываются ровно в длину файла
-        pos = 0
-        while pos < len(data):
+    if ext == ".avif":  # коробки ISO BMFF: каждая целиком, среди них — данные картинки (mdat)
+        pos, seen = 0, set()
+        while pos + 8 <= len(data):
             size = int.from_bytes(data[pos:pos + 4], "big")
             if size == 1:
                 size = int.from_bytes(data[pos + 8:pos + 16], "big")
             elif size == 0:
-                return pos + 8 <= len(data)
+                return True  # последняя коробка — до конца файла
             if size < 8:
+                break  # дальше не коробки — лишние байты после картинки
+            if pos + size > len(data):
                 return False
+            seen.add(data[pos + 4:pos + 8])
             pos += size
-        return pos == len(data)
+        return b"mdat" in seen
     return False
 
 
-def _site(url):
-    """Доверенный сайт адреса (supremevalues.com / starpets.gg) — пауза общая для его поддоменов."""
+def site_of(url):
+    """Доверенный сайт адреса (supremevalues.com / starpets.gg): связь, пауза и бережность —
+    общие для его поддоменов."""
     host = (urllib.parse.urlsplit(str(url)).hostname or "").lower().rstrip(".")
     return next((site for site in ALLOWED_SITES if host == site or host.endswith("." + site)), host)
 
@@ -134,6 +155,19 @@ class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _challenge(page):
+    """Страница защиты от ботов вместо картинки?"""
+    page = (page or b"")[:PAGE_BYTES].lower()
+    return any(marker in page for marker in _CHALLENGE)
+
+
+def _error_page(error):
+    try:
+        return error.read(PAGE_BYTES) or b""
+    except Exception:  # тело ответа с ошибкой не прочиталось — без него
+        return b""
+
+
 def _download(url, opener=None):
     """Скачать картинку: (байты, (content-type, расширение)). ImageError — если это не картинка."""
     opener = opener or urllib.request.build_opener(_CheckedRedirects)
@@ -145,16 +179,22 @@ def _download(url, opener=None):
             if declared is not None and declared > MAX_BYTES:
                 raise ImageError(502, "картинка слишком большая")
             ctype = (response.headers.get_content_type() or "").lower()
-            if ctype in ("text/html", "application/xhtml+xml"):  # страница защиты сайта вместо картинки
-                raise ImageError(429, "сайт картинок не пускает программу (страница защиты)", "blocked")
+            if ctype in ("text/html", "application/xhtml+xml"):
+                # Страница вместо картинки: защита сайта (не пускает программу) — или так сайт
+                # отвечает на этот адрес (нет такой картинки): тогда виноват только адрес.
+                if _challenge(response.read(PAGE_BYTES)):
+                    raise ImageError(429, "сайт картинок не пускает программу (страница защиты)", "blocked")
+                raise ImageError(502, "сайт вернул страницу вместо картинки", "denied")
             if not (ctype.startswith("image/") or ctype in ("application/octet-stream", "binary/octet-stream")):
                 raise ImageError(502, f"сайт вернул не картинку ({ctype})")
             body = response.read(MAX_BYTES + 1)
     except urllib.error.HTTPError as error:
-        if error.code in BLOCK_STATUSES:
+        if error.code == 429 or _challenge(_error_page(error)):
             raise ImageError(429, f"сайт картинок не пускает программу (HTTP {error.code})", "blocked") from None
+        if error.code in DENIED_STATUSES:
+            raise ImageError(502, f"сайт картинок не отдал картинку (HTTP {error.code})", "denied") from None
         busy = error.code >= 500
-        status = 404 if error.code in (404, 410) else 503 if busy else 502
+        status = 404 if error.code in (404, 410) else 502
         raise ImageError(status, f"сайт картинок ответил HTTP {error.code}", "busy" if busy else "final") from None
     except http.client.InvalidURL as error:
         raise ImageError(502, f"неверный адрес картинки ({error})") from None
@@ -169,7 +209,11 @@ def _download(url, opener=None):
     if kind is None:
         raise ImageError(502, "сайт вернул не картинку")
     if not complete(body, kind[1]):
-        raise ImageError(503, "картинка пришла не целиком", "busy")
+        # Длина совпала с объявленной — такая картинка на самом сайте (испорчена): надолго.
+        # Длины не было — скорее связь оборвалась: попробовать позже.
+        if declared is not None:
+            raise ImageError(502, "картинка на сайте испорчена (не целиком)")
+        raise ImageError(502, "картинка пришла не целиком", "busy")
     return body, kind
 
 
@@ -188,20 +232,28 @@ def _atomic_write(path, data):
 
 
 class ImageCache:
-    """Картинки на диске: <папка>/<sha1 адреса>.<расширение>; неудачи — в failed.json."""
+    """Картинки на диске: <папка>/<sha1 адреса>.<расширение>; неудачи — в failed.json.
+    С каждым сайтом — отдельно: бережно (PACE, SESSION_CAP), своя связь и своя пауза, если он
+    не пускает программу: один недоступный сайт не мешает брать картинки с другого."""
 
-    def __init__(self, folder, download=_download, clock=time.time):
+    def __init__(self, folder, download=_download, clock=time.time, sleep=time.sleep):
         self.folder = Path(folder)
         self._download = download
         self._clock = clock
+        self._sleep = sleep
         self._lock = threading.Lock()
         self._url_locks = {}
         self._slots = threading.BoundedSemaphore(PARALLEL)
         self._failed = None
         self._size = None
-        self._network_errors = 0
-        self._offline_until = 0.0
-        self._paused = {}  # сайт -> до какого времени не запрашивать (не пускает программу)
+        self._site_slots = {}      # сайт -> сколько загрузок с него одновременно
+        self._next_start = {}      # сайт -> не раньше какого времени начать следующую загрузку
+        self._slow = {}            # сайт -> промежуток между загрузками, увеличенный после ошибок
+        self._fetched = {}         # сайт -> загрузок за этот запуск программы
+        self._network_errors = {}  # сайт -> обрывов связи подряд
+        self._offline_until = {}   # сайт -> до какого времени связи с ним нет
+        self._denied = {}          # сайт -> сколько разных картинок подряд он не отдал
+        self._paused = {}          # сайт -> до какого времени не запрашивать (не пускает программу)
 
     @staticmethod
     def _name(url):
@@ -236,10 +288,14 @@ class ImageCache:
             except OSError:
                 pass
 
+    def _capped(self, site):
+        return self._fetched.get(site, 0) >= SESSION_CAP.get(site, float("inf"))
+
     def get(self, url):
         """(байты, content-type). ImageError — если картинку не получить."""
         if not host_allowed(url):
             raise ImageError(403, "картинки берутся только с supremevalues.com и starpets.gg")
+        site = site_of(url)
         with self._lock:
             url_lock = self._url_locks.setdefault(url, threading.Lock())
         with url_lock:  # один адрес качается один раз, остальные запросы ждут файл
@@ -254,24 +310,30 @@ class ImageCache:
                     return data, kind[0]
             with self._lock:
                 failed = self._failures().get(url)
-                offline = self._clock() < self._offline_until
-                paused = self._clock() < self._paused.get(_site(url), 0.0)
+                now = self._clock()
+                offline = now < self._offline_until.get(site, 0.0)
+                paused = now < self._paused.get(site, 0.0)
+                capped = self._capped(site)
             if failed:
                 at, kind = failed
                 if self._clock() - at < (BUSY_RETRY if kind == "busy" else FAIL_RETRY):
-                    raise ImageError(404 if kind == "final" else 503, "картинка недавно не загрузилась", kind)
+                    raise ImageError(404 if kind == "final" else 502, "картинка недавно не загрузилась", kind)
             if offline:
-                raise ImageError(503, "нет связи с сайтами картинок", "network")
+                raise ImageError(503, "нет связи с сайтом картинок", "network")
             if paused:
                 raise ImageError(429, "сайт картинок не пускает программу — попробую позже", "blocked")
-            with self._slots:
+            if capped:
+                raise ImageError(429, "картинок с этого сайта на этот запуск достаточно — остальные в следующий раз", "capped")
+            with self._polite(site):
                 try:
                     data, (ctype, ext) = self._download(url)
                 except ImageError as error:
-                    self._after_error(url, error)
+                    self._after_error(url, site, error)
                     raise
-            with self._lock:
-                self._network_errors = 0
+            with self._lock:  # сайт ответил: связь есть, и он пускает программу
+                self._network_errors[site] = 0
+                self._denied[site] = 0
+                self._slow.pop(site, None)
             try:
                 self.folder.mkdir(parents=True, exist_ok=True)
                 _atomic_write(self.folder / (self._name(url) + ext), data)
@@ -280,18 +342,50 @@ class ImageCache:
                 pass  # не сохранилась — отдадим и так
             return data, ctype
 
-    def _after_error(self, url, error):
-        if error.kind == "blocked":
+    @contextlib.contextmanager
+    def _polite(self, site):
+        """Загрузка с сайта: не больше PACE[сайт] одновременно, начала — не чаще промежутка
+        (после ошибок он больше) и не больше SESSION_CAP[сайт] загрузок за запуск."""
+        parallel, gap = PACE.get(site, PACE_DEFAULT)
+        with self._lock:
+            slots = self._site_slots.setdefault(site, threading.BoundedSemaphore(parallel))
+        with slots:
             with self._lock:
-                self._paused[_site(url)] = self._clock() + BLOCK_PAUSE
-            return  # не пускает весь сайт — сам адрес не виноват
-        if error.kind == "network":
-            with self._lock:
-                self._network_errors += 1
-                if self._network_errors >= OFFLINE_AFTER:
-                    self._offline_until = self._clock() + OFFLINE_PAUSE
-                    self._network_errors = 0
-            return  # сеть пропала — сам адрес не виноват
+                if self._capped(site):
+                    raise ImageError(429, "картинок с этого сайта на этот запуск достаточно — остальные в следующий раз",
+                                     "capped")
+                self._fetched[site] = self._fetched.get(site, 0) + 1
+                now = self._clock()
+                start = max(now, self._next_start.get(site, 0.0))
+                self._next_start[site] = start + max(gap, self._slow.get(site, 0.0))
+            if start > now:
+                self._sleep(start - now)
+            with self._slots:
+                yield
+
+    def _after_error(self, url, site, error):
+        with self._lock:
+            if error.kind in ("busy", "network"):  # сайт занят или рвёт связь — к нему реже
+                gap = PACE.get(site, PACE_DEFAULT)[1]
+                self._slow[site] = min(SLOW_MAX, max(gap, self._slow.get(site, 0.0)) * 2)
+            if error.kind == "network":
+                errors = self._network_errors.get(site, 0) + 1
+                if errors >= OFFLINE_AFTER:
+                    self._offline_until[site] = self._clock() + OFFLINE_PAUSE
+                    errors = 0
+                self._network_errors[site] = errors
+                return  # связь с сайтом пропала — сам адрес не виноват
+            self._network_errors[site] = 0  # сайт ответил — связь с ним есть
+            if error.kind == "blocked":
+                self._paused[site] = self._clock() + BLOCK_PAUSE
+                self._denied[site] = 0
+                return  # не пускает весь сайт — сам адрес не виноват
+            if error.kind == "denied":  # отказ в одной картинке; в нескольких разных подряд — не пускает
+                denied = self._denied.get(site, 0) + 1
+                if denied >= DENIED_AFTER:
+                    self._paused[site] = self._clock() + BLOCK_PAUSE
+                    denied = 0
+                self._denied[site] = denied
         self._remember_failure(url, error.kind)
 
     def _added(self, size):
