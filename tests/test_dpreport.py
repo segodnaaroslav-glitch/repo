@@ -59,7 +59,7 @@ class DreamPetsCheckEndpointTests(unittest.TestCase):
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         with unittest.mock.patch.object(dpreport, "make_report", fake), \
-                unittest.mock.patch.object(server.os, "name", "posix"):
+                unittest.mock.patch.object(server.os, "startfile", create=True) as opened:
             conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=10)
             conn.request("POST", "/api/dreampets/check", body="{}", headers={"Content-Type": "application/json"})
             response = conn.getresponse()
@@ -67,3 +67,4 @@ class DreamPetsCheckEndpointTests(unittest.TestCase):
         self.assertEqual(response.status, 200, body)
         self.assertEqual((body["cards"], body["api"], body["pages"]), (2, 1, 1))
         self.assertEqual(calls[0][0], "https://dreampets.gg/mm2/")
+        self.assertEqual(opened.call_count, 1 if server.os.name == "nt" else 0)  # папка с отчётом — в Windows
