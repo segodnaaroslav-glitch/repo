@@ -3,12 +3,14 @@
 import json
 import os
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import base64
 import binascii
 
-from . import autosync, calc, liquidity, markets, ocr, parser, paths, store, tileocr
+from . import autosync, calc, imgproxy, liquidity, markets, ocr, parser, paths, store, tileocr
 
 WEB_DIR = paths.resource_dir() / "web"
 STATIC_FILES = {
@@ -16,11 +18,15 @@ STATIC_FILES = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/picmatch.js": ("picmatch.js", "text/javascript; charset=utf-8"),
+    "/pictiles.js": ("pictiles.js", "text/javascript; charset=utf-8"),
 }
 MAX_BODY = 5 * 1024 * 1024
 MAX_CALC_BODY = 64 * 1024 * 1024  # несколько скриншотов (интерфейс уменьшает большие)
 DRAIN_LIMIT = 256 * 1024 * 1024  # слишком большой запрос дочитывается, чтобы браузер увидел ответ
 MAX_IMAGES = 8
+MAX_BADGE_TILES = 300  # плиток на скриншот для повторного чтения значков «xN»
+LARGE_POSTS = ("/api/calc", "/api/calc/badges")  # со скриншотами — больший предел размера
 
 
 class _ExclusiveServer(ThreadingHTTPServer):
@@ -133,6 +139,9 @@ class Handler(BaseHTTPRequestHandler):
     monitor = None  # MarketMonitor или None
     rate = None  # RateWatcher или None
     data_path = None
+    images = None  # imgproxy.ImageCache — картинки предметов для сравнения по картинке
+    features = None  # imgproxy.FeatureStore — их признаки (data/picfeat.json)
+    pic_sources = None  # {"stamp", "sources", "keys", "lock"} — адреса картинок известных предметов
 
     def log_message(self, format, *args):
         pass  # не засорять консоль строками каждого запроса
@@ -190,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
         """Калькулятор продажи: текст и/или скриншоты -> предметы с ценами площадок."""
         text = body.get("text") if isinstance(body.get("text"), str) else ""
         images = body.get("images") if isinstance(body.get("images"), list) else []
+        has_picked = isinstance(body.get("picked"), list) and bool(body["picked"])
+        pictures = body.get("pictures") is True  # браузер умеет искать плитки по картинке
         if len(images) > MAX_IMAGES:
             return self._error(400, f"Не больше {MAX_IMAGES} скриншотов за раз")
         decoded, ocr_errors = [], []
@@ -200,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
                 decoded.append((index, base64.b64decode(image.split(",", 1)[-1], validate=False)))
             except (binascii.Error, ValueError):
                 ocr_errors.append(f"скриншот {index}: не картинка")
-        if not text.strip() and not decoded:
+        if not text.strip() and not decoded and not has_picked:
             message = "; ".join(ocr_errors) or "Вставьте список предметов или добавьте скриншот"
             return self._error(400, message)
         try:
@@ -216,8 +227,14 @@ class Handler(BaseHTTPRequestHandler):
         # Скриншоты: сначала как инвентарь MM2 (плитки: название на полосе + «xN»),
         # иначе — как обычный текст (список, чат).
         matcher = tileocr.NameMatcher([i["name"] for i in items if not i.get("secret")]) if decoded else None
-        shots, ocr_lines, unknown_tiles = [], [], 0
+        picked = calc.picked_entries(body.get("picked"), items)
+        by_name = calc.name_index(items) if decoded else {}
+        shots, ocr_lines, unknown_tiles, shot_info = [], [], 0, []
+        found, unmatched = calc.match_text(text, items) if text.strip() else ([], [])
         for index, raw in decoded:
+            # Для браузера: что распознавание нашло на скриншоте (index — номер в списке images с 0).
+            info = {"index": index - 1, "width": None, "height": None, "mode": "error", "text_items": 0, "tiles": []}
+            shot_info.append(info)
             try:
                 words, tiles = ocr.read_inventory(raw, matcher)
             except ocr.OcrError as error:
@@ -226,25 +243,51 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as error:  # одна картинка не должна ломать весь расчёт
                 ocr_errors.append(f"скриншот {index}: не удалось распознать ({error})")
                 continue
+            info["width"], info["height"] = words.get("width"), words.get("height")
+            for number, tile in enumerate(tiles):
+                tile["id"] = f"{index - 1}:{number}"
             if any(tile["name"] for tile in tiles):
                 shots.append(tiles)
                 unknown_tiles += sum(1 for tile in tiles if not tile["name"])
+                info["mode"] = "tiles"
             else:
-                ocr_lines.extend(ocr.lines_from_words(words))
-        if not text.strip() and not shots and not ocr_lines:
+                # Каждый скриншот — отдельно: «x2» в конце одного не относится к началу другого,
+                # а браузер может убрать строки скриншота, если по картинке это инвентарь.
+                lines = ocr.lines_from_words(words)
+                ocr_lines.extend(lines)
+                info["mode"] = "text"
+                shot_found, shot_unmatched = calc.match_text("\n".join(lines), items) if lines else ([], [])
+                found.extend(shot_found)
+                unmatched.extend(shot_unmatched)
+                info["text_items"] = len(shot_found)
+                info["text_rows"] = [{"key": markets.item_id(entry["item"]), "qty": entry["qty"],
+                                      "score": round(entry["score"], 2), "seen": entry["seen"]} for entry in shot_found]
+            info["tiles"] = calc.describe_tiles(tiles, by_name)
+        if not text.strip() and not shots and not ocr_lines and not picked and not (pictures and shot_info):
             return self._error(400, "; ".join(ocr_errors) or "На скриншотах не найдено ни одного предмета")
-        found, unmatched = calc.match_text(text + "\n" + "\n".join(ocr_lines), items)
         tile_found, tile_unmatched = calc.match_tiles(shots, items)
-        merged = {markets.item_id(entry["item"]): entry for entry in found}
+        merged = {}
+        for entry in found:  # текст и скриншоты, прочитанные как текст: один предмет — одна строка
+            key = markets.item_id(entry["item"])
+            if key in merged:
+                merged[key]["qty"] += entry["qty"]
+                merged[key]["score"] = min(merged[key]["score"], entry["score"])
+                merged[key]["seen"] += entry["seen"]
+            else:
+                merged[key] = dict(entry, seen=list(entry["seen"]))
         for entry in tile_found:
             key = markets.item_id(entry["item"])
             if key in merged:
                 merged[key]["qty"] += entry["qty"]
                 merged[key]["seen"] += entry["seen"]
-                for field in ("alternatives", "ambiguous", "qty_uncertain"):
+                for field in ("alternatives", "ambiguous", "qty_uncertain", "tiles", "tile_qty"):
                     merged[key].setdefault(field, entry[field])
             else:
                 merged[key] = entry
+        for item, qty, via in picked:  # узнанное браузером по картинке или выбранное пользователем
+            key = markets.item_id(item)
+            entry = merged.setdefault(key, {"item": item, "qty": 0, "score": 1.0, "seen": [], "via": via})
+            entry["qty"] = min(9999, entry["qty"] + qty)
         result = []
         for entry in merged.values():
             item = entry["item"]
@@ -255,7 +298,12 @@ class Handler(BaseHTTPRequestHandler):
                 "seen": entry["seen"],
                 "ambiguous": bool(entry.get("ambiguous")),
                 "qty_uncertain": bool(entry.get("qty_uncertain")),
-                "alternatives": [self._calc_item(other) for other in entry.get("alternatives") or []],
+                "alternatives": [dict(self._calc_item(other), key=markets.item_id(other))
+                                 for other in entry.get("alternatives") or []],
+                "key": markets.item_id(item),
+                "tiles": entry.get("tiles") or [],
+                "tile_qty": entry.get("tile_qty") or 0,
+                "via": entry.get("via") or ("name" if entry.get("tiles") else "text"),
             })
             result.append(row)
         return self._json(200, {
@@ -265,9 +313,138 @@ class Handler(BaseHTTPRequestHandler):
             "tiles": sum(len(tiles) for tiles in shots),
             "unknown_tiles": unknown_tiles,
             "ocr_errors": ocr_errors,
+            "shots": shot_info,
             "rate": self.rate.status() if self.rate else None,
             "fees": {m["id"]: m.get("fee", 0) for m in (self.monitor.configs() if self.monitor else [])},
         })
+
+    def _calc_badges(self, body):
+        """Значки «xN» плиток, которые браузер нашёл по картинке (распознавание их не нашло):
+        {"shots": [{"index", "image", "boxes": [[x, y, w, h]]}]} -> количество каждой плитки.
+        Нет значка — 1 шт.; значок есть, но не прочитан — "qty_uncertain"."""
+        shots = body.get("shots") if isinstance(body.get("shots"), list) else []
+        if len(shots) > MAX_IMAGES:
+            return self._error(400, f"Не больше {MAX_IMAGES} скриншотов за раз")
+        result, errors = [], []
+        for number, shot in enumerate(shots, 1):
+            if not isinstance(shot, dict) or not isinstance(shot.get("image"), str):
+                continue
+            # Ответ — по плитке на каждое место из запроса (в том же порядке); неверное место — 1 шт.
+            # «name» — чтобы tileocr.badge_regions взял плитку: название здесь не нужно.
+            tiles = []
+            for box in (shot.get("boxes") if isinstance(shot.get("boxes"), list) else [])[:MAX_BADGE_TILES]:
+                ok = (isinstance(box, list) and len(box) == 4
+                      and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in box)
+                      and 8 <= box[2] <= 10000 and 8 <= box[3] <= 10000 and abs(box[0]) <= 10 ** 5 and abs(box[1]) <= 10 ** 5)
+                tiles.append({"name": "?" if ok else None, "box": [int(round(v)) for v in box] if ok else None,
+                              "qty": 1, "qty_from_badge": False})
+            index = shot.get("index") if isinstance(shot.get("index"), int) else number - 1
+            read = False
+            if any(tile["box"] for tile in tiles):
+                try:
+                    raw = base64.b64decode(shot["image"].split(",", 1)[-1], validate=False)
+                    regions = tileocr.badge_regions(tiles)
+                    again = ocr.recognize_regions(raw, [area for _, area in regions])
+                    tileocr.apply_region_badges(tiles, regions, again.get("words"), again.get("areas"))
+                    read = True
+                except (binascii.Error, ValueError):
+                    errors.append(f"скриншот {index + 1}: не картинка")
+                except ocr.OcrError as error:
+                    errors.append(f"скриншот {index + 1}: {error}")
+                except Exception as error:  # без количества, но с найденными предметами
+                    errors.append(f"скриншот {index + 1}: значки не прочитаны ({error})")
+            result.append({"index": index, "read": read, "tiles": [
+                {"qty": int(t["qty"]), "qty_from_badge": bool(t["qty_from_badge"]),
+                 "qty_uncertain": bool(t.get("qty_uncertain"))} for t in tiles]})
+        return self._json(200, {"shots": result, "ocr_errors": errors})
+
+    # --- картинки предметов (сравнение плиток со скриншотов по картинке) ---
+
+    def _pic_sources(self):
+        """({ключ: {"site"|"market": адрес}}, ключи всех предметов) — адреса картинок известных
+        предметов. Пересчитывается, только когда изменились цены или данные площадок."""
+        holder = self.pic_sources
+        version = self.monitor.version if self.monitor else 0
+        try:
+            stamp = (os.stat(self.data_path or store.DATA_FILE).st_mtime_ns, version)
+        except OSError:
+            stamp = (0, version)
+        with holder["lock"]:
+            if holder["stamp"] == stamp:
+                return holder["sources"], holder["keys"]
+        items = [i for i in store.load(self.data_path)["items"] if not parser.is_placeholder(i) and not i.get("secret")]
+        # Картинка StarPets нужна и тем, у кого есть картинка с сайта (два эталона на предмет):
+        # annotate берёт её с площадки, только когда своей картинки у предмета нет.
+        probes = [dict(item, image=None) for item in items]
+        if self.monitor is not None:
+            try:
+                self.monitor.annotate(probes)
+            except Exception:
+                pass
+        sources = {}
+        for item, probe in zip(items, probes):
+            if item["category"] == "sets":
+                continue  # набор не лежит в инвентаре плиткой, а его картинка — один из предметов
+            entry = {}
+            for src, url in (("site", item.get("image")), ("market", probe.get("image_market"))):
+                if isinstance(url, str) and imgproxy.host_allowed(url):
+                    entry[src] = url
+            if entry:
+                sources[markets.item_id(item)] = entry
+        keys = {markets.item_id(item) for item in items}
+        with holder["lock"]:
+            holder.update(stamp=stamp, sources=sources, keys=keys)
+        return sources, keys
+
+    def _same_site(self):
+        """Картинки и признаки — только для страниц самой программы (не для чужих сайтов)."""
+        return self.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
+
+    def _item_image(self, query):
+        params = urllib.parse.parse_qs(query)
+        key = (params.get("key") or [""])[0]
+        src = (params.get("src") or ["site"])[0]
+        try:
+            url = self._pic_sources()[0].get(key, {}).get(src)
+        except (OSError, ValueError) as error:
+            return self._error(500, f"Не удалось прочитать цены: {error}")
+        if not url:
+            return self._error(404, "У предмета нет такой картинки")
+        try:
+            body, content_type = self.images.get(url)
+        except imgproxy.ImageError as error:
+            return self._error(error.status, str(error))
+        except Exception as error:  # ответить, а не оборвать связь: браузер примет обрыв за «нет сети»
+            return self._error(502, f"Картинка не загрузилась: {error}")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        # Адрес запроса — ключ предмета, а не адрес картинки: из кэша браузера после смены картинки
+        # пришла бы старая, и её признаки сохранились бы для новой. Повтор дёшев — картинка на диске.
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _picfeat(self):
+        try:
+            sources, _ = self._pic_sources()
+        except (OSError, ValueError):
+            sources = {}
+        self._send(200, self.features.snapshot_json({"sources": sources}), "application/json; charset=utf-8")
+
+    def _save_picfeat(self, body):
+        try:
+            sources, keys = self._pic_sources()
+            saved = self.features.update(body, sources, keys, set(parser.CATEGORY_TITLES))
+        except ValueError as error:
+            return self._error(409, str(error))
+        except OSError as error:
+            return self._error(500, f"Не удалось сохранить признаки картинок: {error}")
+        except (TypeError, AttributeError, KeyError) as error:  # странный запрос — ответ, а не обрыв связи
+            return self._error(400, f"Неверные признаки картинок: {error}")
+        return self._json(200, {"saved": saved})
 
     @staticmethod
     def _calc_item(item):
@@ -322,6 +499,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, payload)
         if path == "/api/status":
             return self._json(200, self._status())
+        if path in ("/api/itemimg", "/api/picfeat"):
+            if not self._same_site():
+                return self._error(403, "Запрос с чужого сайта запрещён")
+            if path == "/api/picfeat":
+                return self._picfeat()
+            return self._item_image(self.path.partition("?")[2])
         return self._error(404, "Не найдено")
 
     def do_POST(self):
@@ -333,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return self._error(400, "Неверная длина запроса")
-        limit = MAX_CALC_BODY if self.path.split("?", 1)[0] == "/api/calc" else MAX_BODY
+        limit = MAX_CALC_BODY if self.path.split("?", 1)[0] in LARGE_POSTS else MAX_BODY
         if length < 0 or length > limit:
             if 0 < length <= DRAIN_LIMIT:
                 self._drain(length)  # иначе браузер видит обрыв связи вместо сообщения
@@ -355,6 +538,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(202, {"started": started, **self._status()})
         if path == "/api/calc":
             return self._calc(body)
+        if path == "/api/calc/badges":
+            return self._calc_badges(body)
+        if path == "/api/picfeat":
+            return self._save_picfeat(body)
         if path == "/api/markets/poll":
             if self.monitor is None:
                 return self._error(409, "Площадки выключены")
@@ -393,9 +580,12 @@ def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=
     sync = None
     if auto_sync:
         sync = autosync.AutoSync(job, data_path, **({"check_site": check_site} if check_site else {}))
+    data_dir = Path(data_path).parent if data_path else store.DATA_DIR
     handler = type(
         "BoundHandler", (Handler,),
-        {"job": job, "sync": sync, "monitor": monitor, "rate": rate, "data_path": data_path},
+        {"job": job, "sync": sync, "monitor": monitor, "rate": rate, "data_path": data_path,
+         "images": imgproxy.ImageCache(data_dir / "images"), "features": imgproxy.FeatureStore(data_dir / "picfeat.json"),
+         "pic_sources": {"stamp": None, "sources": {}, "keys": set(), "lock": threading.Lock()}},
     )
     server_class = _ExclusiveServer if os.name == "nt" else ThreadingHTTPServer
     last_error = None

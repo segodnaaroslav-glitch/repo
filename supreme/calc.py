@@ -249,16 +249,64 @@ def merge_shots(shots):
     return merged
 
 
+def name_index(items):
+    """{ключ названия: [предметы]} — у одного названия бывает несколько предметов (Cowboy — ружьё и нож)."""
+    by_key = {}
+    for item in items:
+        if not item.get("secret") and not parser.is_placeholder(item):
+            by_key.setdefault(parser.name_key(item["name"]), []).append(item)
+    return by_key
+
+
+def tile_choice(tile, by_key):
+    """Плитка -> (предмет или None, выбран ли однозначно, все предметы с этим названием).
+
+    Из нескольких предметов с одним названием выбирается подходящий по цвету полосы,
+    иначе — первый (неоднозначно: выберет картинка или пользователь)."""
+    candidates = by_key.get(parser.name_key(tile["name"])) or [] if tile.get("name") else []
+    if not candidates:
+        return None, False, []
+    item, sure = candidates[0], len(candidates) == 1
+    if not sure:
+        fits = [c for c in candidates if c["category"] in banner_categories(tile.get("bg"))]
+        if len(fits) == 1:
+            item, sure = fits[0], True
+    return item, sure, candidates
+
+
+def describe_tiles(tiles, by_key):
+    """Плитки скриншота для браузера (сравнение по картинке): место, количество и предмет."""
+    out = []
+    for tile in tiles:
+        item, sure, candidates = tile_choice(tile, by_key)
+        out.append({
+            "id": tile.get("id"),
+            "box": tile.get("box"),
+            "badge_box": tile.get("badge_box"),
+            "name_box": tile.get("name_box"),
+            "name": tile.get("name"),
+            "text": tile.get("text") or "",
+            "score": round(float(tile.get("score") or 0.0), 3),
+            "qty": max(1, int(tile.get("qty") or 1)),
+            "qty_from_badge": bool(tile.get("qty_from_badge")),
+            "qty_uncertain": bool(tile.get("qty_uncertain")),
+            "clipped": bool(tile.get("clipped")),
+            "bg": tile.get("bg"),
+            "key": markets.item_id(item) if item else None,
+            "sure": sure,
+            "candidates": [markets.item_id(c) for c in candidates],
+        })
+    return out
+
+
 def match_tiles(shots, items):
     """Плитки со скриншотов -> найденные предметы (как у match_text) и неузнанные названия.
 
     У записи есть "alternatives" — другие предметы с тем же названием, и "ambiguous", если
-    выбрать по цвету полосы не удалось (пусть выберет пользователь).
+    выбрать по цвету полосы не удалось (пусть выберет пользователь); "tiles" — посчитанные
+    плитки ({"id", "qty"}, если у плитки есть "id"), "tile_qty" — сколько штук с плиток.
     """
-    usable = [i for i in items if not i.get("secret") and not parser.is_placeholder(i)]
-    by_key = {}
-    for item in usable:
-        by_key.setdefault(parser.name_key(item["name"]), []).append(item)
+    by_key = name_index(items)
     found, unmatched = {}, []
     for name, tiles in merge_shots(shots).items():
         candidates = by_key.get(parser.name_key(name)) or []
@@ -266,21 +314,44 @@ def match_tiles(shots, items):
             unmatched.append(name)
             continue
         for tile in tiles:
-            item, sure = candidates[0], len(candidates) == 1
-            if not sure:
-                fits = [c for c in candidates if c["category"] in banner_categories(tile.get("bg"))]
-                if len(fits) == 1:
-                    item, sure = fits[0], True
+            item, sure, _ = tile_choice(tile, by_key)
             key = markets.item_id(item)
             qty = max(1, int(tile.get("qty") or 1))
             entry = found.setdefault(key, {
                 "item": item, "qty": 0, "score": float(tile.get("score") or 1.0), "seen": [],
                 "alternatives": [c for c in candidates if c is not item], "ambiguous": False,
-                "qty_uncertain": False, "from_screenshot": True,
+                "qty_uncertain": False, "from_screenshot": True, "tiles": [], "tile_qty": 0,
             })
             entry["qty"] += qty
+            entry["tile_qty"] += qty
+            if tile.get("id") is not None:
+                entry["tiles"].append({"id": tile["id"], "qty": qty})
             entry["score"] = min(entry["score"], float(tile.get("score") or 1.0))
             entry["seen"].append(f"{tile.get('text') or name} ×{qty}" if qty > 1 else (tile.get("text") or name))
             entry["ambiguous"] = entry["ambiguous"] or not sure
             entry["qty_uncertain"] = entry["qty_uncertain"] or bool(tile.get("qty_uncertain"))
     return list(found.values()), unmatched
+
+
+# --- предметы, узнанные в браузере по картинке ----------------------------------------
+
+PICKED_VIA = ("pic", "user")
+MAX_PICKED = 500
+
+
+def picked_entries(picked, items):
+    """Поле "picked" запроса /api/calc: [{"key", "qty", "via"}] — предметы, которые браузер узнал
+    по картинке ("pic") или выбрал пользователь ("user").
+    -> [(предмет, количество 1..9999, via)]; неизвестные и секретные предметы пропускаются."""
+    by_id = {markets.item_id(i): i for i in items if not i.get("secret") and not parser.is_placeholder(i)}
+    out = []
+    for entry in picked[:MAX_PICKED] if isinstance(picked, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("key"), str) or entry["key"] not in by_id:
+            continue
+        try:
+            qty = int(entry.get("qty") or 1)
+        except (TypeError, ValueError, OverflowError):
+            qty = 1
+        via = entry.get("via") if entry.get("via") in PICKED_VIA else "pic"
+        out.append((by_id[entry["key"]], max(1, min(9999, qty)), via))
+    return out
