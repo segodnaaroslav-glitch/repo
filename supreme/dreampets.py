@@ -265,7 +265,9 @@ _BUTTON_RE = re.compile(r"^(купить|в корзину|продать|под
 # названия: значок Chroma над "Harvester" значит товар "Chroma Harvester".
 _RARITY_RE = re.compile(r"^(common|uncommon|rare|legendary|godly|ancient|vintage|unique|pet|misc|knife|gun|weapon|"
                         r"mm2|мм2|нож|пистолет|оружие|питомец|"
-                        r"обычн\w*|необычн\w*|редк\w*|легендарн\w*|древн\w*|винтажн\w*|годли|уникальн\w*)$", re.I)
+                        r"обычн\w*|необычн\w*|редк\w*|легендарн\w*|древн\w*|винтажн\w*|годли|уникальн\w*|"
+                        r"classic|christmas|halloween|"
+                        r"классическ\w*|рождеств\w*|новогодн\w*|хэллоуин\w*|хеллоуин\w*)$", re.I)
 _CHROMA_RE = re.compile(r"^(?:chroma|хрома)$", re.I)
 
 

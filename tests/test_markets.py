@@ -1000,7 +1000,10 @@ fetch('/api/catalog?game=mm2').then((r) => r.json()).then((data) => {
     def test_visible_price_wins_over_data_inside_the_page(self):
         """Режим «как на сайте»: цена с карточки, которую видит посетитель, а не число из данных
         страницы (там бывает другая валюта или старая цена) — и в следующих опросах тоже."""
+        import uuid
         items = [{"id": U1, "slug": "harvester", "title": "Harvester", "minPrice": 99, "lotsCount": 7}]
+        items += [{"id": str(uuid.UUID(int=i)), "slug": f"item-{i}", "title": f"Item {i}", "minPrice": 10 + i,
+                   "lotsCount": i} for i in range(1, 7)]
         wrong = json.dumps({"props": {"items": [{"id": U1, "name": "Harvester", "price": 1.23, "lotsCount": 7}]}})
         page = self.SPA.replace("</body>", f'<script id="__NEXT_DATA__" type="application/json">{wrong}</script></body>')
         routes = {"/mm2/": page, "/api/catalog?game=mm2": json.dumps({"items": items})}
@@ -1020,6 +1023,52 @@ fetch('/api/catalog?game=mm2').then((r) => r.json()).then((data) => {
         self.assertEqual(offers["Harvester"], 99)
         offers = {o["name"]: o["price"] for o in markets.DreamPetsAdapter(config, cache).fetch()}  # без браузера
         self.assertEqual(offers["Harvester"], 99)
+
+    # Как настоящий рынок DreamPets (скриншот пользователя): карточки без ссылок, список
+    # листается внутри своей панели и дорисовывается при прокрутке, значок редкости над
+    # названием (в том числе HALLOWEEN), «от» и цена с точкой, в шапке — баланс «0 ₽».
+    LIKE_SITE = """<html><head><title>DreamPets</title><style>
+#list{height:400px;overflow-y:auto} .card{height:180px;margin:4px;border:1px solid #333}
+</style></head><body><header>Баланс: <b>0 ₽</b></header><div id="list"></div><script>
+const all = [];
+const rarities = ['ANCIENT', 'LEGENDARY', 'HALLOWEEN', 'GODLY', 'UNCOMMON', 'CHRISTMAS', 'CLASSIC'];
+for (let i = 0; i < 60; i++) all.push({r: rarities[i % rarities.length], n: 'Item ' + i, p: (i + 1) + '.' + (i % 10) + '9'});
+all[0] = {r: 'HALLOWEEN', n: 'Candies', p: '2'};
+all[1] = {r: 'GODLY', n: 'Candy', p: '227.88'};
+let shown = 0;
+const list = document.getElementById('list');
+function more() {
+  for (const it of all.slice(shown, shown + 12)) {
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.innerHTML = '<img src="data:,"><div><span class="dot"></span>' + it.r + '</div><div>' + it.n +
+                  '</div><div><small>от</small> <b>' + it.p + ' ₽</b></div>';
+    list.appendChild(d);
+  }
+  shown += 12;
+}
+more();
+list.addEventListener('scroll', () => { if (list.scrollTop + list.clientHeight > list.scrollHeight - 50) more(); });
+</script></body></html>"""
+
+    def test_cards_like_the_real_site_scrolled_inside_a_panel(self):
+        httpd, base = serve_bytes({"/mm2/": self.LIKE_SITE})
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=_test_browser()),
+                      unittest.mock.patch.object(markets.store, "DATA_FILE", Path(tmp.name) / "values.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": base + "/mm2/", "visible": True}
+        offers = markets.DreamPetsAdapter(config, {}).fetch()
+        by_name = {o["name"]: o for o in offers}
+        self.assertEqual(len(offers), 60)  # вся лента, а не первые 12
+        self.assertEqual((by_name["Candies"]["price"], by_name["Candies"]["rarity"]), (2, "HALLOWEEN"))
+        self.assertEqual(by_name["Candy"]["price"], 227.88)
+        self.assertEqual(by_name["Item 33"]["price"], 34.39)
+        self.assertNotIn("HALLOWEEN", by_name)  # значок — не название
 
     def _patch(self):
         tmp = tempfile.TemporaryDirectory()

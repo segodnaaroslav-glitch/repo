@@ -109,7 +109,8 @@ RARITY_CATEGORY = {
 }
 _RARITY_WORDS = (
     ("uncommon", r"uncommon|необычн"), ("common", r"common|обычн"), ("godly", r"godly|годли|божеств"),
-    ("ancient", r"ancient|древн|эншент"), ("unique", r"unique|уникальн"), ("vintage", r"vintage|винтаж"),
+    ("ancient", r"ancient|древн|эншент"), ("unique", r"unique|уникальн"),
+    ("vintage", r"vintage|винтаж|classic|классич"),  # DreamPets зовёт винтажные «Classic»
     ("legendary", r"legendary|легендарн"), ("rare", r"rare|редк"),
 )
 # Предмет с неизвестной редкостью (площадка её не показала) из нескольких одноимённых:
@@ -824,6 +825,7 @@ class DreamPetsAdapter(Adapter):
     VISIBLE_FRESH = 30 * 60
     VISIBLE_PAGES = 60  # страниц списка рынка («Показать ещё», ?page=2…) за проход
     VISIBLE_TIME = 180
+    VISIBLE_MIN = 5  # меньше карточек с ценой — страница не дорисовалась, снимок не обновляется
     MAX_SITEMAPS = 40
     USELESS_PAGES = 6  # прочитано столько страниц, и ни на одной нет ни цены, ни лотов — рисуются скриптом
     MISSING_DROP = 3  # страница товара — 404 столько раз подряд ...
@@ -856,6 +858,8 @@ class DreamPetsAdapter(Adapter):
     def fetch(self):
         base = self.config["url"]
         self.root = re.match(r"https?://[^/]+", base).group(0)
+        if self._visible(base):
+            return self._fetch_visible(base)
         now = time.time()
         products = self.cache.setdefault("products", {})  # uuid -> данные товара
         self._migrate_cache(products, now)
@@ -929,6 +933,66 @@ class DreamPetsAdapter(Adapter):
         if visible is None:
             visible = bool(re.search(r"//(?:www\.)?dreampets\.(?:gg|io)/", base))
         return bool(visible) and bool(fetcher.find_system_browser())
+
+    def _fetch_visible(self, base):
+        """Цены «как на сайте»: только то, что посетитель видит на карточках рынка
+        (название, редкость, «от N ₽»). Рынок читается в скрытом Edge раз в VISIBLE_EVERY;
+        между проходами — последний снимок. Других источников нет: числа из данных
+        страницы и со страниц товаров с экраном не совпадали."""
+        now = time.time()
+        self._new_poll()
+        snap = self.cache.get("visible") or {}
+        error = None
+        if now - snap.get("at", 0) >= self.VISIBLE_EVERY and not self._stopped():
+            try:
+                with cdp.Browser() as browser:
+                    browser.open(base, settle=2)
+                    result = browser.collect_price_cards(timeout=self.VISIBLE_TIME)
+                    for note in browser.notes:
+                        self._step("visible", "заметка", note)
+                cards = []
+                for card in result["cards"]:
+                    slug = re.search(r"/product/([^/?#]+)", card.get("href") or "")
+                    data = dreampets.parse_card_text(card.get("text"), slug.group(1).replace("-", " ") if slug else None)
+                    if data.get("name") and data.get("price") is not None:
+                        cards.append({"name": data["name"], "price": data["price"], "lots": data.get("lots"),
+                                      "rarity": data.get("rarity"), "href": card.get("href") or ""})
+                self._step("visible", base, f"карточек с ценой: {len(cards)}, проходов: {result.get('rounds')}, "
+                                            f"заголовок: {result.get('title')}")
+                if len(cards) >= self.VISIBLE_MIN:
+                    snap = {"at": now, "cards": cards}
+                    self.cache["visible"] = snap
+                else:
+                    error = f"на странице рынка нашлось карточек с ценой: {len(cards)}"
+            except Exception as failure:  # браузер не открылся, сайт не ответил — остаётся прошлый снимок
+                error = f"{type(failure).__name__}: {failure}"
+        age = now - snap.get("at", 0)
+        if not snap.get("cards") or age > self.VISIBLE_FRESH:
+            self.report["visible_error"] = error
+            self._save_report(None)
+            raise fetcher.FetchError("не удалось прочитать цены с сайта DreamPets" + (f": {error}" if error else ""))
+        offers, seen = [], {}
+        for card in snap["cards"]:
+            uuid = dreampets.uuid_of(card["href"]) if card["href"] else None
+            key = uuid or "card:%s:%s" % (parser.name_key(card["name"]), str(card.get("rarity") or "").lower())
+            seen[key] = seen.get(key, 0) + 1
+            offers.append({
+                "id": key if seen[key] == 1 else f"{key}#{seen[key]}",
+                "name": card["name"],
+                "price": card["price"],
+                "currency": "RUB",
+                "stock": card.get("lots"),  # на карточках DreamPets лотов нет — None, а не 0
+                "sales_week": None,
+                "available": True,
+                "rarity": card.get("rarity"),
+                "product": True,
+                "price_from": True,  # «от N ₽» — минимальная цена лота, как на карточке
+                "url": card["href"] or base,
+            })
+        self.complete = True
+        self.note = (f"цены как на сайте: {len(snap['cards'])} карточек, проверено {int(age // 60)} мин назад"
+                     + (f" (последняя проверка не удалась: {error})" if error else ""))
+        return offers
 
     def _visible_fresh(self, entry, now=None):
         seen = entry.get("visible_at")
@@ -2053,6 +2117,7 @@ class MarketMonitor:
                     "price_rub": offer.get("price_rub"),
                     "price_rub_approx": bool(offer.get("price_rub_approx")),
                     "year": offer.get("year"),
+                    "price_from": bool(offer.get("price_from")),
                     "product": " · ".join(str(part) for part in (
                         offer.get("name"), offer.get("rarity"), offer.get("kind"), offer.get("year")) if part),
                     "currency": offer.get("currency") or "USD",

@@ -95,6 +95,13 @@ def make_report(base="https://dreampets.gg/mm2/", ours=None, folder=None, produc
                     "href": href, "text": (card.get("text") or "")[:800], "inner": (card.get("inner") or "")[:800],
                     "parsed": dreampets.parse_card_text(card.get("text"), slug.group(1).replace("-", " ") if slug else None),
                 })
+            try:  # то, по чему программа берёт цены «как на сайте»
+                found = browser.collect_price_cards(timeout=120)
+                report["price_cards"] = [dict(card, parsed=dreampets.parse_card_text(card.get("text")))
+                                         for card in found["cards"][:CARDS_MAX]]
+                report["price_cards_total"] = len(found["cards"])
+            except (cdp.BrowserError, TimeoutError) as error:
+                report["notes"].append(f"карточки по цене: {error}")
             try:
                 report["card_html"] = browser.evaluate(JS_CARD_HTML, timeout=20) or []
             except (cdp.BrowserError, TimeoutError) as error:

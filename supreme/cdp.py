@@ -693,6 +693,27 @@ class Browser:
         return {"cards": list(cards.values()), "api": list(api)[:200], "title": title, "pages": pages, "url": url,
                 "next": following}
 
+    def collect_price_cards(self, timeout=180, wait=1.2, stable_rounds=4):
+        """Все карточки с ценой на открытой странице — как их видит посетитель: страница
+        и её панели прокручиваются до конца, пока новые карточки не перестанут появляться.
+        -> {"cards": [{"href", "text"}], "title", "url", "rounds"}"""
+        cards, title, url, rounds, stable = {}, None, None, 0, 0
+        deadline = time.time() + timeout
+        while time.time() < deadline and stable < stable_rounds:
+            rounds += 1
+            try:
+                result = self.evaluate(JS_PRICE_CARDS % int(wait * 1000), timeout=60, retries=2) or {}
+            except (BrowserError, TimeoutError) as error:
+                self.notes.append(f"карточки: {error}")
+                stable += 1
+                continue
+            title, url = result.get("title") or title, result.get("url") or url
+            before = len(cards)
+            for card in result.get("cards") or []:
+                cards.setdefault((card.get("href") or "", card.get("text") or ""), card)
+            stable = stable + 1 if len(cards) == before else 0
+        return {"cards": list(cards.values()), "title": title, "url": url, "rounds": rounds}
+
     def fetch_many(self, urls, pause=1.0, timeout=15, deadline=60, stop_on=(403, 429, 503)):
         """Запросы изнутри страницы (с её cookies) — по одному, с паузой.
 
@@ -915,6 +936,52 @@ def _windows_job_assign(process):
         return bool(kernel32.AssignProcessToJobObject(handle, int(process._handle)))
     except Exception:
         return False
+
+
+# Карточки товаров по цене на экране (ссылки не нужны): у каждого текста с «₽» ищется
+# самый большой блок вокруг, где эта цена — единственная; его видимый текст и ссылка
+# (если есть) — карточка. Перед чтением прокручивается и сама страница, и все блоки
+# со своей прокруткой (список рынка часто листается внутри панели), и нажимается
+# «Показать ещё». Видимый текст — как innerText: строки блоков отдельно.
+JS_PRICE_CARDS = r"""(async (wait) => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const scrollers = [document.scrollingElement || document.documentElement];
+  for (const el of document.querySelectorAll('body *')) {
+    const style = getComputedStyle(el);
+    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 20) scrollers.push(el);
+  }
+  for (const el of scrollers) el.scrollTop = el.scrollHeight;
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  const more = /показать ещё|показать еще|загрузить ещё|загрузить еще|load more|show more/i;
+  for (const b of document.querySelectorAll('button, [role=button]')) {
+    if (more.test(b.textContent || '') && b.offsetParent) { b.click(); break; }
+  }
+  await sleep(wait);
+  const leaves = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (/₽|руб/.test(node.nodeValue) && /\d/.test(node.parentElement ? node.parentElement.textContent : '')) {
+      if (node.parentElement) leaves.push(node.parentElement);
+    }
+  }
+  const count = new Map();
+  for (const leaf of leaves) {
+    for (let el = leaf; el && el !== document.body; el = el.parentElement) count.set(el, (count.get(el) || 0) + 1);
+  }
+  const out = [], seen = new Set();
+  for (const leaf of leaves) {
+    let box = leaf;
+    while (box.parentElement && box.parentElement !== document.body && count.get(box.parentElement) === 1)
+      box = box.parentElement;
+    if (seen.has(box)) continue;
+    seen.add(box);
+    const link = box.querySelector('a[href]') || box.closest('a[href]');
+    const text = (box.innerText || box.textContent || '').trim();
+    if (text) out.push({ href: link ? link.href : '', text: text.slice(0, 600) });
+  }
+  return { cards: out, scrollers: scrollers.length, title: document.title, url: location.href };
+})(%s)"""
 
 
 # --- скрипты для страницы ---------------------------------------------------------

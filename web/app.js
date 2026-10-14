@@ -196,6 +196,12 @@ function onSale(info) {
 // Цена площадки или почему её нет.
 function infoNode(info, className) {
   const money = infoMoney(info);
+  if (money && info.price_from) {
+    // Минимальная цена, как на карточке площадки: «от 330 ₽».
+    const box = el("span", className || "");
+    box.append(el("span", "muted small", "от "), moneyNode(money));
+    return box;
+  }
   if (money) return moneyNode(money, className);
   return el("span", "muted", priceUnknown(info) ? "цена неизвестна" : "нет в продаже");
 }
