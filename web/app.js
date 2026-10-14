@@ -1422,10 +1422,11 @@ function calcFee(id) {
   return calc.fees && typeof calc.fees[id] === "number" ? calc.fees[id] : feeOf(id);
 }
 
-function calcMoney(item, id) {
+function calcMoney(item, id, gross) {
   const info = item.prices[id];
   if (!info || (finite(info.price) === null && finite(info.price_rub) === null)) return null;
-  return infoMoney(info, (1 - calcFee(id)) * item.qty);
+  // gross — по ценам площадки (без комиссии), иначе — сколько вы получите после комиссии
+  return infoMoney(info, (gross ? 1 : 1 - calcFee(id)) * item.qty);
 }
 
 function fillCalcSums(item, sums) {
@@ -1533,26 +1534,36 @@ function renderCalcTotals() {
     return;
   }
   const totals = {};
+  const gross = {};
   const missing = {};
   const unknown = {};
+  const empty = (id) => ({ usd: 0, rub: 0, usdApprox: false, rubApprox: false, incomplete: false,
+    primary: id === "dreampets" ? "rub" : "usd" });
   for (const id of MARKET_ORDER) {
-    totals[id] = { usd: 0, rub: 0, usdApprox: false, rubApprox: false, incomplete: false,
-      primary: id === "dreampets" ? "rub" : "usd" };
+    totals[id] = empty(id);  // вы получите (после комиссии)
+    gross[id] = empty(id);  // по ценам площадки, без комиссии
     missing[id] = 0;
     unknown[id] = 0;
     for (const item of calc.items) {
       const money = calcMoney(item, id);
-      if (money !== null) addMoney(totals[id], money);
-      else if (priceUnknown(item.prices[id])) unknown[id] += item.qty;  // продаётся, но цена не прочитана
+      if (money !== null) {
+        addMoney(totals[id], money);
+        addMoney(gross[id], calcMoney(item, id, true));
+      } else if (priceUnknown(item.prices[id])) unknown[id] += item.qty;  // продаётся, но цена не прочитана
       else missing[id] += item.qty;
     }
   }
   for (const id of MARKET_ORDER) {
     const card = el("div", `total ${id}`);
-    card.append(el("span", "muted", `${marketTitle(id)} — вы получите (−${Math.round(calcFee(id) * 100)}%)`));
+    // Сверху — сумма по ценам площадки (без комиссии), под ней — сколько вы получите.
+    card.append(el("span", "muted", `${marketTitle(id)} — по ценам площадки`));
     const sum = el("div", "total-sum");
-    sum.append(totalNode(totals[id]));
+    sum.append(totalNode(gross[id]));
     card.append(sum);
+    card.append(el("span", "muted", `вы получите (−${Math.round(calcFee(id) * 100)}%)`));
+    const net = el("div", "total-net");
+    net.append(totalNode(totals[id]));
+    card.append(net);
     if (unknown[id]) card.append(el("span", "muted small", `цена неизвестна (не в сумме): ${unknown[id]} шт.`));
     if (missing[id]) card.append(el("span", "muted small", `не продаётся там: ${missing[id]} шт.`));
     box.append(card);

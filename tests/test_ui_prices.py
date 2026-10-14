@@ -165,6 +165,16 @@ class PriceUiTests(unittest.TestCase):
         self.assertTrue(any("не понять: на DreamPets у 1 шт. цена неизвестна" in t for t in totals), totals)
         self.assertFalse(any("Выгоднее" in t for t in totals), totals)
 
+    def test_totals_show_market_sum_on_top_and_payout_below(self):
+        self.rate.usd_rub = 80.0
+        self.js("poll()")
+        self.calc("Harvester x2\nIcebreaker")
+        dream = self.js("[...document.querySelectorAll('#calcTotals .total.dreampets > *')].map((n) => n.textContent)")
+        self.assertEqual(dream[0], "DreamPets — по ценам площадки")
+        self.assertTrue(dream[1].startswith("1 790,00 ₽"), dream)  # 820×2 + 150 — без комиссии
+        self.assertEqual(dream[2], "вы получите (−10%)")
+        self.assertTrue(dream[3].startswith("1 611,00 ₽"), dream)  # × 0.9
+
     def test_totals_without_rate_are_not_partial(self):
         totals = self.calc("Harvester x2\nIcebreaker\nFang\nFlowerwood Gun\nLuger")
         star, dream = totals[0], totals[1]
@@ -179,7 +189,7 @@ class PriceUiTests(unittest.TestCase):
         self.rate.usd_rub = 80.0
         self.js("poll()")
         self.wait("!document.querySelector('#calcTotals').textContent.includes('Нет курса')")
-        star = self.js("document.querySelector('#calcTotals .total.starpets .total-sum').textContent")
+        star = self.js("document.querySelector('#calcTotals .total.starpets .total-net').textContent")
         self.assertEqual(star, "≈$20.37 · ≈1 699,20 ₽")  # 19.168 + 96/80; 1 507,20 + 2.4×80
         units = self.js("[...document.querySelectorAll('#calcBody tr')].map((tr) => tr.children[2].textContent)")
         self.assertIn("≈$1.50 · 120,00 ₽", units)
@@ -192,7 +202,7 @@ class PriceUiTests(unittest.TestCase):
         # Поле количества не пересоздаётся под курсором, а итог уже по курсу.
         self.assertTrue(self.js("document.activeElement === document.querySelector('#calcBody input.qty')"))
         self.assertEqual(self.js("document.querySelector('#calcBody tr').children[2].textContent"), "120,00 ₽")
-        self.assertEqual(self.js("document.querySelector('#calcTotals .total.starpets .total-sum').textContent"),
+        self.assertEqual(self.js("document.querySelector('#calcTotals .total.starpets .total-net').textContent"),
                          "≈$2.24 · 179,20 ₽")  # (1.5 + 1.3) × 0.8; (120 + 104) × 0.8
         self.js("document.activeElement.blur()")
         self.js("poll()")

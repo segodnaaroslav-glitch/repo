@@ -533,6 +533,7 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
 .total.starpets { border-left: 4px solid var(--sp); }
 .total.dreampets { border-left: 4px solid var(--dp); }
 .total-sum { font-size: 24px; }
+.total-net { font-size: 18px; }
 .totals .hint { flex-basis: 100%; margin: 0; }
 input.qty { width: 72px; text-align: right; }
 
