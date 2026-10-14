@@ -816,6 +816,14 @@ class DreamPetsAdapter(Adapter):
     PAUSE = 0.5
     SITEMAP_EVERY = 60 * 60
     BROWSER_EVERY = 10 * 60
+    # Цены «как на сайте»: рынок DreamPets открывается в скрытом Edge и цена берётся из
+    # того, что видит посетитель на карточке («от 328 ₽»), а не из данных внутри страницы
+    # (там бывает другая валюта, старая или не минимальная цена). Такая цена главнее
+    # остальных источников VISIBLE_FRESH секунд.
+    VISIBLE_EVERY = 5 * 60
+    VISIBLE_FRESH = 30 * 60
+    VISIBLE_PAGES = 60  # страниц списка рынка («Показать ещё», ?page=2…) за проход
+    VISIBLE_TIME = 180
     MAX_SITEMAPS = 40
     USELESS_PAGES = 6  # прочитано столько страниц, и ни на одной нет ни цены, ни лотов — рисуются скриптом
     MISSING_DROP = 3  # страница товара — 404 столько раз подряд ...
@@ -873,7 +881,9 @@ class DreamPetsAdapter(Adapter):
         pages_useless = self.cache.get("pages_useless_until", 0) > now
         priced_now = sum(1 for key in products if key in self.fresh)
         need_browser = blocked or not products or (pages_useless and priced_now < len(products) / 2)
-        if need_browser and not self._stopped() and now - self.cache.get("browser_at", 0) >= self.BROWSER_EVERY:
+        visible = self._visible(base)
+        every = self.VISIBLE_EVERY if visible else self.BROWSER_EVERY
+        if (need_browser or visible) and not self._stopped() and now - self.cache.get("browser_at", 0) >= every:
             self.cache["browser_at"] = now
             # После 429 («слишком много запросов») страницы товаров не читаются и браузером —
             # только список; проверку 403/503 браузер может пройти, тогда и страницы.
@@ -911,6 +921,18 @@ class DreamPetsAdapter(Adapter):
         return offers
 
     # --- общие части ---
+
+    def _visible(self, base):
+        """Брать цены «как на сайте» из браузера: на настоящем DreamPets, если есть Edge/Chrome
+        (в markets.json можно выключить: "visible": false)."""
+        visible = self.config.get("visible")
+        if visible is None:
+            visible = bool(re.search(r"//(?:www\.)?dreampets\.(?:gg|io)/", base))
+        return bool(visible) and bool(fetcher.find_system_browser())
+
+    def _visible_fresh(self, entry, now=None):
+        seen = entry.get("visible_at")
+        return bool(seen) and (now or time.time()) - seen < self.VISIBLE_FRESH
 
     def _step(self, name, what, result):
         self.report["steps"].append({"step": name, "what": str(what)[:300], "result": str(result)[:500]})
@@ -1084,6 +1106,10 @@ class DreamPetsAdapter(Adapter):
                         marks.discard(twin)
                         marks.add(key)
         price, lots = data.get("price"), data.get("lots")
+        if source != "браузер" and self._visible_fresh(entry):
+            price = None  # цена с экрана сайта свежая — данные страницы её не меняют
+            if entry.get("visible_lots"):
+                lots = None  # и число лотов, если карточка его показывала
         if by_name and price is not None and key in self.got_price and entry.get("price") is not None:
             # Совпадение только по названию (другой лот или вариант) не поднимает цену этого опроса.
             price = min(price, entry["price"])
@@ -1293,7 +1319,8 @@ class DreamPetsAdapter(Adapter):
         и PAGES_TIME секунд за опрос, по WORKERS сразу с паузой PAUSE. Ответ 403/429/503
         останавливает чтение до следующего опроса, закрытие программы — сразу."""
         import queue  # noqa: E402 (нужен только здесь)
-        waiting = [key for key, entry in products.items() if key not in self.fresh and entry.get("url")]
+        waiting = [key for key, entry in products.items() if key not in self.fresh and entry.get("url")
+                   and not (self._visible_fresh(entry) and entry.get("visible_lots"))]
         due = sorted(waiting, key=lambda k: (products[k].get("page_at", 0), -(products[k].get("price") or 0)))
         due = due[:self.PAGES_PER_POLL]
         if not due:
@@ -1432,7 +1459,12 @@ class DreamPetsAdapter(Adapter):
                 browser.open(base, settle=1)
                 # Постраничный рынок: прошлый проход остановился на странице "browser_next" — после
                 # первой страницы продолжаем с неё, так за несколько проходов читаются все страницы.
-                result = browser.collect_cards(self._CARD_SELECTOR, resume=self.cache.get("browser_next"))
+                visible = self._visible(base)
+                if visible:  # весь список рынка, как его листает посетитель
+                    result = browser.collect_cards(self._CARD_SELECTOR, resume=self.cache.get("browser_next"),
+                                                   timeout=self.VISIBLE_TIME, max_pages=self.VISIBLE_PAGES)
+                else:
+                    result = browser.collect_cards(self._CARD_SELECTOR, resume=self.cache.get("browser_next"))
                 self.cache["browser_next"] = result.get("next")
                 cards = result["cards"]
                 for card in cards:
@@ -1444,7 +1476,10 @@ class DreamPetsAdapter(Adapter):
                         # "<i>3</i> лотов": число и слово — разные надписи; их склеивает innerText.
                         extra = dreampets.parse_card_text(card["inner"])
                         data = {field: extra.get(field) if value is None else value for field, value in data.items()}
-                    self._upsert(products, data, now, "браузер", link.group(1))
+                    key = self._upsert(products, data, now, "браузер", link.group(1))
+                    if visible and key in products and data.get("price") is not None:
+                        products[key]["visible_at"] = now  # цена — как её видит посетитель
+                        products[key]["visible_lots"] = data.get("lots") is not None
                 self._step("browser", base, f"карточек: {len(cards)}, страниц: {result.get('pages')}, "
                                             f"заголовок: {result.get('title')}")
                 # Запросы, которые сделала сама страница: если в ответе товары с ценами —

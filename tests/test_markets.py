@@ -997,6 +997,30 @@ fetch('/api/catalog?game=mm2').then((r) => r.json()).then((data) => {
         self.assertEqual(offers["Harvester"], 328.98)
         self.assertIn("api", adapter.note)
 
+    def test_visible_price_wins_over_data_inside_the_page(self):
+        """Режим «как на сайте»: цена с карточки, которую видит посетитель, а не число из данных
+        страницы (там бывает другая валюта или старая цена) — и в следующих опросах тоже."""
+        items = [{"id": U1, "slug": "harvester", "title": "Harvester", "minPrice": 99, "lotsCount": 7}]
+        wrong = json.dumps({"props": {"items": [{"id": U1, "name": "Harvester", "price": 1.23, "lotsCount": 7}]}})
+        page = self.SPA.replace("</body>", f'<script id="__NEXT_DATA__" type="application/json">{wrong}</script></body>')
+        routes = {"/mm2/": page, "/api/catalog?game=mm2": json.dumps({"items": items})}
+        httpd, base = serve_bytes(routes)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (unittest.mock.patch.object(markets, "_pause"),
+                      unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=_test_browser()),
+                      unittest.mock.patch.object(markets.store, "DATA_FILE", Path(tmp.name) / "values.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        cache = {}
+        config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": base + "/mm2/", "visible": True}
+        offers = {o["name"]: o["price"] for o in markets.DreamPetsAdapter(config, cache).fetch()}
+        self.assertEqual(offers["Harvester"], 99)
+        offers = {o["name"]: o["price"] for o in markets.DreamPetsAdapter(config, cache).fetch()}  # без браузера
+        self.assertEqual(offers["Harvester"], 99)
+
     def _patch(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
