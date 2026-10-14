@@ -1442,3 +1442,71 @@ class SameNameGroupTests(unittest.TestCase):
         self.assertEqual(got["commons:Elf"]["price"], 0.08)  # нож 2017
         self.assertEqual(got["pets:Elf"]["price"], 18.52)
         self.assertEqual(unused, 3)
+
+
+class EventRarityAndLinksTests(unittest.TestCase):
+    """Peppermint и Snowflake: годли-ножи и праздничные товары с тем же названием за 2 ₽."""
+
+    def item(self, name, category, origin=""):
+        return parser.make_item(name, category, {"value": "1", "demand": "1", "rarity": "1", "origin": origin})
+
+    def run_groups(self, items, offers, links=None):
+        index = markets.build_index(items)
+        groups = {}
+        for offer in offers:
+            candidates = markets.candidate_items(index, offer)
+            groups.setdefault(tuple(markets.item_id(c) for c in candidates), (candidates, []))[1].append(offer)
+        explain = {}
+        got, _ = markets.assign_offers(groups.values(), links=links, explain=explain)
+        return got, explain
+
+    def test_christmas_card_is_not_the_godly_and_godly_card_wins(self):
+        items = [self.item("Peppermint", "godlies")]
+        offers = [{"id": "c", "name": "Peppermint", "rarity": "CHRISTMAS", "price": 2.0, "product": True},
+                  {"id": "g", "name": "Peppermint", "rarity": "GODLY", "price": 23.0, "product": True}]
+        got, explain = self.run_groups(items, offers)
+        self.assertEqual(got["godlies:Peppermint"]["price"], 23.0)
+        got, explain = self.run_groups(items, offers[:1])  # только праздничный — лучше «не найден», чем чужая цена
+        self.assertNotIn("godlies:Peppermint", got)
+        self.assertEqual([(row["id"], row["reason"]) for row in explain["godlies:Peppermint"]], [("c", "другая редкость")])
+
+    def test_known_rarity_beats_unknown(self):
+        items = [self.item("Snowflake", "godlies")]
+        offers = [{"id": "u", "name": "Snowflake", "price": 5.98, "product": True},
+                  {"id": "g", "name": "Snowflake", "rarity": "godly", "price": 25.0, "product": True}]
+        got, _ = self.run_groups(items, offers)
+        self.assertEqual(got["godlies:Snowflake"]["price"], 25.0)
+
+    def test_user_link_wins_and_is_remembered(self):
+        items = [self.item("Snowflake", "godlies")]
+        offers = [{"id": "g", "name": "Snowflake", "rarity": "godly", "price": 25.0, "product": True},
+                  {"id": "k", "name": "Snowflake", "rarity": "uncommon", "kind": "knife", "year": 2018,
+                   "price": 1.37, "product": True}]
+        got, _ = self.run_groups(items, offers, links={"godlies:Snowflake": "k"})
+        self.assertEqual((got["godlies:Snowflake"]["id"], got["godlies:Snowflake"]["linked"]), ("k", True))
+
+    def test_monitor_shows_candidates_and_link_applies_at_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "values.json"
+        data = store.empty_data()
+        store.replace_category(data, "godlies", [self.item("Peppermint", "godlies")], "site")
+        store.save(data, path)
+
+        class Fake(markets.Adapter):
+            def fetch(self):
+                return [{"id": "c", "name": "Peppermint", "rarity": "CHRISTMAS", "price": 2.0, "currency": "RUB",
+                         "available": True, "product": True, "url": "u"}]
+
+        monitor = markets.MarketMonitor(path, [{"id": "d", "title": "D", "kind": "fake", "url": "u"}], adapters={"fake": Fake})
+        monitor.poll(monitor.markets[0])
+        item = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(path)["items"]])[0]
+        self.assertNotIn("d", item.get("market") or {})
+        self.assertEqual(item["market_candidates"]["d"][0]["id"], "c")
+        monitor.link("d", "godlies:Peppermint", "c")  # «Это он»
+        item = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(path)["items"]])[0]
+        self.assertEqual((item["market"]["d"]["price"], item["market"]["d"]["linked"]), (2.0, True))
+        monitor.poll(monitor.markets[0])  # и после нового опроса — тоже
+        again = markets.MarketMonitor(path, [{"id": "d", "title": "D", "kind": "fake", "url": "u"}], adapters={"fake": Fake})
+        item = again.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(path)["items"]])[0]
+        self.assertEqual(item["market"]["d"]["price"], 2.0)  # привязка пережила перезапуск

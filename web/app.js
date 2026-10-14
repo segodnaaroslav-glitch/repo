@@ -941,8 +941,36 @@ function marketTile(item, id) {
   }
   tile.append(head);
   if (!info) {
-    tile.append(el("p", "muted small", "Не найден на площадке."));
+    const shown = (item.market_candidates || {})[id] || [];
+    if (!shown.length) {
+      tile.append(el("p", "muted small", "Не найден на площадке."));
+      return tile;
+    }
+    // Одноимённые товары есть, но ни один не подошёл уверенно — пусть выберет пользователь.
+    tile.append(el("p", "muted small", "Точного товара не нашлось. С этим названием на площадке есть:"));
+    for (const row of shown) {
+      const line = el("div", "candidate");
+      const label = [row.name, row.rarity, row.kind, row.year].filter(Boolean).join(" · ");
+      const money = infoMoney(row);
+      line.append(el("span", "small", label));
+      if (money) line.append(moneyNode(money, "small"));
+      if (row.reason) line.append(el("span", "muted small", `(${row.reason})`));
+      const pick = el("button", "ghost small", "Это он");
+      pick.type = "button";
+      pick.title = "Цена этого товара будет показываться для предмета; выбор запоминается";
+      pick.addEventListener("click", () => linkOffer(id, itemKey(item), row.id));
+      line.append(pick);
+      tile.append(line);
+    }
     return tile;
+  }
+  if (info.linked) {
+    const line = el("p", "muted small", "Товар выбран вами. ");
+    const undo = el("button", "ghost small", "Отвязать");
+    undo.type = "button";
+    undo.addEventListener("click", () => linkOffer(id, itemKey(item), null));
+    line.append(undo);
+    tile.append(line);
   }
   // Какой именно товар площадки взят (одноимённых бывает много: нож/пистолет, годы, редкость).
   if (info.product) tile.append(el("p", "muted small", `товар площадки: ${info.product}`));
@@ -1654,6 +1682,17 @@ async function pollMarkets() {
     toast(error.message, "error");
   }
   pollSoon();
+}
+
+async function linkOffer(market, item, offer) {
+  try {
+    await postJson("/api/markets/link", { market, item, offer });
+    toast(offer === null ? "Привязка снята" : "Запомнил: этот товар площадки — для этого предмета");
+    await loadData();
+    if (state.selected) renderDrawer();
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 async function checkDreamPets() {

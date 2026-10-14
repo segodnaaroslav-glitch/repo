@@ -580,3 +580,7 @@ input.pic-other { width: 260px; font-size: 13px; padding: 4px 8px; }
 @media (max-width: 760px) {
   select.pic-choice, input.pic-other { width: 100%; max-width: 100%; }
 }
+
+/* Одноимённые товары площадки, когда точный не найден: выбор «Это он». */
+.candidate { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 0; border-top: 1px solid var(--line); }
+.candidate button { margin-left: auto; padding: 2px 8px; }

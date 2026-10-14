@@ -576,6 +576,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(409, "Площадки выключены")
             self.monitor.poll_now()
             return self._json(202, self._status())
+        if path == "/api/markets/link":
+            if self.monitor is None:
+                return self._error(409, "Площадки выключены")
+            market, item = body.get("market"), body.get("item")
+            offer = body.get("offer")
+            if not isinstance(market, str) or not isinstance(item, str) or not (offer is None or isinstance(offer, (str, int))):
+                return self._error(400, "Нужны market, item и offer")
+            try:
+                self.monitor.link(market, item, None if offer is None else str(offer))
+            except KeyError:
+                return self._error(404, "Нет такой площадки")
+            return self._json(200, {"linked": offer is not None})
         if path == "/api/dreampets/check":
             return self._dreampets_check()
         if path == "/api/check":

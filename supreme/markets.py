@@ -112,7 +112,12 @@ _RARITY_WORDS = (
     ("ancient", r"ancient|древн|эншент"), ("unique", r"unique|уникальн"),
     ("vintage", r"vintage|винтаж|classic|классич"),  # DreamPets зовёт винтажные «Classic»
     ("legendary", r"legendary|легендарн"), ("rare", r"rare|редк"),
+    # праздничная редкость (значок CHRISTMAS / HALLOWEEN на DreamPets) — дешёвые предметы событий
+    ("event", r"christmas|halloween|рождеств|новогод|хэллоуин|хеллоуин"),
 )
+# Дорогие категории: праздничный (CHRISTMAS/HALLOWEEN) товар к ним не подходит — у Godly
+# праздничных предметов значок GODLY, а не CHRISTMAS.
+_VALUABLE = ("godlies", "ancients", "uniques", "chromas", "vintages", "legendaries", "pets", "sets")
 # Предмет с неизвестной редкостью (площадка её не показала) из нескольких одноимённых:
 # сначала то, чем торгуют чаще всего.
 _CATEGORY_PREFERENCE = ("godlies", "ancients", "chromas", "uniques", "legendaries", "rares", "uncommons",
@@ -241,6 +246,13 @@ def offer_fit(item, offer):
             score += 60
         else:
             return None
+    if not category:
+        if rarity(offer.get("rarity")) == "event":
+            if own in _VALUABLE:
+                return None  # праздничный Peppermint за 2 ₽ — не Godly Peppermint
+            score += 10
+        else:
+            score += 5  # редкость неизвестна — товар с совпавшей редкостью лучше
     years, year = _item_years(item), offer.get("year")
     if years:
         score += -20 if year in years else (50 if year is not None else 10)
@@ -262,20 +274,38 @@ def offer_fit(item, offer):
     return score
 
 
-def assign_offers(groups):
+def offer_summary(offer):
+    """Коротко о товаре площадки — для подсказки «на площадке есть похожие» и ручной привязки."""
+    summary = {field: offer.get(field) for field in ("name", "rarity", "kind", "year", "price", "price_rub", "currency", "url")}
+    summary["id"] = str(offer.get("id"))
+    return summary
+
+
+def assign_offers(groups, links=None, explain=None):
     """Одноимённые предметы и товары одной группы: каждому предмету — самый подходящий
     товар, один товар — одному предмету. groups: [(предметы, товары)].
-    -> ({id предмета: товар}, сколько товаров не подошло ни одному)."""
+    links — {id предмета: id товара}, выбранные пользователем («Это он»): им — в первую очередь.
+    explain — словарь: предметам без товара туда пишется, что на площадке есть с этим
+    названием и почему не подошло. -> ({id предмета: товар}, сколько товаров не подошло)."""
+    links = links or {}
     matched, unused = {}, 0
     for items, offers in groups:
+        taken_items, taken_offers = set(), set()
+        for i, item in enumerate(items):
+            wanted = links.get(item_id(item))
+            j = next((j for j, offer in enumerate(offers)
+                      if wanted is not None and j not in taken_offers and str(offer.get("id")) == str(wanted)), None)
+            if j is not None:
+                taken_items.add(i)
+                taken_offers.add(j)
+                matched[item_id(item)] = dict(offers[j], linked=True)
         pairs = []
         for i, item in enumerate(items):
             for j, offer in enumerate(offers):
-                fit = offer_fit(item, offer)
+                fit = offer_fit(item, offer) if i not in taken_items and j not in taken_offers else None
                 if fit is not None:
                     pairs.append((fit, i, j))
         pairs.sort()
-        taken_items, taken_offers = set(), set()
         for fit, i, j in pairs:
             if i in taken_items or j in taken_offers:
                 continue
@@ -283,6 +313,17 @@ def assign_offers(groups):
             taken_offers.add(j)
             matched[item_id(items[i])] = offers[j]
         unused += len(offers) - len(taken_offers)
+        if explain is not None:
+            for i, item in enumerate(items):
+                if i in taken_items:
+                    continue
+                rows = []
+                for j, offer in enumerate(offers):
+                    fit = offer_fit(item, offer)
+                    reason = "другая редкость" if fit is None else "подошёл другому предмету" if j in taken_offers else ""
+                    rows.append((fit is None, fit or 0.0, dict(offer_summary(offer), reason=reason)))
+                rows.sort(key=lambda row: (row[0], row[1]))
+                explain[item_id(item)] = [row[2] for row in rows[:8]]
     return matched, unused
 
 
@@ -1810,6 +1851,8 @@ class MarketState:
         self.unmatched = 0
         self.sales = {}        # id предмета -> [[время, количество], ...] ушедших лотов за 2 дня
         self.listed = {}       # id предмета -> [[время, количество], ...] новых лотов за 2 дня
+        self.links = {}        # id предмета -> id товара, выбранный пользователем («Это он»)
+        self.candidates = {}   # id предмета без товара -> одноимённые товары площадки и почему не подошли
 
     def interval(self, default):
         return self.config.get("interval") or default
@@ -1889,6 +1932,10 @@ class MarketMonitor:
             market.cache = entry.get("cache") if isinstance(entry.get("cache"), dict) else {}
             market.complete = bool(entry.get("complete")) and bool(market.offers)
             market.unmatched = entry.get("unmatched") if isinstance(entry.get("unmatched"), int) else 0
+            links = entry.get("links") if isinstance(entry.get("links"), dict) else {}
+            market.links = {str(k): str(v) for k, v in links.items() if v is not None}
+            candidates = entry.get("candidates") if isinstance(entry.get("candidates"), dict) else {}
+            market.candidates = {str(k): v for k, v in candidates.items() if isinstance(v, list)}
             try:
                 market.last_ok_at = datetime.fromisoformat(entry["last_ok_at"]) if entry.get("last_ok_at") else None
                 if market.last_ok_at and market.last_ok_at.tzinfo is None:
@@ -1909,6 +1956,8 @@ class MarketMonitor:
                     "cache": market.cache,
                     "complete": market.complete,
                     "unmatched": market.unmatched,
+                    "links": market.links,
+                    "candidates": market.candidates,
                     "last_ok_at": market.last_ok_at.isoformat() if market.last_ok_at else None,
                 }
                 for market in self.markets
@@ -2042,7 +2091,8 @@ class MarketMonitor:
                 if offer.get("popularity") is not None:
                     previous["popularity"] = min(previous.get("popularity", 1), offer["popularity"])
                 previous["available"] = bool(previous.get("available")) or bool(offer.get("available"))
-        assigned, unused = assign_offers(groups.values())
+        explain = {}
+        assigned, unused = assign_offers(groups.values(), links=dict(market.links), explain=explain)
         matched.update((key, dict(offer)) for key, offer in assigned.items())
         unmatched += unused
         now = _now()
@@ -2076,12 +2126,35 @@ class MarketMonitor:
                 market.offers = dict(market.offers, **matched)
             market.complete = adapter.complete
             market.unmatched = unmatched
+            market.candidates = {key: rows for key, rows in explain.items() if key not in market.offers}
             market.failures = 0
             market.status = "ok"
             market.message = adapter.note if offers else "площадка не вернула ни одного предложения"
             market.last_ok_at = now
             market.next_poll_at = now + timedelta(seconds=market.interval(self.interval))
             self.version += 1
+        self._save_state()
+
+    # --- ручная привязка («Это он») ---
+
+    def link(self, market_id, item_key, offer_id):
+        """Пользователь указал товар площадки для предмета (offer_id None — отвязать).
+        Привязка запоминается; цена показывается сразу, а следующий опрос её обновит."""
+        with self._lock:
+            market = next((m for m in self.markets if m.config["id"] == market_id), None)
+            if market is None:
+                raise KeyError(market_id)
+            if offer_id is None:
+                market.links.pop(item_key, None)
+                if (market.offers.get(item_key) or {}).get("linked"):
+                    market.offers.pop(item_key, None)
+            else:
+                market.links[item_key] = str(offer_id)
+                shown = next((row for row in market.candidates.get(item_key) or [] if row.get("id") == str(offer_id)), None)
+                if shown:
+                    market.offers[item_key] = dict(shown, available=True, linked=True)
+                    market.candidates.pop(item_key, None)
+            self.version += 1  # цена видна сразу; следующий плановый опрос применит привязку сам
         self._save_state()
 
     # --- данные для окна программы ---
@@ -2101,12 +2174,16 @@ class MarketMonitor:
                  {k: (market.sold(k), market.new_lots(k)) for k in market.offers})
                 for market in self.markets
             ]
+            candidates = {market.config["id"]: dict(market.candidates) for market in self.markets}
         for item in items:
             key = item_id(item)
             infos = {}
             for config, offers, sold in snapshot:
                 offer = offers.get(key)
                 if not isinstance(offer, dict):
+                    shown = candidates.get(config["id"], {}).get(key)
+                    if shown:  # товара нет, но одноимённые на площадке есть — показать, почему не подошли
+                        item.setdefault("market_candidates", {})[config["id"]] = shown
                     continue
                 sold_48h, listed_48h = sold.get(key, (0, 0))
                 if not isinstance(offer.get("stock"), int):
@@ -2118,6 +2195,7 @@ class MarketMonitor:
                     "price_rub_approx": bool(offer.get("price_rub_approx")),
                     "year": offer.get("year"),
                     "price_from": bool(offer.get("price_from")),
+                    "linked": bool(offer.get("linked")),
                     "product": " · ".join(str(part) for part in (
                         offer.get("name"), offer.get("rarity"), offer.get("kind"), offer.get("year")) if part),
                     "currency": offer.get("currency") or "USD",
