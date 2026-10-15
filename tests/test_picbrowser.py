@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -88,6 +89,20 @@ def cut_bottom(canvas, height):
 
 
 @unittest.skipUnless(BROWSER, "нет Edge/Chrome/Chromium")
+def _remove_folder(path):
+    """Убрать папку проверки. Запрос страницы, начатый до остановки сервера, может дописать
+    файл (картинку, failed.json) уже во время уборки — тогда ещё раз, чуть позже."""
+    for _ in range(10):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.3)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 class CalcPicturesBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -104,9 +119,8 @@ class CalcPicturesBrowserTests(unittest.TestCase):
         cls.browser.close()
 
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.folder = Path(tmp.name)
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(_remove_folder, self.folder)
         data = store.empty_data()
         items = stock()
         for category in sorted({i["category"] for i in items}):
@@ -131,9 +145,6 @@ class CalcPicturesBrowserTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.badge_calls = []
-        # Перед остановкой сервера страница закрывается: её запросы (картинки) не пишут в папку,
-        # которую уже убирают.
-        self.addCleanup(self.browser.open, "about:blank", settle=0.2)
         self.browser.open(f"http://127.0.0.1:{self.httpd.server_address[1]}/", settle=0.2)
         self.wait("state.data.items.length > 0 && state.dataVersion !== null")
 
