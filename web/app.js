@@ -1610,8 +1610,26 @@ function renderCalc() {
   renderCalcTotals();
 }
 
+// Цена площадки для строки расчёта — те же поля, что присылает /api/calc.
+function calcPrices(market) {
+  const out = {};
+  for (const [id, info] of Object.entries(market || {})) {
+    out[id] = {
+      price: info.price ?? null,
+      currency: info.currency ?? null,
+      price_rub: info.price_rub ?? null,
+      price_rub_approx: Boolean(info.price_rub_approx),
+      price_from: Boolean(info.price_from),
+      fee: info.fee ?? 0,
+      stock: info.stock ?? null,
+    };
+  }
+  return out;
+}
+
 // Цены в расчёте — по последним данным площадок (новый опрос, привязка товара по ссылке).
-// Пока курсор в поле количества, строки не перерисовываются (поле не пропадёт из-под курсора).
+// Строки перерисовываются, только если цена изменилась, и не пока курсор в поле количества
+// (поле не пропадёт из-под курсора).
 function refreshCalcPrices() {
   if (!calc.items.length) return;
   let changed = false;
@@ -1619,7 +1637,7 @@ function refreshCalcPrices() {
     for (const choice of [row, ...(row.alternatives || [])]) {
       const fresh = choice.key ? findItem(choice.key) : null;
       if (!fresh) continue;
-      const prices = fresh.market || {};
+      const prices = calcPrices(fresh.market);
       if (JSON.stringify(prices) !== JSON.stringify(choice.prices)) {
         choice.prices = prices;
         changed = true;

@@ -131,6 +131,9 @@ class CalcPicturesBrowserTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.badge_calls = []
+        # Перед остановкой сервера страница закрывается: её запросы (картинки) не пишут в папку,
+        # которую уже убирают.
+        self.addCleanup(self.browser.open, "about:blank", settle=0.2)
         self.browser.open(f"http://127.0.0.1:{self.httpd.server_address[1]}/", settle=0.2)
         self.wait("state.data.items.length > 0 && state.dataVersion !== null")
 
