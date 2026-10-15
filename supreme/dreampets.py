@@ -335,6 +335,82 @@ def parse_card_text(text, slug=None):
     return {"name": name, "price": price, "lots": lots, "rarity": rarity}
 
 
+
+# Окно (страница) товара: «GODLY · НОЖ», «Beachy», «223 ₽» над «мин. цена», «24» над «на продаже»,
+# ниже — лоты по возрастанию цены.
+_MIN_PRICE_RE = re.compile(r"мин(?:\.|имальн\w*)?\s*цен", re.I)
+_ON_SALE_RE = re.compile(r"(?:на|в)\s+продаж", re.I)
+_KIND_WORD_RE = re.compile(r"(?:pet|misc|knife|gun|weapon|mm2|мм2|нож|пистолет|оружие|питомец)$", re.I)
+
+
+def _badge_rarity(line):
+    """«GODLY · НОЖ», «Classic», «ANCIENT» -> редкость (как на значке) или None."""
+    for part in re.split(r"\s*[·•|/,]\s*", line):
+        match = _RARITY_RE.match(part.strip())
+        if match and not _KIND_WORD_RE.match(match.group(1)):
+            return match.group(1)
+    return None
+
+
+def product_text_ready(text, slug=None):
+    """Окно товара дорисовалось: есть минимальная цена или видно, что лотов нет."""
+    data = parse_product_text(text, slug)
+    return data["price"] is not None or data["sold_out"]
+
+
+def parse_product_text(text, slug=None):
+    """Видимый текст окна/страницы товара -> {"name", "price", "lots", "rarity", "sold_out"}.
+
+    Цена — та, что подписана «мин. цена» (самый дешёвый лот, как на карточке «от N ₽»);
+    лоты — число над «на продаже». Название — строка, совпадающая со ссылкой товара (slug),
+    иначе строка над ценой; редкость — значок рядом с названием."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in str(text or "").splitlines()]
+    lines = _glue([line for line in lines if line])
+    out = {"name": None, "price": None, "lots": None, "rarity": None, "sold_out": False}
+    anchor = next((i for i, line in enumerate(lines) if _MIN_PRICE_RE.search(line)), None)
+    if anchor is not None:
+        for i in range(anchor, max(-1, anchor - 4), -1):  # «223 ₽ мин. цена» или «223 ₽» строкой выше
+            match = PRICE_RE.search(lines[i])
+            if match:
+                out["price"] = rub(match.group(1))
+                anchor = i
+                break
+    sale = next((i for i, line in enumerate(lines) if _ON_SALE_RE.search(line) and not _MIN_PRICE_RE.search(line)),
+                None)
+    if sale is not None:
+        same = re.search(r"(\d[\d  ]*)\s*(?:лот\w*\s*)?(?:на|в)\s+продаж", lines[sale], re.I)
+        if same:
+            out["lots"] = int(re.sub(r"\D", "", same.group(1)))
+        else:
+            for i in range(sale - 1, max(-1, sale - 4), -1):
+                if re.fullmatch(r"\d[\d  ]*", lines[i]):
+                    out["lots"] = int(re.sub(r"\D", "", lines[i]))
+                    break
+    top = anchor if out["price"] is not None else len(lines)
+    name_at = None
+    if slug:
+        name_at = next((i for i, line in enumerate(lines[:top]) if same_name(line) == same_name(slug)), None)
+        if name_at is None:
+            name_at = next((i for i, line in enumerate(lines) if same_name(line) == same_name(slug)), None)
+    if name_at is None and out["price"] is not None:
+        name_at = next((i for i in range(anchor - 1, max(-1, anchor - 5), -1)
+                        if re.search(r"[A-Za-z]", lines[i]) and not _badge_rarity(lines[i])
+                        and not PRICE_RE.search(lines[i]) and clean_name(lines[i])), None)
+    if name_at is not None:
+        out["name"] = clean_name(lines[name_at])
+        near = list(range(name_at - 1, max(-1, name_at - 4), -1)) + list(range(name_at + 1, min(len(lines), name_at + 3)))
+        out["rarity"] = next((r for r in (_badge_rarity(lines[i]) for i in near) if r), None)
+    elif slug:
+        out["name"] = " ".join(word.capitalize() for word in str(slug).replace("-", " ").split())
+    if out["rarity"] is None:
+        out["rarity"] = next((r for r in (_badge_rarity(line) for line in lines[:top]) if r), None)
+    # «Лотов нет» — только у самого товара (рядом с его названием) или «0 на продаже»: такая же
+    # фраза в подвале или у другого товара — не про него.
+    if out["price"] is None:
+        out["sold_out"] = out["lots"] == 0 or (name_at is not None and any(
+            _SOLD_OUT_RE.search(line) for line in lines[name_at + 1:name_at + 7]))
+    return out
+
 # --- карточки в разметке ------------------------------------------------------------
 
 _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
@@ -476,7 +552,8 @@ _RELATED_RE = re.compile(r"^(?:похож|рекоменд|другие (?:то�
 _PROMO_RE = re.compile(r"бонус|пополн|кэшб|кешб|cashback|промокод|скидк|депозит|реферал", re.I)
 # "Продано 1 250 лотов", "Продажи за месяц: 1 250 лотов" — не лоты в продаже; "В продаже 674 лота" — они.
 _SOLD_RE = re.compile(r"продан|продал|продаж|куплен|купил", re.I)
-_SOLD_OUT_RE = re.compile(r"нет в наличии|нет лотов|нет предложений|распродан|закончил|out of stock|sold out", re.I)
+_SOLD_OUT_RE = re.compile(r"нет в наличии|нет лотов|лотов пока нет|нет (?:в|на) продаже|нет предложений|распродан|"
+                          r"закончил|out of stock|sold out", re.I)
 
 
 def _title_name(text):

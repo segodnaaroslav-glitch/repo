@@ -487,6 +487,7 @@ class Handler(BaseHTTPRequestHandler):
                 market_id: {"price": info.get("price"), "currency": info.get("currency"),
                             "price_rub": info.get("price_rub"),
                             "price_rub_approx": bool(info.get("price_rub_approx")),
+                            "price_from": bool(info.get("price_from")),
                             "fee": info.get("fee", 0), "stock": info.get("stock")}
                 for market_id, info in market.items()
             },
@@ -580,14 +581,23 @@ class Handler(BaseHTTPRequestHandler):
             if self.monitor is None:
                 return self._error(409, "Площадки выключены")
             market, item = body.get("market"), body.get("item")
-            offer = body.get("offer")
+            offer, url = body.get("offer"), body.get("url")
+            if isinstance(item, str) and isinstance(url, str) and url.strip():
+                # Ссылка на страницу товара: площадка — по ссылке (StarPets или DreamPets).
+                try:
+                    market = self.monitor.link_url(item, url)
+                except ValueError as error:
+                    return self._error(400, str(error))
+                except KeyError:
+                    return self._error(404, "Эта площадка выключена")
+                return self._json(200, {"linked": True, "market": market})
             if not isinstance(market, str) or not isinstance(item, str) or not (offer is None or isinstance(offer, (str, int))):
-                return self._error(400, "Нужны market, item и offer")
+                return self._error(400, "Нужны market, item и offer (или url)")
             try:
                 self.monitor.link(market, item, None if offer is None else str(offer))
             except KeyError:
                 return self._error(404, "Нет такой площадки")
-            return self._json(200, {"linked": offer is not None})
+            return self._json(200, {"linked": offer is not None, "market": market})
         if path == "/api/dreampets/check":
             return self._dreampets_check()
         if path == "/api/check":

@@ -693,26 +693,45 @@ class Browser:
         return {"cards": list(cards.values()), "api": list(api)[:200], "title": title, "pages": pages, "url": url,
                 "next": following}
 
-    def collect_price_cards(self, timeout=180, wait=1.2, stable_rounds=4):
-        """Все карточки с ценой на открытой странице — как их видит посетитель: страница
-        и её панели прокручиваются до конца, пока новые карточки не перестанут появляться.
+    def collect_price_cards(self, timeout=180, wait=1.2, stable_rounds=5, reset=False, step_time=20):
+        """Все карточки с ценой на открытой странице — как их видит посетитель. Страница и её
+        панели листаются вниз по экрану за раз (а не сразу в самый низ: длинный список
+        рисует только видимые карточки, и середина иначе пропадает), с чтением после каждого
+        шага, пока внизу новые карточки не перестанут появляться. reset — сначала наверх
+        (список после выбора фильтра).
         -> {"cards": [{"href", "text"}], "title", "url", "rounds"}"""
         cards, title, url, rounds, stable = {}, None, None, 0, 0
         deadline = time.time() + timeout
         while time.time() < deadline and stable < stable_rounds:
             rounds += 1
+            budget = max(1.0, min(step_time, deadline - time.time()))
+            script = JS_PRICE_CARDS % (int(wait * 1000), int(budget * 1000), "true" if reset else "false")
             try:
-                result = self.evaluate(JS_PRICE_CARDS % int(wait * 1000), timeout=60, retries=2) or {}
+                result = self.evaluate(script, timeout=budget + wait + 60, retries=2) or {}
             except (BrowserError, TimeoutError) as error:
                 self.notes.append(f"карточки: {error}")
                 stable += 1
                 continue
+            reset = False
             title, url = result.get("title") or title, result.get("url") or url
             before = len(cards)
             for card in result.get("cards") or []:
                 cards.setdefault((card.get("href") or "", card.get("text") or ""), card)
             stable = stable + 1 if len(cards) == before else 0
         return {"cards": list(cards.values()), "title": title, "url": url, "rounds": rounds}
+
+    def click_filter(self, label, labels):
+        """Нажать фильтр с надписью label (например, редкость «Classic») — тот, что стоит рядом
+        с другими фильтрами из labels, а не значок на карточке товара. -> что нажато или None."""
+        try:
+            return self.evaluate(JS_CLICK_FILTER % (json.dumps(label), json.dumps(list(labels))), timeout=30, retries=1)
+        except (BrowserError, TimeoutError) as error:
+            self.notes.append(f"фильтр {label}: {error}")
+            return None
+
+    def page_text(self, timeout=20):
+        """Видимый текст страницы (как его видит посетитель)."""
+        return self.evaluate("document.body ? document.body.innerText : ''", timeout=timeout, retries=1) or ""
 
     def fetch_many(self, urls, pause=1.0, timeout=15, deadline=60, stop_on=(403, 429, 503)):
         """Запросы изнутри страницы (с её cookies) — по одному, с паузой.
@@ -943,45 +962,109 @@ def _windows_job_assign(process):
 # (если есть) — карточка. Перед чтением прокручивается и сама страница, и все блоки
 # со своей прокруткой (список рынка часто листается внутри панели), и нажимается
 # «Показать ещё». Видимый текст — как innerText: строки блоков отдельно.
-JS_PRICE_CARDS = r"""(async (wait) => {
+JS_PRICE_CARDS = r"""(async (wait, budget, reset) => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const scrollers = [document.scrollingElement || document.documentElement];
-  for (const el of document.querySelectorAll('body *')) {
-    const style = getComputedStyle(el);
-    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 20) scrollers.push(el);
-  }
-  for (const el of scrollers) el.scrollTop = el.scrollHeight;
-  window.scrollTo(0, document.documentElement.scrollHeight);
-  const more = /показать ещё|показать еще|загрузить ещё|загрузить еще|load more|show more/i;
-  for (const b of document.querySelectorAll('button, [role=button]')) {
-    if (more.test(b.textContent || '') && b.offsetParent) { b.click(); break; }
-  }
-  await sleep(wait);
-  const leaves = [];
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  while (walker.nextNode()) {
-    const node = walker.currentNode;
-    if (/₽|руб/.test(node.nodeValue) && /\d/.test(node.parentElement ? node.parentElement.textContent : '')) {
-      if (node.parentElement) leaves.push(node.parentElement);
+  const started = Date.now();
+  const scrollers = () => {
+    const out = [document.scrollingElement || document.documentElement];
+    for (const el of document.querySelectorAll('body *')) {
+      const style = getComputedStyle(el);
+      if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 20) out.push(el);
     }
+    return out;
+  };
+  const found = new Map();
+  const read = () => {
+    const leaves = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (/₽|руб/.test(node.nodeValue) && /\d/.test(node.parentElement ? node.parentElement.textContent : '')) {
+        if (node.parentElement) leaves.push(node.parentElement);
+      }
+    }
+    const count = new Map();
+    for (const leaf of leaves) {
+      for (let el = leaf; el && el !== document.body; el = el.parentElement) count.set(el, (count.get(el) || 0) + 1);
+    }
+    const seen = new Set();
+    for (const leaf of leaves) {
+      let box = leaf;
+      while (box.parentElement && box.parentElement !== document.body && count.get(box.parentElement) === 1)
+        box = box.parentElement;
+      if (seen.has(box)) continue;
+      seen.add(box);
+      const link = box.querySelector('a[href]') || box.closest('a[href]');
+      const text = (box.innerText || box.textContent || '').trim();
+      const href = link ? link.href : '';
+      if (text) found.set(href + '\n' + text, { href, text: text.slice(0, 600) });
+    }
+  };
+  if (reset) {
+    for (const el of scrollers()) el.scrollTop = 0;
+    window.scrollTo(0, 0);
+    await sleep(wait);
   }
-  const count = new Map();
-  for (const leaf of leaves) {
-    for (let el = leaf; el && el !== document.body; el = el.parentElement) count.set(el, (count.get(el) || 0) + 1);
+  const more = /показать ещё|показать еще|загрузить ещё|загрузить еще|load more|show more/i;
+  let atEnd = false, panels = 0;
+  for (;;) {
+    read();
+    const all = scrollers();
+    panels = all.length;
+    let moved = false;
+    for (const el of all) {
+      const before = el.scrollTop;
+      el.scrollTop = before + Math.max(150, Math.floor(el.clientHeight * 0.8));
+      if (el.scrollTop > before + 1) moved = true;
+    }
+    if (!moved) {
+      for (const b of document.querySelectorAll('button, [role=button]')) {
+        if (more.test(b.textContent || '') && b.offsetParent) { b.click(); break; }
+      }
+      await sleep(wait);
+      read();
+      atEnd = true;
+      break;
+    }
+    if (Date.now() - started > budget) break;
+    await sleep(Math.min(wait, 300));
   }
-  const out = [], seen = new Set();
-  for (const leaf of leaves) {
-    let box = leaf;
-    while (box.parentElement && box.parentElement !== document.body && count.get(box.parentElement) === 1)
-      box = box.parentElement;
-    if (seen.has(box)) continue;
-    seen.add(box);
-    const link = box.querySelector('a[href]') || box.closest('a[href]');
-    const text = (box.innerText || box.textContent || '').trim();
-    if (text) out.push({ href: link ? link.href : '', text: text.slice(0, 600) });
+  return { cards: [...found.values()], atEnd, scrollers: panels, title: document.title, url: location.href };
+})(%s, %s, %s)"""
+
+
+# Нажать фильтр по надписи (редкость «Classic» и т. п.). Такая же надпись бывает значком на
+# карточке товара, поэтому берётся та, рядом с которой (в нескольких уровнях вверх) — другие
+# фильтры из списка, а цены (₽) нет.
+JS_CLICK_FILTER = r"""((label, labels) => {
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = norm(label);
+  const words = new Set(labels.map(norm));
+  const named = (node) => {  // сколько разных фильтров из списка внутри (надписи соседей склеены без пробелов)
+    const hit = new Set();
+    for (const el of [node, ...node.querySelectorAll('*')]) {
+      const text = norm(el.textContent);
+      if (words.has(text)) hit.add(text);
+    }
+    return hit.size;
+  };
+  const enough = Math.min(4, words.size);
+  let best = null, bestDepth = 99;
+  for (const el of document.querySelectorAll('body *')) {
+    if (norm(el.textContent) !== want || !el.getClientRects().length) continue;
+    if (el.closest('a[href*="/product/"]')) continue;
+    let node = el, depth = 0, ok = false;
+    for (; node && node !== document.body && depth <= 5; node = node.parentElement, depth++) {
+      if (/₽|руб/i.test(node.textContent || '')) break;
+      if (named(node) >= enough) { ok = true; break; }
+    }
+    if (ok && depth < bestDepth) { best = el; bestDepth = depth; }
   }
-  return { cards: out, scrollers: scrollers.length, title: document.title, url: location.href };
-})(%s)"""
+  if (!best) return null;
+  const target = best.closest('button, [role="button"], [role="checkbox"], [role="option"], label, a') || best;
+  target.click();
+  return { text: norm(best.textContent), tag: target.tagName };
+})(%s, %s)"""
 
 
 # --- скрипты для страницы ---------------------------------------------------------

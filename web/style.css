@@ -584,3 +584,8 @@ input.pic-other { width: 260px; font-size: 13px; padding: 4px 8px; }
 /* Одноимённые товары площадки, когда точный не найден: выбор «Это он». */
 .candidate { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 0; border-top: 1px solid var(--line); }
 .candidate button { margin-left: auto; padding: 2px 8px; }
+.link-url { margin-top: 8px; }
+.link-url summary { cursor: pointer; color: var(--muted); }
+.link-url-row { display: flex; gap: 6px; margin-top: 6px; }
+.link-url-input { flex: 1; min-width: 0; font-size: 13px; padding: 4px 8px; }
+button.link-fix { display: block; margin-left: auto; padding: 0 4px; font-size: 11px; color: var(--muted); }

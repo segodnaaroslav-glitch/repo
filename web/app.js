@@ -20,6 +20,7 @@ const state = {
   data: { items: [], categories: [], markets: [] },
   status: null,
   clockOffset: 0,        // серверное время минус время браузера, мс
+  linkFocus: null,       // площадка, чью ссылку на товар указать (из калькулятора)
   dataVersion: null,
   category: "weapons",
   search: "",
@@ -944,6 +945,7 @@ function marketTile(item, id) {
     const shown = (item.market_candidates || {})[id] || [];
     if (!shown.length) {
       tile.append(el("p", "muted small", "Не найден на площадке."));
+      tile.append(linkUrlForm(item, id, false));
       return tile;
     }
     // Одноимённые товары есть, но ни один не подошёл уверенно — пусть выберет пользователь.
@@ -962,6 +964,7 @@ function marketTile(item, id) {
       line.append(pick);
       tile.append(line);
     }
+    tile.append(linkUrlForm(item, id, false));
     return tile;
   }
   if (info.linked) {
@@ -999,7 +1002,50 @@ function marketTile(item, id) {
   const liq = el("div", "tile-liq");
   liq.append(el("span", "muted", "Ликвидность"), liquidityChip(info));
   tile.append(liq);
+  tile.append(linkUrlForm(item, id, true));
   return tile;
+}
+
+// Привязка товара площадки по ссылке на его страницу: программа не нашла товар (или нашла
+// не тот), а на площадке он есть — пользователь вставляет ссылку, цена берётся с неё.
+function linkUrlForm(item, id, found) {
+  const box = el("details", "link-url");
+  box.append(el("summary", "small", found ? "Не тот товар? Укажите ссылку на нужный"
+    : "Продаётся на площадке? Вставьте ссылку на товар"));
+  const row = el("div", "link-url-row");
+  const input = el("input", "link-url-input");
+  input.type = "url";
+  input.placeholder = `ссылка на товар ${marketTitle(id)}`;
+  input.setAttribute("aria-label", `Ссылка на товар ${marketTitle(id)} для «${item.name}»`);
+  const save = el("button", "small", "Привязать");
+  save.type = "button";
+  const go = () => {
+    const url = input.value.trim();
+    if (url) linkUrl(item, url);
+  };
+  save.addEventListener("click", go);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") go();
+  });
+  row.append(input, save);
+  box.append(row);
+  if (state.linkFocus === id) {  // пришли из калькулятора по «указать ссылку»
+    state.linkFocus = null;
+    box.open = true;
+    setTimeout(() => input.focus(), 0);
+  }
+  return box;
+}
+
+async function linkUrl(item, url) {
+  try {
+    const result = await postJson("/api/markets/link", { item: itemKey(item), url });
+    toast(`Запомнил: товар ${marketTitle(result.market)} по ссылке — для «${item.name}». ` +
+          "Цена появится после проверки площадки (обычно 1–3 минуты).");
+    await loadData();
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 function renderDrawer() {
@@ -1514,6 +1560,17 @@ function renderCalc() {
       const info = item.prices[id];
       const unit = el("td", "num");
       unit.append(infoNode(info));
+      if (!onSale(info) && item.key && findItem(item.key)) {
+        // Программа не нашла товар, а он продаётся — указать его ссылкой.
+        const fix = el("button", "ghost small link-fix", "указать ссылку");
+        fix.type = "button";
+        fix.title = `Вставить ссылку на этот товар ${marketTitle(id)} — цена будет браться с неё`;
+        fix.addEventListener("click", () => {
+          state.linkFocus = id;
+          openDrawer(item.key);
+        });
+        unit.append(fix);
+      }
       sums[id] = el("td", "num");
       cells.push(unit, sums[id]);
     }
@@ -1551,6 +1608,25 @@ function renderCalc() {
   $("calcWrap").classList.toggle("hidden", !calc.items.length);
   calc.rate = usdRub();  // по какому курсу пересчитаны строки
   renderCalcTotals();
+}
+
+// Цены в расчёте — по последним данным площадок (новый опрос, привязка товара по ссылке).
+// Пока курсор в поле количества, строки не перерисовываются (поле не пропадёт из-под курсора).
+function refreshCalcPrices() {
+  if (!calc.items.length) return;
+  let changed = false;
+  for (const row of calc.items) {
+    for (const choice of [row, ...(row.alternatives || [])]) {
+      const fresh = choice.key ? findItem(choice.key) : null;
+      if (!fresh) continue;
+      const prices = fresh.market || {};
+      if (JSON.stringify(prices) !== JSON.stringify(choice.prices)) {
+        choice.prices = prices;
+        changed = true;
+      }
+    }
+  }
+  if (changed && !$("calcBody").contains(document.activeElement)) renderCalc();
 }
 
 function renderCalcTotals() {
@@ -1689,7 +1765,6 @@ async function linkOffer(market, item, offer) {
     await postJson("/api/markets/link", { market, item, offer });
     toast(offer === null ? "Привязка снята" : "Запомнил: этот товар площадки — для этого предмета");
     await loadData();
-    if (state.selected) renderDrawer();
   } catch (error) {
     toast(error.message, "error");
   }
@@ -1800,6 +1875,7 @@ async function loadData() {
     return;
   }
   state.data.markets = state.data.markets || [];
+  refreshCalcPrices();
   const known = new Set(["weapons", "all", "favorites", ...state.data.categories.map((c) => c.slug)]);
   if (!known.has(state.category)) state.category = "weapons";
   if (!known.has(state.liqCategory)) state.liqCategory = "weapons";

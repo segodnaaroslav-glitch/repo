@@ -347,6 +347,54 @@ def item_id(item):
     return f"{item['category']}:{item['name']}"
 
 
+# Товары, которые пользователь прислал ссылками («они продаются, а программа пишет „нет в
+# продаже“»). Привязываются к предмету с этим названием сами, один раз — потом их можно
+# отвязать или выбрать другой товар. Редкость — какой из одноимённых предметов это.
+KNOWN_PRODUCTS = (
+    ("Peppermint", "godly", (
+        "https://starpets.gg/ru/mm2/shop/weapon/peppermint/279",
+        "https://dreampets.gg/mm2/product/peppermint/70db199b-0248-4deb-ab53-0d7f3132e2cf")),
+    ("Snowflake", "godly", (
+        "https://starpets.gg/ru/mm2/shop/weapon/snowflake/918",
+        "https://dreampets.gg/mm2/product/snowflake/264ba2f5-c2cb-43f5-a508-194ebb34f7bc")),
+    ("Shadow", "vintage", (
+        "https://starpets.gg/ru/mm2/shop/weapon/shadow/269",
+        "https://dreampets.gg/mm2/product/shadow/d3537bed-0ca9-4c17-bd8d-7e41fd970ecd")),
+    ("Prince", "vintage", (
+        "https://starpets.gg/ru/mm2/shop/weapon/prince/178",
+        "https://dreampets.gg/mm2/product/prince/f48efeba-9af7-4411-ae6d-f75f729ba0c5")),
+    ("Phaser", "vintage", (
+        "https://starpets.gg/ru/mm2/shop/weapon/phaser/125",
+        "https://dreampets.gg/mm2/product/phaser/b3b45d93-df92-4fe9-8cc8-33f475d74cf3")),
+    ("Golden", "vintage", (
+        "https://starpets.gg/ru/mm2/shop/weapon/golden/590",
+        "https://dreampets.gg/mm2/product/golden/e9a75d02-4186-4657-af2e-efb36e0202a2")),
+    ("Ghost", "vintage", (
+        "https://starpets.gg/ru/mm2/shop/weapon/ghost/458",
+        "https://dreampets.gg/mm2/product/ghost/986f0a0f-f132-449a-beb4-f55441d9abf3")),
+    ("Cowboy", "vintage", (
+        "https://starpets.gg/ru/mm2/shop/weapon/cowboy/761",
+        "https://dreampets.gg/mm2/product/cowboy/f7b41518-ff5c-4fe5-b411-60e4bcd7a515")),
+)
+
+_STARPETS_PRODUCT_RE = re.compile(r"^https?://(?:www\.)?starpets\.gg/(?:[a-z]{2}(?:-[a-z]{2})?/)?mm2/shop/"
+                                  r"[^/?#]+/[^/?#]+/(\d+)(?:[/?#]|$)", re.I)
+_DREAMPETS_PRODUCT_RE = re.compile(r"^https?://(?:www\.)?dreampets\.(?:gg|io)/mm2/product/", re.I)
+
+
+def product_ref(url):
+    """Ссылка на страницу товара -> (вид площадки, id товара) или None.
+    https://starpets.gg/ru/mm2/shop/weapon/peppermint/279 -> ("starpets", "279"),
+    https://dreampets.gg/mm2/product/cowboy/<uuid> -> ("dreampets", "<uuid>")."""
+    text = str(url or "").strip()
+    match = _STARPETS_PRODUCT_RE.match(text)
+    if match:
+        return "starpets", match.group(1)
+    if _DREAMPETS_PRODUCT_RE.match(text) and dreampets.uuid_of(text):
+        return "dreampets", dreampets.uuid_of(text)
+    return None
+
+
 _YEAR_RE = re.compile(r"(?<!\d)(20[0-4]\d)(?!\d)")
 
 
@@ -444,6 +492,9 @@ class Adapter:
         # False, пока адаптер не прочитал площадку целиком (читает её частями):
         # тогда старые данные не выбрасываются, а покупки не считаются.
         self.complete = True
+        # Товары, выбранные пользователем (ссылкой или «Это он»): {id товара: адрес его страницы}.
+        # Их цена нужна, даже если в общем списке площадки товар не попался.
+        self.wanted = {}
 
     def fetch(self):
         """Список предложений: {"name", "price", "currency", "stock", "sales_week", "available", "url"}."""
@@ -635,6 +686,8 @@ class StarPetsAdapter(Adapter):
             self.cache["rows"] = {key: {k: row.get(k) for k in self._ROW_FIELDS} for key, row in rows_by_id.items()}
         self.complete = complete
         offers = self._offers(rows_by_id, prices, swept)
+        if swept and not blocked_seen:
+            self._linked_lots(api, offers, "usd" if "usd" in swept else swept[-1])
         if self._rub_stale(prices) and not notes:
             notes.append("цены в рублях StarPets сейчас не получены — показаны последние известные (≈)")
         try:
@@ -649,7 +702,8 @@ class StarPetsAdapter(Adapter):
             self.note = "; ".join([self.note] + notes) if self.note else "; ".join(notes)
         return offers
 
-    _ROW_FIELDS = ("id", "name", "type", "subtype", "year", "chroma", "realName", "imageUri", "_rank", "_type")
+    _ROW_FIELDS = ("id", "name", "type", "subtype", "year", "chroma", "rare", "realName", "imageId", "imageUri",
+                   "_rank", "_type")
 
     def _sweep(self, api, currency):
         """Весь каталог в одной валюте: {id: строка}, прочитан ли он целиком."""
@@ -787,6 +841,48 @@ class StarPetsAdapter(Adapter):
             "id": product_id,
         }
 
+    BOOK = 72  # лотов за один запрос списка лотов
+
+    def _linked_lots(self, api, offers, currency):
+        """Товары, выбранные пользователем, у которых в каталоге нет цены: самый дешёвый лот и
+        число лотов — из списка лотов самих товаров (как на их странице). Не вышло — не беда:
+        остаётся «нет в продаже», повтор через час."""
+        wanted = {str(key) for key in self.wanted or {}}
+        need = [offer for offer in offers if str(offer["id"]) in wanted
+                and offer["price"] is None and offer["price_rub"] is None]
+        ids = []
+        for offer in need[:12]:  # больше 12 товаров за запрос площадка не принимает
+            try:
+                ids.append(int(offer["id"]))
+            except (TypeError, ValueError):
+                pass
+        if not ids or self.cache.get("book_off_until", 0) > time.time():
+            return
+        _pause(self.PAUSE)
+        try:
+            data = post_json(f"{api}/api/v2/store/items/product",
+                             {"currency": currency, "products": ids, "amount": self.BOOK}, headers=self.HEADERS)
+        except fetcher.FetchError:
+            self.cache["book_off_until"] = time.time() + 3600
+            return
+        rows = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            self.cache["book_off_until"] = time.time() + 3600
+            return
+        lots = {}
+        for row in rows:
+            price = _price(row.get("price")) if isinstance(row, dict) else None
+            if price:
+                lots.setdefault(str(row.get("productId")), []).append(price)
+        for offer in need:
+            prices = lots.get(str(offer["id"]))
+            if not prices:
+                continue
+            offer["price" if currency == "usd" else "price_rub"] = min(prices)
+            offer["available"] = True
+            if len(rows) < self.BOOK:  # список не обрезан — лотов столько и есть
+                offer["stock"] = len(prices)
+
     def _add_sales(self, api, offers, request=True):
         sales = self.cache.setdefault("sales", {})
         now = time.time()
@@ -865,8 +961,20 @@ class DreamPetsAdapter(Adapter):
     VISIBLE_EVERY = 5 * 60
     VISIBLE_FRESH = 30 * 60
     VISIBLE_PAGES = 60  # страниц списка рынка («Показать ещё», ?page=2…) за проход
-    VISIBLE_TIME = 180
+    VISIBLE_TIME = 150
     VISIBLE_MIN = 5  # меньше карточек с ценой — страница не дорисовалась, снимок не обновляется
+    # Фильтры редкости рынка. Общий список отсортирован по популярности, и редкие товары
+    # (Classic — винтажные Cowboy, Golden, Prince…) в нём далеко внизу; список по одному
+    # фильтру короткий и читается целиком. За проход — сколько успеется, дальше по кругу.
+    FILTERS = ("Classic", "Unique", "Ancient", "Christmas", "Halloween", "Legendary", "Rare", "Uncommon",
+               "Common", "Godly")
+    FILTER_TIME = 80
+    FILTER_ONE = 40
+    # Окна товаров, выбранных пользователем, которых нет среди карточек: «223 ₽ мин. цена»,
+    # «24 на продаже».
+    PRODUCT_PAGES = 12
+    PRODUCT_TIME = 60
+    PRODUCT_WAIT = 12
     MAX_SITEMAPS = 40
     USELESS_PAGES = 6  # прочитано столько страниц, и ни на одной нет ни цены, ни лотов — рисуются скриптом
     MISSING_DROP = 3  # страница товара — 404 столько раз подряд ...
@@ -977,63 +1085,166 @@ class DreamPetsAdapter(Adapter):
 
     def _fetch_visible(self, base):
         """Цены «как на сайте»: только то, что посетитель видит на карточках рынка
-        (название, редкость, «от N ₽»). Рынок читается в скрытом Edge раз в VISIBLE_EVERY;
-        между проходами — последний снимок. Других источников нет: числа из данных
-        страницы и со страниц товаров с экраном не совпадали."""
+        (название, редкость, «от N ₽») и в окнах товаров («N ₽ мин. цена»). Рынок читается
+        в скрытом Edge раз в VISIBLE_EVERY: весь список, затем списки по фильтрам редкости
+        (по очереди), затем окна товаров, выбранных пользователем, если их не было среди
+        карточек. Между проходами — последний снимок. Других источников нет: числа из
+        данных страницы и со страниц товаров с экраном не совпадали."""
         now = time.time()
         self._new_poll()
         snap = self.cache.get("visible") or {}
+        # Карточки со списков по фильтрам и из окон товаров: {ключ товара: карточка + "at"}.
+        extra = {key: card for key, card in (snap.get("extra") or {}).items()
+                 if isinstance(card, dict) and now - card.get("at", 0) <= self.VISIBLE_FRESH}
+        wanted = {}
+        for offer_id, url in (self.wanted or {}).items():
+            uid = dreampets.uuid_of(offer_id) or dreampets.uuid_of(url)
+            if uid and url:
+                wanted[uid] = url
+        known = set(extra)
+        if now - snap.get("at", 0) <= self.VISIBLE_FRESH:
+            known.update(self._card_key(card) for card in snap.get("cards") or [])
+        due = now - snap.get("at", 0) >= self.VISIBLE_EVERY
         error = None
-        if now - snap.get("at", 0) >= self.VISIBLE_EVERY and not self._stopped():
+        if (due or set(wanted) - known) and not self._stopped():
+            seen = set()  # товары, прочитанные в этом проходе
             try:
                 with cdp.Browser() as browser:
-                    browser.open(base, settle=2)
-                    result = browser.collect_price_cards(timeout=self.VISIBLE_TIME)
+                    if due:
+                        browser.open(base, settle=2)
+                        result = browser.collect_price_cards(timeout=self.VISIBLE_TIME)
+                        cards = self._read_cards(result["cards"])
+                        self._step("visible", base, f"карточек с ценой: {len(cards)}, шагов: {result.get('rounds')}, "
+                                                    f"заголовок: {result.get('title')}")
+                        if len(cards) >= self.VISIBLE_MIN:
+                            snap = {"at": now, "cards": cards}
+                            seen.update(self._card_key(card) for card in cards)
+                            self._filter_cards(browser, extra, seen)
+                        else:
+                            error = f"на странице рынка нашлось карточек с ценой: {len(cards)}"
+                    pages = [(uid, url) for uid, url in wanted.items() if uid not in seen and (due or uid not in known)]
+                    self._product_pages(browser, pages, extra)
                     for note in browser.notes:
                         self._step("visible", "заметка", note)
-                cards = []
-                for card in result["cards"]:
-                    slug = re.search(r"/product/([^/?#]+)", card.get("href") or "")
-                    data = dreampets.parse_card_text(card.get("text"), slug.group(1).replace("-", " ") if slug else None)
-                    if data.get("name") and data.get("price") is not None:
-                        cards.append({"name": data["name"], "price": data["price"], "lots": data.get("lots"),
-                                      "rarity": data.get("rarity"), "href": card.get("href") or ""})
-                self._step("visible", base, f"карточек с ценой: {len(cards)}, проходов: {result.get('rounds')}, "
-                                            f"заголовок: {result.get('title')}")
-                if len(cards) >= self.VISIBLE_MIN:
-                    snap = {"at": now, "cards": cards}
-                    self.cache["visible"] = snap
-                else:
-                    error = f"на странице рынка нашлось карточек с ценой: {len(cards)}"
             except Exception as failure:  # браузер не открылся, сайт не ответил — остаётся прошлый снимок
                 error = f"{type(failure).__name__}: {failure}"
+        snap = dict(snap, extra=extra)
+        self.cache["visible"] = snap
         age = now - snap.get("at", 0)
         if not snap.get("cards") or age > self.VISIBLE_FRESH:
             self.report["visible_error"] = error
             self._save_report(None)
             raise fetcher.FetchError("не удалось прочитать цены с сайта DreamPets" + (f": {error}" if error else ""))
-        offers, seen = [], {}
+        # Один товар — одна цена: из более свежего чтения (список, фильтр или окно товара).
+        # Одинаковые карточки без ссылки (то же название и редкость) — разные товары: #2, #3.
+        entries, counts = {}, {}
         for card in snap["cards"]:
-            uuid = dreampets.uuid_of(card["href"]) if card["href"] else None
-            key = uuid or "card:%s:%s" % (parser.name_key(card["name"]), str(card.get("rarity") or "").lower())
-            seen[key] = seen.get(key, 0) + 1
-            offers.append({
-                "id": key if seen[key] == 1 else f"{key}#{seen[key]}",
-                "name": card["name"],
-                "price": card["price"],
-                "currency": "RUB",
-                "stock": card.get("lots"),  # на карточках DreamPets лотов нет — None, а не 0
-                "sales_week": None,
-                "available": True,
-                "rarity": card.get("rarity"),
-                "product": True,
-                "price_from": True,  # «от N ₽» — минимальная цена лота, как на карточке
-                "url": card["href"] or base,
-            })
+            key = self._card_key(card)
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] > 1 and not dreampets.uuid_of(key):
+                key = f"{key}#{counts[key]}"
+            entries[key] = (snap["at"], card)
+        for key, card in extra.items():
+            if key not in entries or card.get("at", 0) > entries[key][0]:
+                entries[key] = (card.get("at", 0), card)
+        offers = [self._visible_offer(key, card, base) for key, (_, card) in entries.items()]
         self.complete = True
-        self.note = (f"цены как на сайте: {len(snap['cards'])} карточек, проверено {int(age // 60)} мин назад"
+        self.note = (f"цены как на сайте: {len(snap['cards'])} карточек"
+                     + (f" и ещё {len(extra)} с фильтров и окон товаров" if extra else "")
+                     + f", проверено {int(age // 60)} мин назад"
                      + (f" (последняя проверка не удалась: {error})" if error else ""))
         return offers
+
+    @staticmethod
+    def _card_key(card):
+        """Ключ товара карточки: id из ссылки, иначе название и значок редкости."""
+        uid = dreampets.uuid_of(card.get("href")) if card.get("href") else None
+        return uid or "card:%s:%s" % (parser.name_key(card.get("name") or ""), str(card.get("rarity") or "").lower())
+
+    @staticmethod
+    def _read_cards(found):
+        """Карточки со страницы (ссылка + текст) -> [{"name", "price", "lots", "rarity", "href"}] с ценой."""
+        cards = []
+        for card in found:
+            slug = re.search(r"/product/([^/?#]+)", card.get("href") or "")
+            data = dreampets.parse_card_text(card.get("text"), slug.group(1).replace("-", " ") if slug else None)
+            if data.get("name") and data.get("price") is not None:
+                cards.append({"name": data["name"], "price": data["price"], "lots": data.get("lots"),
+                              "rarity": data.get("rarity"), "href": card.get("href") or ""})
+        return cards
+
+    @staticmethod
+    def _visible_offer(key, card, base):
+        price = card.get("price")
+        return {
+            "id": key,
+            "name": card["name"],
+            "price": price,
+            "currency": "RUB",
+            "stock": card.get("lots"),  # на карточках DreamPets лотов нет — None, а не 0
+            "sales_week": None,
+            "available": price is not None,
+            "rarity": card.get("rarity"),
+            "product": True,
+            "price_from": price is not None,  # «от N ₽» — минимальная цена лота, как на карточке
+            "url": card.get("href") or base,
+        }
+
+    def _filter_cards(self, browser, extra, seen):
+        """Списки по фильтрам редкости — по очереди, сколько успеется за FILTER_TIME; в следующий
+        проход — с того фильтра, на котором остановились."""
+        order = self.FILTERS
+        if not order:
+            return 0
+        first = int(self.cache.get("visible_filter") or 0) % len(order)
+        start, done, clicked = time.time(), 0, 0
+        while done < len(order) and time.time() - start < self.FILTER_TIME and not self._stopped():
+            label = order[(first + done) % len(order)]
+            done += 1
+            if not browser.click_filter(label, order):
+                self._step("visible", f"фильтр {label}", "не найден на странице")
+                continue
+            clicked += 1
+            time.sleep(1.5)
+            left = self.FILTER_TIME - (time.time() - start)
+            found = browser.collect_price_cards(timeout=max(5, min(self.FILTER_ONE, left)), reset=True)
+            cards = self._read_cards(found["cards"])
+            at = time.time()
+            for card in cards:
+                key = self._card_key(card)
+                extra[key] = dict(card, at=at)
+                seen.add(key)
+            self._step("visible", f"фильтр {label}", f"карточек с ценой: {len(cards)}")
+            browser.click_filter(label, order)  # снять фильтр
+            time.sleep(1)
+        self.cache["visible_filter"] = (first + done) % len(order)
+        return clicked
+
+    def _product_pages(self, browser, pages, extra):
+        """Окна товаров (по ссылке): «223 ₽ мин. цена», «24 на продаже» или «лотов нет»."""
+        start = time.time()
+        for uid, url in pages[:self.PRODUCT_PAGES]:
+            if self._stopped() or time.time() - start > self.PRODUCT_TIME:
+                break
+            try:
+                browser.open(url, settle=1)
+                text, end = "", time.time() + self.PRODUCT_WAIT
+                while True:
+                    text = browser.page_text()
+                    if dreampets.product_text_ready(text, dreampets.slug_name(url)) or time.time() > end:
+                        break
+                    time.sleep(0.7)
+            except (cdp.BrowserError, TimeoutError, OSError) as error:
+                self._step("visible", url, f"окно товара не прочитано: {error}")
+                continue
+            data = dreampets.parse_product_text(text, dreampets.slug_name(url))
+            self._step("visible", url, f"окно товара: цена {data['price']}, лотов {data['lots']}"
+                                       + (", лотов нет" if data["sold_out"] else ""))
+            if data["price"] is None and not data["sold_out"]:
+                continue  # окно не дорисовалось — остаётся прошлое чтение
+            extra[uid] = {"name": data["name"] or dreampets.slug_name(url) or uid, "price": data["price"],
+                          "lots": 0 if data["price"] is None else data["lots"], "rarity": data["rarity"],
+                          "href": url, "at": time.time(), "page": True}
 
     def _visible_fresh(self, entry, now=None):
         seen = entry.get("visible_at")
@@ -1851,7 +2062,9 @@ class MarketState:
         self.unmatched = 0
         self.sales = {}        # id предмета -> [[время, количество], ...] ушедших лотов за 2 дня
         self.listed = {}       # id предмета -> [[время, количество], ...] новых лотов за 2 дня
-        self.links = {}        # id предмета -> id товара, выбранный пользователем («Это он»)
+        self.links = {}        # id предмета -> id товара, выбранный пользователем («Это он», ссылка)
+        self.urls = {}         # id выбранного товара -> адрес его страницы (окно товара читается по нему)
+        self.seeded = set()    # товары из KNOWN_PRODUCTS, уже привязанные (повторно не привязываются)
         self.candidates = {}   # id предмета без товара -> одноимённые товары площадки и почему не подошли
 
     def interval(self, default):
@@ -1934,6 +2147,10 @@ class MarketMonitor:
             market.unmatched = entry.get("unmatched") if isinstance(entry.get("unmatched"), int) else 0
             links = entry.get("links") if isinstance(entry.get("links"), dict) else {}
             market.links = {str(k): str(v) for k, v in links.items() if v is not None}
+            urls = entry.get("urls") if isinstance(entry.get("urls"), dict) else {}
+            market.urls = {str(k): str(v) for k, v in urls.items() if isinstance(v, str)}
+            seeded = entry.get("seeded") if isinstance(entry.get("seeded"), list) else []
+            market.seeded = {str(v) for v in seeded}
             candidates = entry.get("candidates") if isinstance(entry.get("candidates"), dict) else {}
             market.candidates = {str(k): v for k, v in candidates.items() if isinstance(v, list)}
             try:
@@ -1957,6 +2174,8 @@ class MarketMonitor:
                     "complete": market.complete,
                     "unmatched": market.unmatched,
                     "links": market.links,
+                    "urls": market.urls,
+                    "seeded": sorted(market.seeded),
                     "candidates": market.candidates,
                     "last_ok_at": market.last_ok_at.isoformat() if market.last_ok_at else None,
                 }
@@ -2042,21 +2261,36 @@ class MarketMonitor:
                 market.next_poll_at = _now() + timedelta(seconds=self.WAIT_FOR_PRICES)
                 self.version += 1
             return
+        index = build_index(items)
+        by_key = {item_id(item): item for item in items}
+        adapter = self._adapter(market)
         with self._lock:
             market.status = "busy"
-        adapter = self._adapter(market)
+            self._seed_links(market, index)
+            # Выбранные пользователем товары: id товара -> id предмета (им — в первую очередь).
+            links = {key: offer_id for key, offer_id in market.links.items() if key in by_key}
+            pinned = {}
+            for key, offer_id in links.items():
+                pinned.setdefault(str(offer_id), key)
+            adapter.wanted = {offer_id: market.urls.get(offer_id) for offer_id in pinned}
         try:
             offers = adapter.fetch()
         except Exception as error:
             self._fail(market, error)
             self._save_state()  # кэш адаптера мог пополниться и до ошибки
             return
-        index = build_index(items)
-        by_key = {item_id(item): item for item in items}
         matched = {}
         unmatched = 0
+        # Предметы, чей выбранный товар площадка сейчас показала (с ценой или без — «лотов нет»):
+        # в подборе они не участвуют. Не показала (окно товара не прочиталось) — до следующего
+        # опроса цена по обычному подбору, а не пусто.
+        chosen = {pinned[str(offer.get("id"))] for offer in offers if str(offer.get("id")) in pinned}
         groups = {}  # товары-страницы (StarPets, DreamPets): одноимённые сопоставляются вместе
         for offer in offers:
+            owner = pinned.get(str(offer.get("id")))
+            if owner is not None:
+                matched.setdefault(owner, dict(offer, linked=True))
+                continue
             if offer.get("product"):
                 candidates = candidate_items(index, offer)
                 if not candidates:
@@ -2066,7 +2300,7 @@ class MarketMonitor:
                 group[1].append(offer)
                 continue
             item = find_item(index, offer)
-            if item is None:
+            if item is None or item_id(item) in chosen:  # у предмета товар выбран пользователем
                 unmatched += 1
                 continue
             key = item_id(item)
@@ -2092,7 +2326,8 @@ class MarketMonitor:
                     previous["popularity"] = min(previous.get("popularity", 1), offer["popularity"])
                 previous["available"] = bool(previous.get("available")) or bool(offer.get("available"))
         explain = {}
-        assigned, unused = assign_offers(groups.values(), links=dict(market.links), explain=explain)
+        assigned, unused = assign_offers([([item for item in same if item_id(item) not in chosen], group)
+                                          for same, group in groups.values()], explain=explain)
         matched.update((key, dict(offer)) for key, offer in assigned.items())
         unmatched += unused
         now = _now()
@@ -2137,9 +2372,11 @@ class MarketMonitor:
 
     # --- ручная привязка («Это он») ---
 
-    def link(self, market_id, item_key, offer_id):
+    def link(self, market_id, item_key, offer_id, url=None):
         """Пользователь указал товар площадки для предмета (offer_id None — отвязать).
-        Привязка запоминается; цена показывается сразу, а следующий опрос её обновит."""
+        Привязка запоминается. Товар из подсказок показывается сразу, другой (по ссылке) —
+        после опроса площадки, который начинается сразу."""
+        wake = False
         with self._lock:
             market = next((m for m in self.markets if m.config["id"] == market_id), None)
             if market is None:
@@ -2149,13 +2386,54 @@ class MarketMonitor:
                 if (market.offers.get(item_key) or {}).get("linked"):
                     market.offers.pop(item_key, None)
             else:
-                market.links[item_key] = str(offer_id)
-                shown = next((row for row in market.candidates.get(item_key) or [] if row.get("id") == str(offer_id)), None)
+                offer_id = str(offer_id)
+                market.links[item_key] = offer_id
+                shown = next((row for row in market.candidates.get(item_key) or [] if row.get("id") == offer_id), None)
+                url = url or (shown or {}).get("url")
+                if url and product_ref(url):
+                    market.urls[offer_id] = url
                 if shown:
                     market.offers[item_key] = dict(shown, available=True, linked=True)
                     market.candidates.pop(item_key, None)
-            self.version += 1  # цена видна сразу; следующий плановый опрос применит привязку сам
+                else:
+                    previous = (market.offers.get(item_key) or {}).get("id")
+                    if previous is not None and str(previous) != offer_id:
+                        market.offers.pop(item_key, None)  # прежний товар — не этот
+                    market.next_poll_at = _now()
+                    wake = True
+            self.version += 1
         self._save_state()
+        if wake:
+            self._wake.set()
+
+    def link_url(self, item_key, url):
+        """Привязать предмет к товару по ссылке на страницу товара StarPets или DreamPets.
+        -> id площадки. ValueError — это не ссылка на товар, KeyError — площадка выключена."""
+        ref = product_ref(url)
+        if ref is None:
+            raise ValueError("Нужна ссылка на страницу товара StarPets или DreamPets")
+        kind, offer_id = ref
+        market = next((m for m in self.markets if m.config.get("kind") == kind), None)
+        if market is None:
+            raise KeyError(kind)
+        self.link(market.config["id"], item_key, offer_id, url=str(url).strip())
+        return market.config["id"]
+
+    def _seed_links(self, market, index):
+        """Товары из KNOWN_PRODUCTS — к предметам с их названием (каждый один раз)."""
+        for name, rarity_name, urls in KNOWN_PRODUCTS:
+            same = index["every"].get(parser.name_key(name)) or []
+            category = RARITY_CATEGORY.get(rarity_name)
+            fit = [item for item in same if item.get("category") == category] or (same if len(same) == 1 else [])
+            for url in urls:
+                ref = product_ref(url)
+                if not fit or not ref or ref[0] != market.config.get("kind") or ref[1] in market.seeded:
+                    continue
+                market.seeded.add(ref[1])
+                key = item_id(fit[0])
+                if key not in market.links:
+                    market.links[key] = ref[1]
+                    market.urls[ref[1]] = url
 
     # --- данные для окна программы ---
 

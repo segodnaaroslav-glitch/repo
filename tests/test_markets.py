@@ -1510,3 +1510,298 @@ class EventRarityAndLinksTests(unittest.TestCase):
         again = markets.MarketMonitor(path, [{"id": "d", "title": "D", "kind": "fake", "url": "u"}], adapters={"fake": Fake})
         item = again.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(path)["items"]])[0]
         self.assertEqual(item["market"]["d"]["price"], 2.0)  # привязка пережила перезапуск
+
+
+class UserLinkedProductsTests(unittest.TestCase):
+    """Товары, которые пользователь прислал ссылками: привязываются к предмету и побеждают подбор."""
+
+    def item(self, name, category):
+        return parser.make_item(name, category, {"value": "1", "demand": "1", "rarity": "1"})
+
+    def monitor(self, items, adapters, markets_list):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "values.json"
+        data = store.empty_data()
+        by_category = {}
+        for item in items:
+            by_category.setdefault(item["category"], []).append(item)
+        for category, same in by_category.items():
+            store.replace_category(data, category, same, "site")
+        store.save(data, path)
+        self.path = path
+        return markets.MarketMonitor(path, markets_list, adapters=adapters)
+
+    def shown(self, monitor):
+        items = monitor.annotate([dict(i, liquidity=liquidity.assess(i)) for i in store.load(self.path)["items"]])
+        return {markets.item_id(item): item for item in items}
+
+    def test_product_links_are_recognised(self):
+        self.assertEqual(markets.product_ref("https://starpets.gg/ru/mm2/shop/weapon/peppermint/279"), ("starpets", "279"))
+        self.assertEqual(markets.product_ref(" https://starpets.gg/mm2/shop/weapon/cowboy/761?x=1 "), ("starpets", "761"))
+        self.assertEqual(markets.product_ref(f"https://dreampets.gg/mm2/product/cowboy/{U1}"), ("dreampets", U1))
+        for junk in ("https://starpets.gg/ru/mm2/shop/weapon", "https://example.com/mm2/product/x/" + U1, "", None,
+                     "https://dreampets.gg/mm2/"):
+            self.assertIsNone(markets.product_ref(junk), junk)
+        # ссылки пользователя из KNOWN_PRODUCTS — все узнаются
+        for name, rarity_name, urls in markets.KNOWN_PRODUCTS:
+            self.assertEqual(sorted(markets.product_ref(url)[0] for url in urls), ["dreampets", "starpets"], name)
+            self.assertIn(rarity_name, markets.RARITY_CATEGORY)
+
+    def test_known_products_are_linked_once_and_win_over_rarity(self):
+        offers = [
+            {"id": 761, "name": "Cowboy", "rarity": "vintage", "kind": "gun", "year": 2014, "price": 0.52},
+            {"id": 37790684, "name": "Cowboy", "rarity": "rare", "kind": "knife", "year": 2026, "price": 1.48},
+            {"id": 458, "name": "Ghost", "rarity": "vintage", "kind": "knife", "price": 0.31},
+            {"id": 122, "name": "Ghost", "rarity": "legendary", "kind": "gun", "year": 2018, "price": 0.1},
+        ]
+
+        class Fake(markets.Adapter):
+            def fetch(self):
+                return [dict(o, currency="USD", available=True, product=True, url="u") for o in offers]
+
+        # Ghost на сайте Supreme — в другой категории, чем «vintage» на площадке: по редкости не подошёл бы.
+        items = [self.item("Cowboy", "vintages"), self.item("Cowboy", "rares"), self.item("Ghost", "misc")]
+        monitor = self.monitor(items, {"starpets": Fake},
+                               [{"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "u"}])
+        monitor.poll(monitor.markets[0])
+        shown = self.shown(monitor)
+        self.assertEqual(shown["vintages:Cowboy"]["market"]["starpets"]["price"], 0.52)
+        self.assertTrue(shown["vintages:Cowboy"]["market"]["starpets"]["linked"])
+        self.assertEqual(shown["rares:Cowboy"]["market"]["starpets"]["price"], 1.48)  # подбор — как раньше
+        self.assertEqual(shown["misc:Ghost"]["market"]["starpets"]["price"], 0.31)
+        market = monitor.markets[0]
+        self.assertEqual(market.links["misc:Ghost"], "458")
+        self.assertEqual(market.urls["458"], "https://starpets.gg/ru/mm2/shop/weapon/ghost/458")
+        # Пользователь отвязал — повторно сама не привязывается (и другой Ghost по редкости не подходит).
+        monitor.link("starpets", "misc:Ghost", None)
+        monitor.poll(monitor.markets[0])
+        self.assertNotIn("starpets", self.shown(monitor)["misc:Ghost"].get("market") or {})
+        again = markets.MarketMonitor(self.path, [{"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "u"}],
+                                      adapters={"starpets": Fake})
+        again.poll(again.markets[0])
+        self.assertNotIn("misc:Ghost", again.markets[0].links)  # «уже привязывали» пережило перезапуск
+
+    def test_link_by_url_reaches_adapter_and_sold_out_is_not_replaced(self):
+        seen, extra = [], []
+
+        class FakeDream(markets.Adapter):
+            def fetch(self):
+                seen.append(dict(self.wanted))
+                return [{"id": "card:x", "name": "Laser", "rarity": "GODLY", "price": 75.0, "currency": "RUB",
+                         "available": True, "product": True, "url": "u"}] + extra
+
+        items = [self.item("Laser", "godlies")]
+        monitor = self.monitor(items, {"dreampets": FakeDream},
+                               [{"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": "u"}])
+        monitor.poll(monitor.markets[0])
+        self.assertEqual(self.shown(monitor)["godlies:Laser"]["market"]["dreampets"]["price"], 75.0)
+        url = f"https://dreampets.gg/mm2/product/laser/{U2}"
+        before = monitor.markets[0].next_poll_at
+        self.assertEqual(monitor.link_url("godlies:Laser", url), "dreampets")
+        self.assertLessEqual(monitor.markets[0].next_poll_at, before)  # опрос — сразу
+        self.assertNotIn("dreampets", self.shown(monitor)["godlies:Laser"].get("market") or {})  # прежний — не этот
+        monitor.poll(monitor.markets[0])
+        self.assertEqual(seen[-1], {U2: url})  # окно этого товара прочитает адаптер
+        # Окно ещё не прочитано — пока цена по обычному подбору, а не пусто.
+        info = self.shown(monitor)["godlies:Laser"]["market"]["dreampets"]
+        self.assertEqual((info["price"], info["linked"]), (75.0, False))
+        # Площадка подтвердила: лотов нет — «нет в продаже», а не цена другого товара с этим названием.
+        extra.append({"id": U2, "name": "Laser", "rarity": "GODLY", "price": None, "stock": 0, "currency": "RUB",
+                      "available": False, "product": True, "url": url})
+        monitor.poll(monitor.markets[0])
+        info = self.shown(monitor)["godlies:Laser"]["market"]["dreampets"]
+        self.assertEqual((info["price"], info["linked"], info["available"]), (None, True, False))
+        extra[0] = dict(extra[0], price=80.0, stock=4, available=True)
+        monitor.poll(monitor.markets[0])
+        info = self.shown(monitor)["godlies:Laser"]["market"]["dreampets"]
+        self.assertEqual((info["price"], info["stock"], info["linked"]), (80.0, 4, True))
+        with self.assertRaises(ValueError):
+            monitor.link_url("godlies:Laser", "https://dreampets.gg/mm2/")
+        with self.assertRaises(KeyError):  # площадки StarPets в этом списке нет
+            monitor.link_url("godlies:Laser", "https://starpets.gg/ru/mm2/shop/weapon/laser/1")
+
+    def test_link_endpoint_accepts_a_product_url(self):
+        import http.client
+        from supreme import server
+
+        class Fake(markets.Adapter):
+            def fetch(self):
+                return []
+
+        monitor = self.monitor([self.item("Peppermint", "godlies")], {"starpets": Fake},
+                               [{"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "u"}])
+        httpd = server.make_server(port=0, data_path=self.path, update=lambda log: None, monitor=monitor)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def post(payload):
+            conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=10)
+            conn.request("POST", "/api/markets/link", body=json.dumps(payload), headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+
+        status, body = post({"item": "godlies:Peppermint", "url": "https://starpets.gg/ru/mm2/shop/weapon/peppermint/279"})
+        self.assertEqual((status, body["market"]), (200, "starpets"))
+        self.assertEqual(monitor.markets[0].links["godlies:Peppermint"], "279")
+        status, body = post({"item": "godlies:Peppermint", "url": "https://example.com/x"})
+        self.assertEqual(status, 400)
+        self.assertIn("ссылка", body["error"])
+
+
+class FakeBookApi(FakeApi):
+    """StarPets API со списком лотов товаров (items/product)."""
+
+    def do_POST(self):
+        if self.path.endswith("/items/product"):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.calls.append(("POST", self.path, body))
+            usd = body["currency"] == "usd"
+            rows = [{"id": "a", "productId": 900, "price": 0.31 if usd else 22.0},
+                    {"id": "b", "productId": 900, "price": 0.29 if usd else 21.0}] if 900 in body["products"] else []
+            return self._send(200, {"status": True, "items": rows, "count": len(rows)})
+        return super().do_POST()
+
+
+class StarPetsLinkedLotsTests(unittest.TestCase):
+    def setUp(self):
+        FakeApi.calls = []
+        FakeApi.info_status = 200
+        FakeApi.rub_status = 200
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeBookApi)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.config = {"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "https://starpets.gg/mm2",
+                       "api": f"http://127.0.0.1:{self.httpd.server_address[1]}"}
+        patcher = unittest.mock.patch.object(markets, "_pause")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_linked_product_without_catalog_price_reads_its_lots(self):
+        adapter = markets.StarPetsAdapter(self.config, {})
+        adapter.wanted = {"900": "https://starpets.gg/ru/mm2/shop/weapon/gone/900"}
+        gone = {o["id"]: o for o in adapter.fetch()}[900]
+        self.assertEqual((gone["price"], gone["stock"], gone["available"]), (0.29, 2, True))
+        books = [c for c in FakeApi.calls if c[1].endswith("/items/product")]
+        self.assertEqual(len(books), 1)
+        self.assertEqual(books[0][2]["products"], [900])
+
+    def test_not_linked_products_are_not_asked(self):
+        markets.StarPetsAdapter(self.config, {}).fetch()
+        self.assertFalse([c for c in FakeApi.calls if c[1].endswith("/items/product")])
+
+
+@unittest.skipUnless(_test_browser(), "нет Edge/Chrome для проверки скрытого браузера")
+class DreamPetsVisibleFiltersTests(unittest.TestCase):
+    """Как настоящий рынок DreamPets: список рисует только видимые карточки (середина пропала бы
+    при прокрутке сразу в низ), «Classic» (винтажные) — в самом конце или только по фильтру
+    редкости, окно товара — «223 ₽ мин. цена», «24 на продаже»."""
+
+    SITE = """<html><head><title>DreamPets</title><style>
+body{margin:0} #side{position:fixed;left:0;top:0;width:150px} #list{margin-left:160px;height:400px;overflow-y:auto;position:relative}
+.chip{display:inline-block;margin:2px;padding:2px 6px;border:1px solid #555;cursor:pointer}
+.row{position:absolute;left:0;right:0;height:200px;display:flex} .card{width:150px;height:190px;margin:4px;border:1px solid #333}
+</style></head><body>
+<div id="side"><div>Фильтры</div><div>Цена</div><div>Редкость</div><div id="chips"></div></div>
+<div id="list"><div id="spacer"></div></div>
+<script>
+const R = ['Unique', 'Ancient', 'Godly', 'Legendary', 'Rare', 'Uncommon', 'Common', 'Classic', 'Christmas', 'Halloween'];
+const all = [];
+for (let i = 0; i < 90; i++) all.push({r: ['GODLY', 'ANCIENT', 'LEGENDARY', 'UNCOMMON', 'CHRISTMAS'][i % 5], n: 'Item ' + i, p: String(i + 1)});
+for (const n of ['Cowboy', 'Golden', 'Phaser', 'Prince', 'Shadow']) all.push({r: 'CLASSIC', n, p: '87'});
+const LIMIT = LIMIT_VALUE;  // сколько показывает общий список (дальше не догружает)
+let loaded = 24, active = null;
+const list = document.getElementById('list'), spacer = document.getElementById('spacer');
+const shown = () => active ? all.filter((x) => x.r.toLowerCase() === active.toLowerCase()) : all.slice(0, Math.min(loaded, LIMIT));
+function render() {
+  const data = shown(), rows = Math.ceil(data.length / 3);
+  spacer.style.height = rows * 200 + 'px';
+  for (const old of list.querySelectorAll('.row')) old.remove();
+  const first = Math.floor(list.scrollTop / 200);
+  for (let r = first; r < Math.min(rows, first + 3); r++) {  // только видимые ряды
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.top = r * 200 + 'px';
+    for (const it of data.slice(r * 3, r * 3 + 3)) {
+      const d = document.createElement('div');
+      d.className = 'card';
+      d.innerHTML = '<div><span class="dot"></span>' + it.r + '</div><div>' + it.n + '</div><div><small>от</small> <b>' + it.p + ' ₽</b></div>';
+      row.appendChild(d);
+    }
+    list.appendChild(row);
+  }
+}
+list.addEventListener('scroll', () => {
+  if (!active && list.scrollTop + list.clientHeight > list.scrollHeight - 50 && loaded < LIMIT) loaded += 24;
+  render();
+});
+for (const name of R) {
+  const chip = document.createElement('span');
+  chip.className = 'chip';
+  chip.innerHTML = '<i></i>' + name;
+  chip.addEventListener('click', () => { active = active === name ? null : name; list.scrollTop = 0; render(); });
+  document.getElementById('chips').appendChild(chip);
+}
+render();
+</script></body></html>"""
+
+    PRODUCT = """<html><head><title>DreamPets</title></head><body><header>Баланс <b>0 ₽</b></header><div id="m"></div><script>
+setTimeout(() => { document.getElementById('m').innerHTML =
+  '<div>GODLY · НОЖ</div><h2>Peppermint</h2><div><div>27 ₽</div><div>мин. цена</div></div>' +
+  '<div><div>5</div><div>на продаже</div></div><div>Peppermint</div><div>27 ₽</div><button>+ В корзину</button>' +
+  '<div>Peppermint</div><div>31.5 ₽</div><button>+ В корзину</button>'; }, 600);
+</script></body></html>"""
+
+    def run_site(self, limit, wanted=None, cache=None):
+        routes = {"/mm2/": self.SITE.replace("LIMIT_VALUE", str(limit)), f"/mm2/product/peppermint/{U1}": self.PRODUCT}
+        httpd, base = serve_bytes(routes)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (unittest.mock.patch.object(markets.fetcher, "find_system_browser", return_value=_test_browser()),
+                      unittest.mock.patch.object(markets.store, "DATA_FILE", Path(tmp.name) / "values.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        config = {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": base + "/mm2/", "visible": True}
+        adapter = markets.DreamPetsAdapter(config, {} if cache is None else cache)
+        adapter.wanted = {key: url.replace("BASE", base) for key, url in (wanted or {}).items()}
+        return adapter, adapter.fetch(), base
+
+    def test_list_that_draws_only_visible_cards_is_read_whole(self):
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "FILTERS", ()):
+            adapter, offers, _ = self.run_site(1000)
+        by_name = {o["name"]: o for o in offers}
+        self.assertEqual(len([n for n in by_name if n.startswith("Item ")]), 90)  # и середина списка тоже
+        self.assertEqual((by_name["Item 44"]["price"], by_name["Item 44"]["rarity"]), (45, "CHRISTMAS"))
+        self.assertEqual((by_name["Cowboy"]["price"], by_name["Cowboy"]["rarity"]), (87, "CLASSIC"))
+
+    def test_classic_items_come_from_the_rarity_filter(self):
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "FILTERS", ("Classic", "Unique")):
+            adapter, offers, _ = self.run_site(48)
+        by_name = {o["name"]: o for o in offers}
+        self.assertNotIn("Item 60", by_name)  # общий список дальше 48 не показывает
+        for name in ("Cowboy", "Golden", "Phaser", "Prince", "Shadow"):
+            self.assertEqual((by_name[name]["price"], by_name[name]["rarity"], by_name[name]["price_from"]),
+                             (87, "CLASSIC", True), name)
+        self.assertEqual(markets.rarity(by_name["Cowboy"]["rarity"]), "vintage")
+        steps = [step for step in adapter.report["steps"] if step["what"].startswith("фильтр")]
+        self.assertEqual([step["what"] for step in steps], ["фильтр Classic", "фильтр Unique"])
+        self.assertIn("5", steps[0]["result"])
+
+    def test_wanted_product_window_is_read_when_not_on_cards(self):
+        cache = {}
+        with unittest.mock.patch.object(markets.DreamPetsAdapter, "FILTERS", ("Classic",)):
+            adapter, offers, base = self.run_site(48, {U1: f"BASE/mm2/product/peppermint/{U1}"}, cache)
+        mine = {o["id"]: o for o in offers}[U1]
+        self.assertEqual((mine["name"], mine["price"], mine["stock"], mine["rarity"], mine["price_from"]),
+                         ("Peppermint", 27, 5, "GODLY", True))
+        self.assertEqual(mine["url"], f"{base}/mm2/product/peppermint/{U1}")
+        # Следующий опрос (рынок ещё свежий) — из снимка, браузер не открывается.
+        adapter = markets.DreamPetsAdapter(adapter.config, cache)
+        adapter.wanted = {U1: f"{base}/mm2/product/peppermint/{U1}"}
+        with unittest.mock.patch.object(markets.cdp, "Browser", side_effect=AssertionError("браузер не нужен")):
+            again = {o["id"]: o for o in adapter.fetch()}
+        self.assertEqual(again[U1]["price"], 27)

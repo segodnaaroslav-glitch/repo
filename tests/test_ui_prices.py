@@ -71,11 +71,12 @@ class PriceUiTests(unittest.TestCase):
                 parser.make_item(name, category, {"value": value, "demand": "5", "rarity": "5"})
                 for name, cat, value in rows if cat == category], "site")
         store.save(data, path)
-        configs = [{"id": "starpets", "title": "StarPets", "kind": "fakesp", "url": "u", "fee": 0.2},
-                   {"id": "dreampets", "title": "DreamPets", "kind": "fakedp", "url": "u", "fee": 0.1}]
-        monitor = markets.MarketMonitor(path, configs, adapters={"fakesp": FakeStarPets, "fakedp": FakeDreamPets})
+        configs = [{"id": "starpets", "title": "StarPets", "kind": "starpets", "url": "u", "fee": 0.2},
+                   {"id": "dreampets", "title": "DreamPets", "kind": "dreampets", "url": "u", "fee": 0.1}]
+        monitor = markets.MarketMonitor(path, configs, adapters={"starpets": FakeStarPets, "dreampets": FakeDreamPets})
         for market in monitor.markets:
             monitor.poll(market)
+        cls.monitor = monitor
         cls.rate = FakeRate()
         cls.httpd = server.make_server(port=0, data_path=path, update=lambda log: None, monitor=monitor, rate=cls.rate)
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
@@ -233,3 +234,22 @@ class PriceUiTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+    def test_not_on_sale_row_offers_a_product_link(self):
+        # Нет на DreamPets — рядом кнопка «указать ссылку»: окно предмета, поле ссылки открыто.
+        self.calc("Flowerwood Gun")
+        self.js("switchTab('calc')")
+        cell = self.js("document.querySelector('#calcBody tr').children[4].textContent")
+        self.assertEqual(cell, "нет в продажеуказать ссылку")
+        self.assertNotIn("указать ссылку", self.js("document.querySelector('#calcBody tr').children[2].textContent"))
+        self.js("document.querySelector('#calcBody tr').children[4].querySelector('button').click()")
+        self.wait("!$('drawer').classList.contains('hidden')")
+        self.wait("document.activeElement && document.activeElement.classList.contains('link-url-input')")
+        self.assertTrue(self.js("document.querySelector('#drawerBody .tile.dreampets details.link-url').open"))
+        url = "https://dreampets.gg/mm2/product/flowerwood-gun/2c0af45a-9134-4c09-9b86-502e81ac758e"
+        self.addCleanup(self.monitor.link, "dreampets", "godlies:Flowerwood Gun", None)
+        self.js(f"document.activeElement.value = {json.dumps(url)}; "
+                "document.querySelector('#drawerBody .tile.dreampets details.link-url button').click()")
+        self.wait("document.querySelector('#toasts').textContent.includes('Запомнил')")
+        market = next(m for m in self.monitor.markets if m.config["id"] == "dreampets")
+        self.assertEqual(market.links["godlies:Flowerwood Gun"], "2c0af45a-9134-4c09-9b86-502e81ac758e")
+        self.assertEqual(market.urls["2c0af45a-9134-4c09-9b86-502e81ac758e"], url)
