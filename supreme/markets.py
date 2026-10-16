@@ -95,7 +95,8 @@ _NOISE_RE = re.compile(
 
 def market_key(name):
     """Ключ названия товара для поиска в списке Supreme Values."""
-    text = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", str(name))  # "(Godly Knife)", "[MM2]"
+    text = parser.chroma_name(name) or str(name)  # «Lightbringer (Chroma)» — это «Chroma Lightbringer»
+    text = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", text)  # "(Godly Knife)", "[MM2]"
     text = re.sub(r"^c\.\s*", "chroma ", text.strip(), flags=re.I)
     text = _NOISE_RE.sub(" ", text)
     return parser.name_key(text)
@@ -145,7 +146,7 @@ def expected_category(offer):
     """Категория Supreme Values, которой подходит товар площадки, или None (неизвестно)."""
     if str(offer.get("kind") or "").lower() == "pet":
         return "pets"
-    if re.match(r"(?:chroma\b|c\.\s)", str(offer.get("name") or "").strip(), re.I):
+    if parser.chroma_name(offer.get("name")) or re.match(r"c\.\s", str(offer.get("name") or "").strip(), re.I):
         return "chromas"
     return RARITY_CATEGORY.get(rarity(offer.get("rarity")))
 

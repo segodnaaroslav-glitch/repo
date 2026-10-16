@@ -128,6 +128,21 @@ def program_value(value_text, range_text):
     return parse_number(value_text)
 
 
+# Пометка хромы в любом месте названия: «Lightbringer Chroma», «Lightbringer (Chroma)»,
+# «Хрома Lightbringer». На Supreme Values хромы называются «Chroma X» («Chromatic» — не хрома).
+_CHROMA_MARK_RE = re.compile(r"[(\[]\s*(?:chroma|хрома)\s*[)\]]|(?<![A-Za-zА-Яа-яЁё])(?:chroma|хрома)(?![A-Za-zА-Яа-яЁё])",
+                             re.I)
+
+
+def chroma_name(name):
+    """Название с пометкой хромы -> «Chroma X»; без пометки — None. «C. X» понимает name_key."""
+    text = str(name or "")
+    if not _CHROMA_MARK_RE.search(text):
+        return None
+    rest = re.sub(r"\s+", " ", _CHROMA_MARK_RE.sub(" ", text)).strip(" -–—:,·|")
+    return f"Chroma {rest}" if rest else None
+
+
 def name_key(name):
     """Ключ для сравнения названий: без регистра, "C. X" == "Chroma X"."""
     text = re.sub(r"\s+", " ", str(name)).strip().lower()

@@ -82,6 +82,17 @@ def build_matcher(items):
         keys.setdefault(parser.name_key(item["name"]), item)
 
     def find(name, line=None):
+        chroma = parser.chroma_name(name)
+        if chroma is None:
+            return plain(name, line)
+        # «Lightbringer Chroma», «Lightbringer (Chroma)» — это «Chroma Lightbringer». Хрома —
+        # только хрома: у обычного предмета с тем же названием другая цена.
+        item, score, whole = plain(chroma, parser.chroma_name(line) if line is not None else None)
+        if item is None or not parser.name_key(item["name"]).startswith("chroma"):
+            return None, 0.0, False
+        return item, score, whole
+
+    def plain(name, line=None):
         # Строка целиком — точное название ("Candy 2" — предмет, а не Candy × 2).
         if line is not None and parser.name_key(line) in keys:
             return keys[parser.name_key(line)], 1.0, True
@@ -133,6 +144,7 @@ def match_text(text, items):
     return list(found.values()), unmatched
 
 
+_CHROMA_WORD_RE = re.compile(r"^[(\[]?(?:chroma|хрома)[)\]]?$", re.I)
 _QTY_TOKEN_RE = re.compile(rf"^(?:{_X}\s*(\d{{1,4}})|(\d{{1,4}})\s*{_X}?|[(\[]\s*{_X}?\s*(\d{{1,4}})\s*[)\]])$", re.I)
 MAX_NAME_WORDS = 5
 
@@ -176,6 +188,14 @@ def _scan_line(line, find):
         if item is None:
             leftover.append(words[index])
             index += 1
+            continue
+        mark_after = index + size < len(words) and _CHROMA_WORD_RE.match(words[index + size])
+        mark_before = bool(leftover) and _CHROMA_WORD_RE.match(leftover[-1])
+        if (mark_after or mark_before) and not parser.name_key(item["name"]).startswith("chroma"):
+            # «Seer Chroma», а такой хромы в списке нет: это не обычный Seer — не узнано.
+            taken = size + (1 if mark_after else 0)
+            leftover.extend(words[index:index + taken])
+            index += taken
             continue
         if leftover:
             rest.append(" ".join(leftover))

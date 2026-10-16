@@ -295,3 +295,40 @@ class WindowsInventoryOcrTests(unittest.TestCase):
         matched = {name for name, qty in expected.items() if got.get(name) == qty}
         self.assertGreaterEqual(len(matched), 5, f"распознано {got}")
         self.assertEqual({got.get("Harvester"), got.get("Corrupt")}, {3, 2}, f"значки x3/x2: {got}")
+
+
+class ChromaNameTests(unittest.TestCase):
+    """«Lightbringer Chroma», «Lightbringer (Chroma)» — это хрома, а не обычный Lightbringer."""
+
+    def stock(self):
+        def item(name, category):
+            return parser.make_item(name, category, {"value": "1", "demand": "1", "rarity": "1"})
+        return [item("Lightbringer", "godlies"), item("Chroma Lightbringer", "chromas"), item("Seer", "godlies"),
+                item("Chromatic", "misc"), item("Harvester", "ancients")]
+
+    def found(self, text):
+        found, unmatched = calc.match_text(text, self.stock())
+        return [(markets.item_id(f["item"]), f["qty"]) for f in found], unmatched
+
+    def test_chroma_mark_anywhere(self):
+        for text, qty in (("Lightbringer Chroma ×1", 1), ("Lightbringer (Chroma) x2", 2), ("Хрома Lightbringer", 1),
+                          ("C. Lightbringer", 1), ("Chroma Lightbringer", 1), ("Lightbringer [chroma] 3", 3),
+                          ("chroma lightbringr", 1)):
+            self.assertEqual(self.found(text), ([("chromas:Chroma Lightbringer", qty)], []), text)
+        self.assertEqual(self.found("Lightbringer"), ([("godlies:Lightbringer", 1)], []))
+        self.assertEqual(self.found("Chromatic"), ([("misc:Chromatic", 1)], []))  # не пометка хромы
+
+    def test_missing_chroma_is_not_the_regular_item(self):
+        for text in ("Seer Chroma", "Chroma Seer x2", "Seer (Chroma)"):
+            found, unmatched = self.found(text)
+            self.assertEqual(found, [], text)
+            self.assertEqual(len(unmatched), 1, text)
+        found, unmatched = self.found("Harvester x2 Seer Chroma Lightbringer Chroma")
+        self.assertEqual(found, [("ancients:Harvester", 2), ("chromas:Chroma Lightbringer", 1)])
+        self.assertEqual(unmatched, ["Seer Chroma"])
+
+    def test_market_titles_with_chroma_in_brackets(self):
+        self.assertEqual(markets.market_key("Lightbringer (Chroma)"), "chromalightbringer")
+        self.assertEqual(markets.market_key("Lightbringer (Godly Knife)"), "lightbringer")
+        self.assertEqual(markets.expected_category({"name": "Lightbringer Chroma"}), "chromas")
+        self.assertIsNone(markets.expected_category({"name": "Chromatic"}))
