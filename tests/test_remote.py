@@ -160,6 +160,12 @@ class RemoteServerTests(_ServerMixin, unittest.TestCase):
                                        other=True, cookie=cookie)
         self.assertEqual(status, 403)
         self.assertIn("evil.example", json.loads(data)["error"])
+        # Прокси хостинга подменил Host: страница программы помечает свои запросы заголовком.
+        proxied = {"Origin": f"http://93.152.223.253:8765", "Host": "h644lrrktfb.example.ru", "X-MM2-Request": "1"}
+        self.assertEqual(self.request("POST", "/api/update", {}, headers=proxied, other=True, cookie=cookie)[0], 202)
+        without = dict(proxied)
+        without.pop("X-MM2-Request")
+        self.assertEqual(self.request("POST", "/api/update", {}, headers=without, other=True, cookie=cookie)[0], 403)
         # Без cookie — ни с каким Origin.
         self.assertEqual(self.request("POST", "/api/calc", {"text": "x"}, headers=hidden, other=True)[0], 401)
 

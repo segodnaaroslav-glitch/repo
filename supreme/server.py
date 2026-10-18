@@ -198,11 +198,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if origin.lower().startswith("http://") and self._local_address(origin[len("http://"):].rstrip("/")):
             return True
-        # Страница программы, открытая с другого компьютера: тот же адрес, что и у запроса. Браузер
-        # с запретом на передачу адреса страницы пишет Origin: null — чужой сайт и так не пройдёт:
-        # cookie входа (SameSite=Strict) на запросы с других сайтов браузер не отдаёт.
+        # Страница программы, открытая с другого компьютера. Сравнить адреса нельзя: прокси хостинга
+        # подменяет Host (страница — 93.152.223.253:8765, Host — внутреннее имя сервера). Поэтому
+        # страница программы помечает свои запросы заголовком X-MM2-Request: чужой сайт отправить
+        # его без разрешения программы не может (браузер сначала спросит, а программа не разрешит),
+        # да и cookie входа (SameSite=Strict) на запросы с других сайтов браузер не отдаёт.
         if not self._session_ok():
             return False
+        if self.headers.get("X-MM2-Request") == "1":
+            return True
         return origin.strip().lower() == "null" or self._same_host(origin)
 
     def _same_host(self, origin):

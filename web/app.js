@@ -61,7 +61,10 @@ function storageSet(key, value) {
 }
 
 async function api(path, options) {
-  const response = await fetch(path, options);
+  // Пометка «запрос со страницы программы»: нужна, когда программа открыта с другого компьютера
+  // (прокси хостинга подменяет адрес, и сравнить его с адресом страницы нельзя).
+  const headers = { "X-MM2-Request": "1", ...((options && options.headers) || {}) };
+  const response = await fetch(path, { ...(options || {}), headers });
   let body = null;
   try { body = await response.json(); } catch (e) { /* пустой ответ */ }
   if (response.status === 401 && path !== "/api/login") {
