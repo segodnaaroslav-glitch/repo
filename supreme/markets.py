@@ -144,10 +144,10 @@ def rarity(value):
 
 def expected_category(offer):
     """Категория Supreme Values, которой подходит товар площадки, или None (неизвестно)."""
+    if parser.chroma_name(offer.get("name")) or re.match(r"c\.\s", str(offer.get("name") or "").strip(), re.I):
+        return "chromas"  # хромы — и оружие, и питомцы (Chroma Fire Cat) — на сайте в Chromas
     if str(offer.get("kind") or "").lower() == "pet":
         return "pets"
-    if parser.chroma_name(offer.get("name")) or re.match(r"c\.\s", str(offer.get("name") or "").strip(), re.I):
-        return "chromas"
     return RARITY_CATEGORY.get(rarity(offer.get("rarity")))
 
 
@@ -242,6 +242,20 @@ def offer_fit(item, offer):
     нож/пистолет/питомец, внутреннее имя картинки, есть ли цена, популярность и лоты."""
     score = 0.0
     category, own = expected_category(offer), item.get("category")
+    offer_kind = str(offer.get("kind") or "").lower() or None
+    if own == "pets" or (own == "chromas" and offer_kind == "pet"):
+        # Питомец. Редкость у площадок своя (Common…Godly, у DreamPets — значок на карточке):
+        # сверяется с классом питомца на сайте, а не с категориями оружия. Нож или пистолет —
+        # точно не питомец; хрома и не хрома — разные товары.
+        if offer_kind in ("gun", "knife") or (category == "chromas") != (own == "chromas"):
+            return None
+        wanted, got = rarity(item.get("pet_class")), rarity(offer.get("rarity"))
+        score += (0 if wanted == got else 30) if wanted and got else 5
+        if offer_kind != "pet":
+            score += 3  # тип товара неизвестен (карточка DreamPets)
+        category = own
+    elif offer_kind == "pet":
+        return None  # питомец — не оружие
     if category and category != own:
         if category in _LADDER and own in _LADDER and abs(_LADDER.index(category) - _LADDER.index(own)) == 1:
             score += 60

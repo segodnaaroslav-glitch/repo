@@ -1805,3 +1805,57 @@ setTimeout(() => { document.getElementById('m').innerHTML =
         with unittest.mock.patch.object(markets.cdp, "Browser", side_effect=AssertionError("браузер не нужен")):
             again = {o["id"]: o for o in adapter.fetch()}
         self.assertEqual(again[U1]["price"], 27)
+
+
+class PetMatchingTests(unittest.TestCase):
+    """Питомцы: редкость площадки сверяется с классом питомца на сайте, а не с категориями оружия."""
+
+    def item(self, name, category, pet_class="", origin=""):
+        return parser.make_item(name, category, {"value": "1", "demand": "1", "rarity": "1", "class": pet_class,
+                                                 "origin": origin})
+
+    def run_groups(self, items, offers):
+        index = markets.build_index(items)
+        groups = {}
+        for offer in offers:
+            candidates = markets.candidate_items(index, offer)
+            groups.setdefault(tuple(markets.item_id(c) for c in candidates), (candidates, []))[1].append(offer)
+        got, _ = markets.assign_offers(groups.values())
+        return {key: offer["id"] for key, offer in got.items()}
+
+    def items(self):
+        return [self.item("Elitey", "pets", "Legendary"), self.item("Bat", "pets", "Legendary"),
+                self.item("Bat", "godlies"), self.item("Fire Cat", "pets", "Godly"),
+                self.item("Chroma Fire Cat", "chromas"), self.item("Pumpkin", "pets", "Common", "Halloween 2019")]
+
+    def test_starpets_pets(self):
+        offers = [
+            {"id": 1, "name": "Elitey", "kind": "pet", "rarity": "legendary", "price": 0.05, "product": True},
+            {"id": 68, "name": "Bat", "kind": "pet", "rarity": "legendary", "price": 0.08, "product": True},
+            {"id": 300, "name": "Bat", "kind": "knife", "rarity": "godly", "price": 4.0, "product": True},
+            {"id": 20, "name": "Fire Cat", "kind": "pet", "rarity": "godly", "price": 0.06, "product": True},
+            {"id": 2, "name": "Chroma Fire Cat", "kind": "pet", "rarity": "godly", "price": 0.2, "product": True},
+            {"id": 33, "name": "Pumpkin", "kind": "pet", "rarity": "common", "year": 2019, "price": 0.08, "product": True},
+            {"id": 28, "name": "Pumpkin", "kind": "pet", "rarity": "common", "year": 2021, "price": 0.04, "product": True},
+        ]
+        self.assertEqual(self.run_groups(self.items(), offers), {
+            "pets:Elitey": 1, "pets:Bat": 68, "godlies:Bat": 300, "pets:Fire Cat": 20,
+            "chromas:Chroma Fire Cat": 2, "pets:Pumpkin": 33})
+
+    def test_dreampets_cards_without_kind(self):
+        offers = [
+            {"id": "e", "name": "Elitey", "rarity": "LEGENDARY", "price": 4.0, "product": True},
+            {"id": "bk", "name": "Bat", "rarity": "GODLY", "price": 330.0, "product": True},
+            {"id": "bp", "name": "Bat", "rarity": "LEGENDARY", "price": 6.0, "product": True},
+            {"id": "fc", "name": "Fire Cat", "rarity": "GODLY", "price": 5.0, "product": True},
+            {"id": "cfc", "name": "Chroma Fire Cat", "rarity": "GODLY", "price": 17.0, "product": True},
+            {"id": "pu", "name": "Pumpkin", "rarity": "HALLOWEEN", "price": 2.0, "product": True},
+        ]
+        self.assertEqual(self.run_groups(self.items(), offers), {
+            "pets:Elitey": "e", "godlies:Bat": "bk", "pets:Bat": "bp", "pets:Fire Cat": "fc",
+            "chromas:Chroma Fire Cat": "cfc", "pets:Pumpkin": "pu"})
+
+    def test_weapon_is_never_a_pet(self):
+        items = [self.item("Bat", "pets", "Legendary")]
+        offers = [{"id": 300, "name": "Bat", "kind": "knife", "rarity": "godly", "price": 4.0, "product": True}]
+        self.assertEqual(self.run_groups(items, offers), {})
