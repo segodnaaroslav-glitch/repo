@@ -15,7 +15,7 @@ import threading
 import urllib.request
 import webbrowser
 
-from supreme import markets, parser, paths, rates, server, store
+from supreme import markets, parser, paths, rates, remote, server, store
 
 
 def running_instance(port, tries=20):
@@ -46,8 +46,13 @@ def cmd_run(args):
     store.use_data_dir(paths.migrate_old_data())
     monitor = None if args.no_markets else markets.MarketMonitor()
     rate = rates.RateWatcher()
+    # Доступ с другого компьютера (включается в программе, вкладка «Импорт цен»): слушать сеть,
+    # но пускать с других компьютеров только по паролю.
+    remote_on = remote.load(store.DATA_DIR)["enabled"]
     httpd = server.make_server(
-        port=args.port, auto_sync=not (args.no_update or args.no_auto), monitor=monitor, rate=rate
+        host="0.0.0.0" if remote_on else "127.0.0.1",
+        port=args.port, auto_sync=not (args.no_update or args.no_auto), monitor=monitor, rate=rate,
+        remote_on=remote_on,
     )
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     if not args.no_update and not store.DATA_FILE.exists():
@@ -59,6 +64,9 @@ def cmd_run(args):
     if not args.no_markets:
         rate.start()  # курс доллара с Rapira
     print(f"Программа открыта: {url}")
+    if remote_on:
+        links = remote.links(httpd.server_address[1])
+        print("Доступ с другого компьютера по паролю: " + (", ".join(links) or f"http://<адрес этого компьютера>:{httpd.server_address[1]}/"))
     print(f"Цены хранятся в: {store.DATA_FILE}")
     print("Чтобы закрыть программу, закройте это окно или нажмите Ctrl+C.")
     if not args.no_browser:

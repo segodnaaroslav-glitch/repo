@@ -1,16 +1,18 @@
-"""Локальный веб-сервер программы: http://127.0.0.1:<порт>/"""
+"""Веб-сервер программы: http://127.0.0.1:<порт>/ (и с другого компьютера — по паролю, если
+доступ включён: см. remote.py)."""
 
 import json
 import os
 import threading
 import urllib.parse
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import base64
 import binascii
 
-from . import autosync, calc, dpreport, imgproxy, liquidity, markets, ocr, parser, paths, store, tileocr
+from . import autosync, calc, dpreport, imgproxy, liquidity, markets, ocr, parser, paths, remote, store, tileocr
 
 WEB_DIR = paths.resource_dir() / "web"
 STATIC_FILES = {
@@ -142,6 +144,9 @@ class Handler(BaseHTTPRequestHandler):
     images = None  # imgproxy.ImageCache — картинки предметов для сравнения по картинке
     features = None  # imgproxy.FeatureStore — их признаки (data/picfeat.json)
     pic_sources = None  # {"stamp", "sources", "keys", "lock"} — адреса картинок известных предметов
+    remote_on = False  # программа слушает сеть: с других компьютеров — по паролю
+    data_dir = None  # папка с ценами (там и настройка доступа с другого компьютера)
+    login_guard = None  # remote.LoginGuard — защита от подбора пароля
 
     def log_message(self, format, *args):
         pass  # не засорять консоль строками каждого запроса
@@ -160,14 +165,84 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return host in ("127.0.0.1", "localhost")
 
+    def _loopback(self):
+        """Запрос с этого же компьютера (а не по сети)."""
+        address = str(self.client_address[0] if self.client_address else "")
+        return address.startswith("127.") or address in ("::1", "::ffff:127.0.0.1")
+
+    def _remote_settings(self):
+        return remote.load(self.data_dir or store.DATA_DIR)
+
+    def _session_ok(self):
+        """Вход с другого компьютера: доступ включён в этом запуске и браузер вошёл по паролю."""
+        if not self.remote_on:
+            return False
+        try:
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        if remote.COOKIE not in cookie:
+            return False
+        return remote.check_session(self._remote_settings(), cookie[remote.COOKIE].value)
+
     def _host_ok(self):
-        return self._local_address(self.headers.get("Host", ""))
+        # С этого компьютера — по адресу 127.0.0.1 / localhost (чужой сайт, подменивший адрес
+        # своего домена на 127.0.0.1, не пройдёт). С другого компьютера — только после входа.
+        if self._loopback() and self._local_address(self.headers.get("Host", "")):
+            return True
+        return self._session_ok()
 
     def _origin_ok(self):
         origin = self.headers.get("Origin")
         if origin is None:
             return True
-        return origin.lower().startswith("http://") and self._local_address(origin[len("http://"):].rstrip("/"))
+        if origin.lower().startswith("http://") and self._local_address(origin[len("http://"):].rstrip("/")):
+            return True
+        # Страница программы, открытая с другого компьютера: тот же адрес, что и у запроса.
+        return self._session_ok() and origin.lower().rstrip("/") == "http://" + self.headers.get("Host", "").lower()
+
+    def _denied(self, path):
+        """Нет доступа: с другого компьютера при включённом доступе — страница входа по паролю."""
+        if self.remote_on and not self._loopback():
+            if path in ("/", "/index.html"):
+                return self._send(200, remote.LOGIN_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            return self._error(401, "Нужно войти по паролю")
+        return self._error(403, "Неверный адрес")
+
+    def _login(self, body):
+        """Вход с другого компьютера по паролю (с паузами после неудачных попыток)."""
+        if not self.remote_on or self._loopback():
+            return self._error(404, "Не найдено")
+        origin = self.headers.get("Origin")
+        if origin is not None and origin.lower().rstrip("/") != "http://" + self.headers.get("Host", "").lower():
+            return self._error(403, "Запрос с чужого сайта запрещён")
+        address = str(self.client_address[0])
+        wait = self.login_guard.wait(address)
+        if wait:
+            return self._error(429, f"Слишком много неверных попыток — подождите {wait} с")
+        settings = self._remote_settings()
+        if not settings["enabled"] or not remote.check_password(settings, body.get("password")):
+            self.login_guard.failed(address)
+            return self._error(401, "Неверный пароль")
+        self.login_guard.passed(address)
+        self.send_response(200)
+        body_bytes = json.dumps({"ok": True}).encode("utf-8")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Set-Cookie", f"{remote.COOKIE}={remote.make_session(settings)}; Path=/; HttpOnly; "
+                                       f"SameSite=Strict; Max-Age={remote.SESSION_DAYS * 86400}")
+        self.end_headers()
+        self.wfile.write(body_bytes)
+        return None
+
+    def _remote_state(self):
+        settings = self._remote_settings()
+        port = self.server.server_address[1]
+        local = self._loopback()
+        return {"enabled": settings["enabled"], "active": bool(self.remote_on), "local": local,
+                "password": remote.has_password(settings), "port": port,
+                "links": remote.links(port) if local else []}
 
     # --- ответы ----------------------------------------------------------
 
@@ -509,9 +584,11 @@ class Handler(BaseHTTPRequestHandler):
     # --- маршруты --------------------------------------------------------
 
     def do_GET(self):
-        if not self._host_ok():
-            return self._error(403, "Неверный адрес")
         path = self.path.split("?", 1)[0]
+        if not self._host_ok():
+            return self._denied(path)
+        if path == "/api/remote":
+            return self._json(200, self._remote_state())
         if path in STATIC_FILES:
             name, content_type = STATIC_FILES[path]
             return self._send(200, (WEB_DIR / name).read_bytes(), content_type)
@@ -538,7 +615,12 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "Не найдено")
 
     def do_POST(self):
-        if not (self._host_ok() and self._origin_ok()):
+        path = self.path.split("?", 1)[0]
+        if path == "/api/login" and self.remote_on and not self._loopback():
+            pass  # вход по паролю — до проверки входа
+        elif not self._host_ok():
+            return self._denied(path)
+        elif not self._origin_ok():
             return self._error(403, "Запрос с чужого сайта запрещён")
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             return self._error(415, "Нужен JSON")
@@ -577,6 +659,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(409, "Площадки выключены")
             self.monitor.poll_now()
             return self._json(202, self._status())
+        if path == "/api/login":
+            return self._login(body)
+        if path == "/api/logout":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "2")
+            self.send_header("Set-Cookie", f"{remote.COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            self.end_headers()
+            self.wfile.write(b"{}")
+            return None
+        if path == "/api/remote":
+            if not self._loopback():
+                return self._error(403, "Доступ с другого компьютера настраивается там, где запущена программа")
+            password, enabled = body.get("password"), body.get("enabled")
+            if (password is not None and not isinstance(password, str)) or (enabled is not None and not isinstance(enabled, bool)):
+                return self._error(400, "Нужны поля password и/или enabled")
+            folder = self.data_dir or store.DATA_DIR
+            try:
+                if password is not None:
+                    remote.set_password(folder, password)
+                if enabled is not None:
+                    remote.set_enabled(folder, enabled)
+            except ValueError as error:
+                return self._error(400, str(error))
+            except OSError as error:
+                return self._error(500, f"Не удалось сохранить настройку: {error}")
+            return self._json(200, self._remote_state())
         if path == "/api/markets/link":
             if self.monitor is None:
                 return self._error(409, "Площадки выключены")
@@ -623,11 +732,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=20, auto_sync=False,
-                check_site=None, monitor=None, rate=None):
+                check_site=None, monitor=None, rate=None, remote_on=False):
     """Создать сервер; если порт занят — взять следующий свободный.
 
     auto_sync=True — следить за сайтом и обновлять цены автоматически
-    (поток запускается методом server.sync.start()).
+    (поток запускается методом server.sync.start()). remote_on=True — пускать другие
+    компьютеры по паролю (тогда host — "0.0.0.0", программа слушает сеть).
     """
     job = UpdateJob(update or (lambda log: store.update_from_site(log=log, path=data_path)))
     sync = None
@@ -638,7 +748,8 @@ def make_server(host="127.0.0.1", port=8765, data_path=None, update=None, tries=
         "BoundHandler", (Handler,),
         {"job": job, "sync": sync, "monitor": monitor, "rate": rate, "data_path": data_path,
          "images": imgproxy.ImageCache(data_dir / "images"), "features": imgproxy.FeatureStore(data_dir / "picfeat.json"),
-         "pic_sources": {"stamp": None, "sources": {}, "keys": set(), "lock": threading.Lock()}},
+         "pic_sources": {"stamp": None, "sources": {}, "keys": set(), "lock": threading.Lock()},
+         "remote_on": bool(remote_on), "data_dir": data_dir, "login_guard": remote.LoginGuard()},
     )
     server_class = _ExclusiveServer if os.name == "nt" else ThreadingHTTPServer
     last_error = None

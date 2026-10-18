@@ -304,6 +304,15 @@ table.mini td, table.mini th { padding: 5px 6px; font-size: 12px; position: stat
 
 #importForm { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 #importForm textarea { width: 100%; resize: vertical; }
+#remoteTitle { margin-top: 32px; }
+#remoteBox { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+#remoteBox p { margin: 0; }
+.remote-status { font-weight: 600; }
+.remote-links { display: flex; flex-direction: column; gap: 6px; }
+.remote-link { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.remote-link code { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; user-select: all; }
+.remote-form { display: flex; gap: 8px; flex-wrap: wrap; }
+.remote-form input { min-width: 260px; }
 
 .toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: grid; gap: 8px; z-index: 30; width: min(520px, calc(100vw - 32px)); }
 .toast {

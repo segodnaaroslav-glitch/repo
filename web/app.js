@@ -64,6 +64,9 @@ async function api(path, options) {
   const response = await fetch(path, options);
   let body = null;
   try { body = await response.json(); } catch (e) { /* пустой ответ */ }
+  if (response.status === 401 && path !== "/api/login") {
+    location.reload();  // вход с другого компьютера истёк — страница входа по паролю
+  }
   if (!response.ok) {
     throw new Error((body && body.error) || `Ошибка ${response.status}`);
   }
@@ -1724,6 +1727,95 @@ function renderImportSelect() {
   if (current) select.value = current;
 }
 
+// --- доступ с другого компьютера ----------------------------------------------
+
+async function renderRemote() {
+  const box = $("remoteBox");
+  let info;
+  try {
+    info = await api("/api/remote");
+  } catch (error) {
+    box.replaceChildren(el("p", "muted", `Не удалось узнать настройку: ${error.message}`));
+    return;
+  }
+  box.replaceChildren();
+  if (!info.local) {
+    box.append(el("p", "", "Программа открыта с другого компьютера по паролю."));
+    const out = el("button", "ghost", "Выйти");
+    out.type = "button";
+    out.addEventListener("click", async () => {
+      await postJson("/api/logout", {});
+      location.reload();
+    });
+    box.append(out);
+    return;
+  }
+  box.append(el("p", "", "Программа работает на этом компьютере (например, на дедике), а открыть её можно " +
+    "в браузере другого компьютера — по ссылке, после ввода пароля. На этом компьютере пароль не нужен."));
+  let status = "Выключен.";
+  if (info.enabled && info.active) status = "Включён: с другого компьютера откройте ссылку ниже и введите пароль.";
+  else if (info.enabled) status = "Включится после перезапуска программы: закройте её окно и откройте программу снова.";
+  else if (info.active) status = "Выключится после перезапуска программы.";
+  box.append(el("p", "remote-status", status));
+  if (info.enabled && info.links.length) {
+    const list = el("div", "remote-links");
+    for (const link of info.links) {
+      const row = el("div", "remote-link");
+      row.append(el("code", "", link));
+      const copy = el("button", "ghost small", "Копировать");
+      copy.type = "button";
+      copy.addEventListener("click", () => {
+        navigator.clipboard.writeText(link).then(() => toast("Ссылка скопирована"), () => toast(link));
+      });
+      row.append(copy);
+      list.append(row);
+    }
+    box.append(list);
+  }
+  const form = el("form", "remote-form");
+  const password = el("input");
+  password.type = "password";
+  password.autocomplete = "new-password";
+  password.placeholder = info.password ? "Новый пароль (если хотите сменить)" : "Пароль, не короче 6 символов";
+  password.setAttribute("aria-label", "Пароль для входа с другого компьютера");
+  const save = el("button", info.enabled ? "ghost" : "primary",
+    info.enabled ? "Сменить пароль" : (info.password ? "Включить" : "Задать пароль и включить"));
+  save.type = "submit";
+  form.append(password, save);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = {};
+    if (password.value) payload.password = password.value;
+    if (!info.enabled) payload.enabled = true;
+    if (!payload.password && !payload.enabled) return;
+    try {
+      await postJson("/api/remote", payload);
+      toast(payload.enabled ? "Доступ включён — перезапустите программу" : "Пароль сменён: другие компьютеры входят заново");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+    renderRemote();
+  });
+  box.append(form);
+  if (info.enabled) {
+    const off = el("button", "ghost", "Выключить доступ");
+    off.type = "button";
+    off.addEventListener("click", async () => {
+      try {
+        await postJson("/api/remote", { enabled: false });
+        toast("Доступ выключен — перезапустите программу");
+      } catch (error) {
+        toast(error.message, "error");
+      }
+      renderRemote();
+    });
+    box.append(off);
+  }
+  box.append(el("p", "muted small", "Windows спросит, разрешить ли программе доступ к сети, — нажмите «Разрешить». " +
+    "Если у сервера есть свой брандмауэр в панели хостинга, откройте там порт " + info.port + " (TCP). " +
+    "Соединение идёт без шифрования (http): задайте отдельный пароль, который нигде больше не используете."));
+}
+
 async function submitImport(event) {
   event.preventDefault();
   const result = $("importResult");
@@ -2032,6 +2124,7 @@ function init() {
   $("marketsBtn").addEventListener("click", pollMarkets);
   $("dpCheckBtn").addEventListener("click", checkDreamPets);
   $("importForm").addEventListener("submit", submitImport);
+  renderRemote();
   $("drawerClose").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && state.selected) closeDrawer();

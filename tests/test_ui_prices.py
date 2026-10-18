@@ -231,8 +231,6 @@ class PriceUiTests(unittest.TestCase):
         self.assertEqual(self.js(fang), "StarPets≈$1.20 · 120,00 ₽")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
     def test_not_on_sale_row_offers_a_product_link(self):
         # Нет на DreamPets — рядом кнопка «указать ссылку»: окно предмета, поле ссылки открыто.
@@ -253,3 +251,17 @@ if __name__ == "__main__":
         market = next(m for m in self.monitor.markets if m.config["id"] == "dreampets")
         self.assertEqual(market.links["godlies:Flowerwood Gun"], "2c0af45a-9134-4c09-9b86-502e81ac758e")
         self.assertEqual(market.urls["2c0af45a-9134-4c09-9b86-502e81ac758e"], url)
+
+    def test_remote_access_section(self):
+        # Доступ с другого компьютера: выключен; пароль и включение — до перезапуска программы.
+        self.js("switchTab('import')")
+        self.wait("$('remoteBox').textContent.includes('Выключен')")
+        self.js("const form = document.querySelector('#remoteBox form'); form.querySelector('input').value = 'secret-pass';"
+                "form.requestSubmit()")
+        self.wait("$('remoteBox').textContent.includes('Включится после перезапуска')")
+        self.assertIn("Выключить доступ", self.js("$('remoteBox').textContent"))
+        self.js("[...document.querySelectorAll('#remoteBox button')].find((b) => b.textContent === 'Выключить доступ').click()")
+        self.wait("$('remoteBox').textContent.includes('Выключен')")
+
+if __name__ == "__main__":
+    unittest.main()
