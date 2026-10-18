@@ -198,8 +198,22 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if origin.lower().startswith("http://") and self._local_address(origin[len("http://"):].rstrip("/")):
             return True
-        # Страница программы, открытая с другого компьютера: тот же адрес, что и у запроса.
-        return self._session_ok() and origin.lower().rstrip("/") == "http://" + self.headers.get("Host", "").lower()
+        # Страница программы, открытая с другого компьютера: тот же адрес, что и у запроса. Браузер
+        # с запретом на передачу адреса страницы пишет Origin: null — чужой сайт и так не пройдёт:
+        # cookie входа (SameSite=Strict) на запросы с других сайтов браузер не отдаёт.
+        if not self._session_ok():
+            return False
+        return origin.strip().lower() == "null" or self._same_host(origin)
+
+    def _same_host(self, origin):
+        """Origin указывает на тот же адрес, по которому открыта программа (без учёта схемы и «/»)."""
+        site = origin.strip().lower().rstrip("/").split("://", 1)[-1]
+        return bool(site) and site == self.headers.get("Host", "").strip().lower()
+
+    def _foreign(self):
+        """Ответ «чужой сайт» — с тем, что пришло: по нему видно, если адрес подменяет прокси."""
+        return self._error(403, f"Запрос с чужого сайта запрещён (Origin: {self.headers.get('Origin')}, "
+                                f"Host: {self.headers.get('Host')})")
 
     def _denied(self, path):
         """Нет доступа: с другого компьютера при включённом доступе — страница входа по паролю."""
@@ -213,9 +227,8 @@ class Handler(BaseHTTPRequestHandler):
         """Вход с другого компьютера по паролю (с паузами после неудачных попыток)."""
         if not self.remote_on or self._loopback():
             return self._error(404, "Не найдено")
-        origin = self.headers.get("Origin")
-        if origin is not None and origin.lower().rstrip("/") != "http://" + self.headers.get("Host", "").lower():
-            return self._error(403, "Запрос с чужого сайта запрещён")
+        # Origin здесь не проверяется: войти можно только паролем, подбор ограничен, а вход «за
+        # пользователя» с чужого сайта ничего не даёт (cookie входа чужим сайтам не отдаётся).
         address = str(self.client_address[0])
         wait = self.login_guard.wait(address)
         if wait:
@@ -621,7 +634,7 @@ class Handler(BaseHTTPRequestHandler):
         elif not self._host_ok():
             return self._denied(path)
         elif not self._origin_ok():
-            return self._error(403, "Запрос с чужого сайта запрещён")
+            return self._foreign()
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             return self._error(415, "Нужен JSON")
         try:

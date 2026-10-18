@@ -60,7 +60,7 @@ class RemoteSettingsTests(unittest.TestCase):
             self.assertNotIn("127.0.0.1", link)
 
 
-class RemoteServerTests(unittest.TestCase):
+class _ServerMixin:
     def start(self, remote_on):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -96,6 +96,8 @@ class RemoteServerTests(unittest.TestCase):
         cookie = headers.get("Set-Cookie", "").split(";", 1)[0] if status == 200 else None
         return status, cookie, data
 
+
+class RemoteServerTests(_ServerMixin, unittest.TestCase):
     def test_off_by_default_other_computers_are_refused(self):
         self.start(remote_on=False)
         self.assertEqual(self.request("GET", "/", other=True)[0], 403)
@@ -141,6 +143,26 @@ class RemoteServerTests(unittest.TestCase):
         status, headers, _ = self.request("POST", "/api/logout", {}, other=True, cookie=self.login("new-secret")[1])
         self.assertIn("Max-Age=0", headers.get("Set-Cookie", ""))
 
+    def test_browser_that_hides_the_page_address(self):
+        # Браузер с запретом передачи адреса страницы: Origin: null при входе и в запросах программы.
+        self.start(remote_on=True)
+        self.request("POST", "/api/remote", {"password": "secret-pass", "enabled": True})
+        hidden = {"Origin": "null"}
+        status, headers, _ = self.request("POST", "/api/login", {"password": "secret-pass"}, headers=hidden, other=True)
+        self.assertEqual(status, 200)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        self.assertEqual(self.request("POST", "/api/calc", {"text": "x"}, headers=hidden, other=True, cookie=cookie)[0], 200)
+        # Вход со страницы, открытой по другому адресу этого же сервера (имя вместо IP), — тоже.
+        named = {"Origin": "http://my-server.example:8765", "Host": "my-server.example:8765"}
+        self.assertEqual(self.request("POST", "/api/login", {"password": "secret-pass"}, headers=named, other=True)[0], 200)
+        # Чужой сайт с cookie (старый браузер без SameSite) — нет, и видно, что пришло.
+        status, _, data = self.request("POST", "/api/calc", {"text": "x"}, headers={"Origin": "http://evil.example"},
+                                       other=True, cookie=cookie)
+        self.assertEqual(status, 403)
+        self.assertIn("evil.example", json.loads(data)["error"])
+        # Без cookie — ни с каким Origin.
+        self.assertEqual(self.request("POST", "/api/calc", {"text": "x"}, headers=hidden, other=True)[0], 401)
+
     def test_guessing_the_password_is_paused(self):
         self.start(remote_on=True)
         self.request("POST", "/api/remote", {"password": "secret-pass", "enabled": True})
@@ -159,3 +181,47 @@ class RemoteServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _test_browser():
+    import os
+    from supreme import fetcher
+    path = os.environ.get("MM2_TEST_BROWSER") or fetcher.find_system_browser()
+    if not path and os.path.exists("/opt/pw-browsers/chromium"):
+        path = "/opt/pw-browsers/chromium"
+    return path
+
+
+@unittest.skipUnless(_test_browser(), "нет Edge/Chrome для проверки страницы входа")
+class RemoteLoginBrowserTests(_ServerMixin, unittest.TestCase):
+    """Вход в настоящем браузере: страница пароля, затем сама программа и её запросы."""
+
+    def test_login_page_in_a_browser(self):
+        import time
+        from supreme import cdp
+        self.start(remote_on=True)
+        self.request("POST", "/api/remote", {"password": "secret-pass", "enabled": True})
+        self.from_other = True
+        browser = cdp.Browser(_test_browser())
+        self.addCleanup(browser.close)
+
+        def wait(expression, timeout=20):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    if browser.evaluate(f"Boolean({expression})"):
+                        return
+                except cdp.BrowserError:
+                    pass
+                time.sleep(0.1)
+            self.fail(f"не дождались: {expression}")
+
+        browser.open(f"http://127.0.0.1:{self.port}/", settle=0.3)
+        wait("document.getElementById('p')")
+        browser.evaluate("document.getElementById('p').value = 'wrong-pass'; document.getElementById('f').requestSubmit()")
+        wait("document.getElementById('msg').textContent.includes('Неверный пароль')")
+        browser.evaluate("document.getElementById('p').value = 'secret-pass'; document.getElementById('f').requestSubmit()")
+        wait("typeof state !== 'undefined' && state.dataVersion !== null")  # открылась сама программа
+        wait("$('remoteBox').textContent.includes('с другого компьютера')")
+        result = browser.evaluate("(async () => { const r = await postJson('/api/calc', {text: 'x'}); return Boolean(r); })()")
+        self.assertTrue(result)  # запросы программы проходят
