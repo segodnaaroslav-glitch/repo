@@ -179,9 +179,9 @@ class PriceUiTests(unittest.TestCase):
     def test_totals_without_rate_are_not_partial(self):
         totals = self.calc("Harvester x2\nIcebreaker\nFang\nFlowerwood Gun\nLuger")
         star, dream = totals[0], totals[1]
-        # Без курса: у Fang цена только в рублях, у Flowerwood Gun — только в долларах.
-        # Доллары: (8.83×2 + 2 + 1.3 + 3) × 0.8 = $19.168; рубли без долларов: 120 × 0.8 = 96 ₽.
-        self.assertIn("$19.17 + 96,00 ₽", star)
+        # Как у DreamPets: главное — рубли StarPets; без курса у Flowerwood Gun только доллары.
+        # Рубли: (750×2 + 160 + 120 + 104) × 0.8 = 1 507,20 ₽; доллары без рублей: 3 × 0.8 = $2.40.
+        self.assertIn("1 507,20 ₽ + $2.40", star)
         self.assertNotIn("$0.00", dream)
         self.assertIn("1 656,00 ₽", dream)  # (820×2 + 150 + 50) × 0.9
         self.assertNotIn("$", dream)
@@ -191,9 +191,9 @@ class PriceUiTests(unittest.TestCase):
         self.js("poll()")
         self.wait("!document.querySelector('#calcTotals').textContent.includes('Нет курса')")
         star = self.js("document.querySelector('#calcTotals .total.starpets .total-net').textContent")
-        self.assertEqual(star, "≈$20.37 · ≈1 699,20 ₽")  # 19.168 + 96/80; 1 507,20 + 2.4×80
+        self.assertEqual(star, "≈1 699,20 ₽ · ≈$21.24")  # 1 507,20 + 2.4×80; 1 507,20/80 + 2.4
         units = self.js("[...document.querySelectorAll('#calcBody tr')].map((tr) => tr.children[2].textContent)")
-        self.assertIn("≈$1.50 · 120,00 ₽", units)
+        self.assertIn("120,00 ₽ · ≈$1.50", units)
 
     def test_rate_arrival_while_typing_quantity(self):
         self.calc("Fang\nLuger")
@@ -204,10 +204,10 @@ class PriceUiTests(unittest.TestCase):
         self.assertTrue(self.js("document.activeElement === document.querySelector('#calcBody input.qty')"))
         self.assertEqual(self.js("document.querySelector('#calcBody tr').children[2].textContent"), "120,00 ₽")
         self.assertEqual(self.js("document.querySelector('#calcTotals .total.starpets .total-net').textContent"),
-                         "≈$2.24 · 179,20 ₽")  # (1.5 + 1.3) × 0.8; (120 + 104) × 0.8
+                         "179,20 ₽ · ≈$2.24")  # (120 + 104) × 0.8; рубли по курсу 80
         self.js("document.activeElement.blur()")
         self.js("poll()")
-        self.assertEqual(self.js("document.querySelector('#calcBody tr').children[2].textContent"), "≈$1.50 · 120,00 ₽")
+        self.assertEqual(self.js("document.querySelector('#calcBody tr').children[2].textContent"), "120,00 ₽ · ≈$1.50")
 
     def test_rubles_compared_without_rate(self):
         totals = self.calc("Harvester x2\nIcebreaker")
@@ -222,13 +222,15 @@ class PriceUiTests(unittest.TestCase):
 
     def test_rate_arrival_redraws_prices(self):
         before = self.js("document.querySelector('#cardsGrid .card[data-key=\"godlies:Luger\"] .mp.starpets').textContent")
-        self.assertEqual(before, "StarPets$1.30 · 104,00 ₽")
+        self.assertEqual(before, "StarPets104,00 ₽")  # рубли StarPets; доллары — когда будет курс
         fang = "document.querySelector('#cardsGrid .card[data-key=\"godlies:Fang\"] .mp.starpets').textContent"
         self.assertEqual(self.js(fang), "StarPets120,00 ₽")
         self.rate.usd_rub = 100.0
         self.js("poll()")
         self.wait(f"{fang}.includes('$')")
-        self.assertEqual(self.js(fang), "StarPets≈$1.20 · 120,00 ₽")
+        self.assertEqual(self.js(fang), "StarPets120,00 ₽ · ≈$1.20")
+        luger = "document.querySelector('#cardsGrid .card[data-key=\"godlies:Luger\"] .mp.starpets').textContent"
+        self.assertEqual(self.js(luger), "StarPets104,00 ₽ · ≈$1.04")  # по курсу Rapira, а не $1.30 самой StarPets
 
 
 

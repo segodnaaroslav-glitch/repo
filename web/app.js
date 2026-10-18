@@ -140,31 +140,36 @@ function finite(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-// Цена площадки в обеих валютах. Точные — как на самой площадке (StarPets сам
-// задаёт и доллары, и рубли); пересчитанные по курсу — с пометкой «≈».
-// factor — множитель (комиссия, количество).
+// Цена площадки в обеих валютах — как у DreamPets: главная — рубли самой площадки (StarPets сам
+// задаёт рублёвые цены), доллары — эти рубли по курсу Rapira (с пометкой «≈»). Если рублей
+// площадка не дала — её доллары, а рубли по курсу («≈»). factor — множитель (комиссия, количество).
 function infoMoney(info, factor = 1) {
   if (!info) return null;
   const rate = usdRub();
-  let usd = info.currency === "RUB" ? null : finite(info.price);
+  const ownUsd = info.currency === "RUB" ? null : finite(info.price);
   let rub = info.currency === "RUB" ? finite(info.price) : finite(info.price_rub);
-  let usdApprox = false;
   let rubApprox = info.currency !== "RUB" && Boolean(info.price_rub_approx) && rub !== null;
+  let usd = null;
+  let usdApprox = false;
+  if (rub !== null && (!rubApprox || ownUsd === null)) {
+    if (rate) {
+      usd = rub / rate;  // доллары — по курсу Rapira, как у DreamPets
+      usdApprox = true;
+    }
+  } else if (ownUsd !== null) {
+    usd = ownUsd;  // рублей площадка не дала (или они устарели) — её доллары
+    if (rub === null && rate) {
+      rub = ownUsd * rate;
+      rubApprox = true;
+    }
+  }
   if (usd === null && rub === null) return null;
-  if (rub === null && rate) {
-    rub = usd * rate;
-    rubApprox = true;
-  }
-  if (usd === null && rate) {
-    usd = rub / rate;
-    usdApprox = true;
-  }
   return {
     usd: usd === null ? null : usd * factor,
     rub: rub === null ? null : rub * factor,
     usdApprox,
     rubApprox,
-    primary: info.currency === "RUB" ? "rub" : "usd",
+    primary: rub !== null ? "rub" : "usd",
   };
 }
 
@@ -1665,11 +1670,10 @@ function renderCalcTotals() {
   const gross = {};
   const missing = {};
   const unknown = {};
-  const empty = (id) => ({ usd: 0, rub: 0, usdApprox: false, rubApprox: false, incomplete: false,
-    primary: id === "dreampets" ? "rub" : "usd" });
+  const empty = () => ({ usd: 0, rub: 0, usdApprox: false, rubApprox: false, incomplete: false, primary: "rub" });
   for (const id of MARKET_ORDER) {
-    totals[id] = empty(id);  // вы получите (после комиссии)
-    gross[id] = empty(id);  // по ценам площадки, без комиссии
+    totals[id] = empty();  // вы получите (после комиссии)
+    gross[id] = empty();  // по ценам площадки, без комиссии
     missing[id] = 0;
     unknown[id] = 0;
     for (const item of calc.items) {
