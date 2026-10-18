@@ -408,3 +408,50 @@ class CardReviewRegressionTests(unittest.TestCase):
         for img, expected in cases.items():
             items, _, _ = parser.parse_category_page(img + "<h3>Alpha</h3><div>Value - 10</div>", "godlies")
             self.assertEqual(items[0]["image"], expected, img)
+
+
+class PetClassTests(unittest.TestCase):
+    """Pets: «Class - Common» между названием и Value — класс питомца, а не его название."""
+
+    M, S = parser.IMAGE_MARK, "\x03"
+
+    def test_class_line_is_a_field(self):
+        text = "\n".join([
+            f"{self.M}https://supremevalues.com/mm2/pets/elitey.webp{self.S}Elitey", "Elitey", "Class - Legendary",
+            "Value - 750", "Demand - 4", "Rarity - 5", "Stability - Stable",
+            f"{self.M}https://supremevalues.com/mm2/pets/frostbird.webp{self.S}Frostbird", "Frostbird", "Class -", "Common",
+            "Value - 625", "Demand - 4", "Rarity - 5", "Stability - Stable",
+            f"{self.M}https://supremevalues.com/mm2/pets/ghosty.webp{self.S}Ghosty", "Class: Rare", "Value - 220", "Demand - 2",
+        ])
+        items = parser.items_from_text(text, "pets")
+        items = items[0] if isinstance(items, tuple) else items
+        self.assertEqual([(i["name"], i["pet_class"], i["value"]) for i in items],
+                         [("Elitey", "Legendary", 750), ("Frostbird", "Common", 625), ("Ghosty", "Rare", 220)])
+        self.assertEqual(items[0]["image"], "https://supremevalues.com/mm2/pets/elitey.webp")
+        self.assertFalse(any(i["name"].startswith("Class") for i in items))
+
+    def test_class_after_value_belongs_to_its_card(self):
+        text = "\n".join(["Elitey", "Value - 750", "Class - Legendary", "Demand - 4",
+                          "Frostbird", "Value - 625", "Class - Common"])
+        cards, orphans = parser.parse_cards(text)
+        self.assertEqual([(c["name"], c.get("class")) for c in cards], [("Elitey", "Legendary"), ("Frostbird", "Common")])
+        self.assertEqual(orphans, 0)
+
+    def test_old_wrong_pet_names_trigger_a_refresh(self):
+        import tempfile
+        from pathlib import Path
+        from supreme import store
+        path = Path(tempfile.mkdtemp()) / "values.json"
+        self.assertFalse(store.needs_refresh(path))  # цен ещё нет
+        data = store.empty_data()
+        store.replace_category(data, "pets", [parser.make_item("Class - Common", "pets", {"value": "750"})], "site")
+        store.save(data, path)
+        self.assertTrue(store.needs_refresh(path))
+        store.replace_category(data, "pets", [parser.make_item("Elitey", "pets", {"value": "750"})], "site")
+        store.save(data, path)
+        self.assertFalse(store.needs_refresh(path))
+
+    def test_classic_is_still_a_name(self):
+        cards, _ = parser.parse_cards("Classic\nValue - 10")
+        self.assertEqual(cards[0]["name"], "Classic")
+

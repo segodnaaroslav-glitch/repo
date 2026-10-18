@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -41,6 +42,19 @@ def empty_data():
         "errors": [],
         "items": [],
     }
+
+
+_STALE_NAME_RE = re.compile(r"^Class\s*[-–—:]", re.I)
+
+
+def needs_refresh(path=None):
+    """Цены разобраны старой версией с известной ошибкой — их стоит скачать заново: у питомцев
+    вместо названий стояли строки класса («Class - Common»)."""
+    try:
+        items = load(path)["items"]
+    except (OSError, ValueError):
+        return False
+    return any(_STALE_NAME_RE.match(item["name"]) for item in items)
 
 
 def load(path=None):
@@ -91,7 +105,7 @@ def _clean_item(item):
     item["secret"] = parser.is_secret(item["value"])
     for key in ("demand", "rarity"):
         item[key] = item[key] if isinstance(item.get(key), int) and not isinstance(item.get(key), bool) else None
-    for key in ("value_text", "range_text", "stability", "change", "origin", "aliases", "contains", "image"):
+    for key in ("value_text", "range_text", "stability", "change", "origin", "aliases", "contains", "pet_class", "image"):
         if not isinstance(item.get(key), str):
             item[key] = ""
     return item

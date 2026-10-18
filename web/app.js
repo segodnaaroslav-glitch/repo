@@ -1100,6 +1100,7 @@ function renderDrawer() {
 
   body.append(el("h3", "", "Supreme Values"));
   const facts = el("dl", "facts");
+  if (item.pet_class) fact(facts, "Класс", item.pet_class);
   fact(facts, "Спрос", item.demand === null ? "" : `${item.demand}/10`);
   fact(facts, "Редкость", item.rarity === null ? "" : `${item.rarity}/10`);
   fact(facts, "Стабильность", stabilityChip(item.stability));

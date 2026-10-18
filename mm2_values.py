@@ -55,8 +55,8 @@ def cmd_run(args):
         remote_on=remote_on,
     )
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
-    if not args.no_update and not store.DATA_FILE.exists():
-        httpd.job.start()  # первый запуск: сразу скачать цены
+    if not args.no_update and (not store.DATA_FILE.exists() or store.needs_refresh()):
+        httpd.job.start()  # первый запуск (или цены с ошибкой прошлой версии): сразу скачать цены
     if httpd.sync:
         httpd.sync.start()  # следить за сайтом и подтягивать новые цены
     if monitor:

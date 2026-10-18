@@ -64,7 +64,7 @@ _LOOSE_RANGE_RE = re.compile(
 _SUFFIX = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
 
 _LABEL_RE = re.compile(
-    r"(?<![A-Za-z])(Change in Value|Value|Range|Stability|Demand|Rarity|Origin|Aliases|Contains)"
+    r"(?<![A-Za-z])(Change in Value|Value|Range|Stability|Demand|Rarity|Origin|Aliases|Contains|Class)"
     r"\s*[-–—:]\s*",
     re.I,
 )
@@ -78,6 +78,7 @@ _LABEL_KEYS = {
     "origin": "origin",
     "aliases": "aliases",
     "contains": "contains",
+    "class": "class",  # класс питомца (Pets): «Class - Common» — поле, а не название
 }
 # Надписи интерфейса сайта, которые не являются названиями предметов.
 _FREE_TEXT_FIELDS = ("origin", "aliases")
@@ -402,6 +403,8 @@ def parse_cards(text, known_names=()):
     candidates = []
     name_before_contains = None
     contains_first = None  # на странице наборов "Contains" идёт до "Value"?
+    class_first = None  # на странице питомцев "Class - Common" идёт между названием и "Value"?
+    next_class = None  # класс питомца для следующей карточки
     contains = None   # состав набора, пока карточка ещё не создана (или собирается по строкам)
     images = []       # картинки после предыдущей карточки: (адрес, подпись)
     pending = None    # метка, значение которой ожидается на следующей строке
@@ -426,6 +429,7 @@ def parse_cards(text, known_names=()):
             commit_tentative()
             pending = None
             candidates = []
+            next_class = None
             continue
         line = re.sub(r"\s+", " ", raw_line).strip()
         if not line:
@@ -440,6 +444,10 @@ def parse_cards(text, known_names=()):
                     continue
                 if pending and not clean_name(value):
                     pending = None  # служебная надпись ("Inv. Controls") — не значение поля
+                    continue
+                if pending == "class" and class_first:
+                    next_class = value  # «Class -» и класс строкой ниже — у следующей карточки
+                    pending = None
                     continue
                 if pending and _value_fits(pending, value):
                     if pending in _FREE_TEXT_FIELDS and _is_name_like(value):
@@ -456,6 +464,18 @@ def parse_cards(text, known_names=()):
                     candidates.append(clean_name(value))
                 continue
 
+            if key == "class":
+                # Класс питомца: до "Value" — следующей карточки, после — этой.
+                commit_tentative()
+                if class_first is None:
+                    class_first = not cards or bool(candidates)
+                if not value:
+                    pending = "class"
+                elif class_first:
+                    next_class = value
+                else:
+                    _set_field(card, "class", value)
+                continue
             if key == "contains" and contains_first is None:
                 # Новое название после предыдущего Value — значит, "Contains" относится
                 # к следующей карточке (служебная "Your Inventory - Value 0" не мешает).
@@ -474,7 +494,14 @@ def parse_cards(text, known_names=()):
             pending = None
             if key == "value":
                 name = name_before_contains or _pick_name(candidates, known_keys)
+                if not name:
+                    # Название только в подписи картинки карточки.
+                    name = next((clean_name(alt) for url, alt in reversed(images)
+                                 if alt and _is_name_like(alt) and not _is_icon(url)), None)
                 card = {"name": name} if name else None
+                if card and next_class:
+                    card["class"] = re.sub(r"\s+", " ", next_class).strip()
+                next_class = None
                 if card:
                     cards.append(card)
                     image = _pick_image(images, name)
@@ -612,6 +639,7 @@ def make_item(name, category, fields):
         "origin": fields.get("origin") or "",
         "aliases": fields.get("aliases") or "",
         "contains": fields.get("contains") or "",
+        "pet_class": fields.get("class") or "",  # класс питомца (Common, Legendary…) — у Pets
         "image": _image_url(fields.get("image")),
     }
 
